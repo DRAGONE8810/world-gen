@@ -782,7 +782,8 @@ unsafe fn create_pipeline(
     render_pass: vk::RenderPass,
 ) -> Result<(vk::PipelineLayout, vk::Pipeline), vk::Result> {
     let load = |bytes: &[u8]| -> Result<vk::ShaderModule, vk::Result> {
-        let words: Vec<u32> = bytes.chunks_exact(4).map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect();
+        let words =
+            ash::util::read_spv(&mut std::io::Cursor::new(bytes)).map_err(|_| vk::Result::ERROR_INVALID_SHADER_NV)?;
         device.create_shader_module(&vk::ShaderModuleCreateInfo::default().code(&words), None)
     };
     let vs = load(VERT_SPV)?;

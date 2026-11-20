@@ -4,6 +4,7 @@ description = "Vulkan viewer and game menu for the world generator"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+rust-version.workspace = true
 default-run = "world-gen"
 
 [[bin]]
