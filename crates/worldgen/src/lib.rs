@@ -10,6 +10,8 @@
 //! * [`palette`] – compressed 16³ block storage
 //! * [`chunk`] – 16×384×16 chunk columns
 //! * [`settings`] – world size, type and seed
+//! * [`spline`] – monotone cubic curves used to shape terrain
+//! * [`terrain`] – climate parameters → height, roughness, rivers
 //! * [`generator`] – turns settings + chunk position into blocks
 
 pub mod block;
@@ -19,6 +21,8 @@ pub mod noise;
 pub mod palette;
 pub mod rng;
 pub mod settings;
+pub mod spline;
+pub mod terrain;
 
 pub use block::{blocks, BlockId};
 pub use chunk::{Chunk, ChunkPos, CHUNK_SIZE};

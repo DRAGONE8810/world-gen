@@ -10,7 +10,7 @@
 //! ```
 
 use rayon::prelude::*;
-use worldgen::{blocks, WorldGenerator, WorldSettings, WorldSize, WorldType, SEA_LEVEL};
+use worldgen::{blocks, ColumnSample, WorldGenerator, WorldSettings, WorldSize, WorldType, SEA_LEVEL};
 
 struct Args {
     seed: u64,
@@ -21,12 +21,24 @@ struct Args {
     px: u32,
     out: String,
     bench: Option<u32>,
+    layer: Layer,
+}
+
+#[derive(Clone, Copy, PartialEq)]
+enum Layer {
+    Surface,
+    Height,
+    Continentalness,
+    Erosion,
+    PeaksValleys,
+    Roughness,
 }
 
 fn usage() -> ! {
     eprintln!(
         "usage: wg-map [--seed N|TEXT] [--type normal|amplified|large|islands|flat] [--size-km KM]\n\
          \x20             [--center X,Z] [--extent BLOCKS] [--px PIXELS] [--out FILE.png]\n\
+         \x20             [--layer surface|height|continentalness|erosion|pv|roughness]\n\
          \x20      wg-map --bench N   (time generating an N×N square of chunks on one thread)"
     );
     std::process::exit(2)
@@ -42,6 +54,7 @@ fn parse_args() -> Args {
         px: 1024,
         out: "map.png".into(),
         bench: None,
+        layer: Layer::Surface,
     };
     let mut it = std::env::args().skip(1);
     while let Some(flag) = it.next() {
@@ -67,6 +80,17 @@ fn parse_args() -> Args {
             "--extent" => a.extent = val().parse().unwrap_or_else(|_| usage()),
             "--px" => a.px = val().parse().unwrap_or_else(|_| usage()),
             "--out" => a.out = val(),
+            "--layer" => {
+                a.layer = match val().as_str() {
+                    "surface" => Layer::Surface,
+                    "height" => Layer::Height,
+                    "continentalness" | "c" => Layer::Continentalness,
+                    "erosion" | "e" => Layer::Erosion,
+                    "pv" | "peaks" => Layer::PeaksValleys,
+                    "roughness" => Layer::Roughness,
+                    _ => usage(),
+                }
+            }
             "--bench" => a.bench = Some(val().parse().unwrap_or_else(|_| usage())),
             "-h" | "--help" => usage(),
             _ => usage(),
@@ -107,27 +131,17 @@ fn main() {
     let mut img = image::RgbImage::new(px, px);
     let mut land = 0u64;
     let mut inside = 0u64;
+    let mut heights = Vec::with_capacity((px * px) as usize);
     for iz in 0..px {
         for ix in 0..px {
             let s = samples[(iz * (px + 1) + ix) as usize];
-            let color = if !s.inside {
-                [12, 12, 16]
-            } else if s.underwater {
+            if s.inside {
                 inside += 1;
-                // Darker blue for deeper water.
-                let depth = (SEA_LEVEL - s.surface_y).clamp(0, 60) as f64 / 60.0;
-                let w = blocks::WATER.info().color;
-                let f = 1.15 - depth * 0.6;
-                [(w[0] as f64 * f) as u8, (w[1] as f64 * f) as u8, (w[2] as f64 * f).min(255.0) as u8]
-            } else {
-                inside += 1;
-                land += 1;
-                let se = samples[((iz + 1) * (px + 1) + ix + 1) as usize];
-                let slope = (s.surface_y - se.surface_y) as f64 / blocks_per_px.max(1.0);
-                let shade = (1.0 + slope * 0.35).clamp(0.55, 1.35);
-                let c = s.top_block.info().color;
-                c.map(|v| (v as f64 * shade).clamp(0.0, 255.0) as u8)
-            };
+                land += !s.underwater as u64;
+                heights.push(s.surface_y);
+            }
+            let se = samples[((iz + 1) * (px + 1) + ix + 1) as usize];
+            let color = pixel_color(args.layer, &s, &se, blocks_per_px);
             img.put_pixel(ix, iz, image::Rgb(color));
         }
     }
@@ -142,6 +156,19 @@ fn main() {
         start.elapsed(),
         if inside > 0 { land as f64 * 100.0 / inside as f64 } else { 0.0 }
     );
+    if !heights.is_empty() {
+        heights.sort_unstable();
+        let p = |q: f64| heights[((heights.len() - 1) as f64 * q) as usize];
+        eprintln!(
+            "surface height: min {} p10 {} p50 {} p90 {} p99 {} max {}",
+            heights[0],
+            p(0.1),
+            p(0.5),
+            p(0.9),
+            p(0.99),
+            heights[heights.len() - 1]
+        );
+    }
 }
 
 /// Single-threaded chunk generation benchmark.
@@ -162,4 +189,70 @@ fn bench(gen: &WorldGenerator, n: i32) {
         t.as_secs_f64() * 1000.0 / total,
         bytes as f64 / total / 1024.0
     );
+}
+
+/// Colour of one map pixel for the chosen layer.
+fn pixel_color(layer: Layer, s: &ColumnSample, se: &ColumnSample, blocks_per_px: f64) -> [u8; 3] {
+    if !s.inside {
+        return [12, 12, 16];
+    }
+    // Hill shading: brighter on slopes facing the north-west light.
+    let slope = (s.surface_y - se.surface_y) as f64 / blocks_per_px.max(1.0);
+    let shade = (1.0 + slope * 0.35).clamp(0.55, 1.4);
+    let shaded = |c: [u8; 3]| c.map(|v| (v as f64 * shade).clamp(0.0, 255.0) as u8);
+    let water = |depth: i32| {
+        let d = (depth.clamp(0, 60) as f64) / 60.0;
+        let w = blocks::WATER.info().color;
+        let f = 1.15 - d * 0.6;
+        [(w[0] as f64 * f) as u8, (w[1] as f64 * f) as u8, (w[2] as f64 * f).min(255.0) as u8]
+    };
+    // Diverging blue → white → red ramp for parameters in [-1, 1].
+    let ramp = |v: f64| {
+        let t = v.clamp(-1.0, 1.0);
+        if t < 0.0 {
+            let k = 1.0 + t;
+            [(40.0 + 215.0 * k) as u8, (80.0 + 175.0 * k) as u8, 255]
+        } else {
+            [255, (255.0 - 190.0 * t) as u8, (255.0 - 215.0 * t) as u8]
+        }
+    };
+    match layer {
+        Layer::Surface => {
+            if s.underwater {
+                water(SEA_LEVEL - s.surface_y)
+            } else {
+                shaded(s.top_block.info().color)
+            }
+        }
+        Layer::Height => {
+            if s.underwater {
+                water(SEA_LEVEL - s.surface_y)
+            } else {
+                // Hypsometric tint: green lowlands, yellow/brown hills, grey
+                // mountains, white peaks.
+                let h = (s.surface_y - SEA_LEVEL) as f64;
+                let stops: [(f64, [f64; 3]); 6] = [
+                    (0.0, [70.0, 140.0, 60.0]),
+                    (25.0, [140.0, 170.0, 80.0]),
+                    (60.0, [190.0, 160.0, 100.0]),
+                    (110.0, [140.0, 110.0, 90.0]),
+                    (160.0, [150.0, 150.0, 150.0]),
+                    (220.0, [250.0, 250.0, 250.0]),
+                ];
+                let mut c = stops[stops.len() - 1].1;
+                for w in stops.windows(2) {
+                    if h <= w[1].0 {
+                        let t = ((h - w[0].0) / (w[1].0 - w[0].0)).clamp(0.0, 1.0);
+                        c = [0, 1, 2].map(|i| w[0].1[i] + t * (w[1].1[i] - w[0].1[i]));
+                        break;
+                    }
+                }
+                shaded(c.map(|v| v as u8))
+            }
+        }
+        Layer::Continentalness => ramp(s.shape.climate.continentalness),
+        Layer::Erosion => ramp(s.shape.climate.erosion),
+        Layer::PeaksValleys => ramp(s.shape.climate.peaks_valleys),
+        Layer::Roughness => ramp(s.shape.roughness / 12.0 - 1.0),
+    }
 }
