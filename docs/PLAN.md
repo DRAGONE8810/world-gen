@@ -10,8 +10,8 @@ seed when it is needed, so a 60,000 km world costs the same as a 1 km one.
 | Step | What | Status |
 |------|------|--------|
 | 1 | Foundation: project layout, world settings, chunk storage, generator skeleton, game menu, Vulkan renderer, map tool | **Done**, see [devlog 01](devlog/01-foundation.md) |
-| 2 | Terrain: continents, oceans, erosion, mountains, rivers, 3D overhangs | Next |
-| 3 | Biomes and trees | Planned |
+| 2 | Terrain: continents, oceans, erosion, mountains, rivers, 3D overhangs | **Done**, see [devlog 02](devlog/02-terrain.md) |
+| 3 | Biomes and trees | Next |
 | 4 | Scale and speed: LODs, faster meshing, GPU-driven drawing, world map | Planned |
 
 ## Step 1: Foundation ✔
@@ -28,7 +28,7 @@ seed when it is needed, so a 60,000 km world costs the same as a 1 km one.
 - Vulkan renderer: greedy-meshed chunks streamed on worker threads,
   staging uploads to GPU memory, frustum culling, camera-relative rendering.
 
-## Step 2: Terrain
+## Step 2: Terrain ✔
 
 Replace the placeholder height with the layered "climate parameter" model
 modern Minecraft popularised:
@@ -43,6 +43,11 @@ modern Minecraft popularised:
   splines, Islands = continentalness biased to ocean, Large biomes = ×4 scale).
 - Accuracy checks: height histograms, land/ocean ratio per world type,
   slope statistics, and maps at several zoom levels in the devlog.
+
+Result: continents several km wide (about 58% land in Normal, 13% in
+Islands), oceans down to y ≈ 13, mountains to y ≈ 270–300, rivers to the
+sea, overhangs in rugged areas. Known limitation: rivers sit at sea level
+(no downhill flow from plateaus).
 
 ## Step 3: Biomes and trees
 

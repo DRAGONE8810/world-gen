@@ -198,12 +198,19 @@ fn preview_image(s: &WorldSettings, px: usize) -> egui::ColorImage {
     let gen = WorldGenerator::new(s.clone());
     let extent = preview_extent(s);
     let step = extent / px as f64;
-    let mut pixels = Vec::with_capacity(px * px);
-    for iz in 0..px {
-        for ix in 0..px {
+    use rayon::prelude::*;
+    let samples: Vec<_> = (0..px * px)
+        .into_par_iter()
+        .map(|i| {
+            let (ix, iz) = (i % px, i / px);
             let x = (-extent / 2.0 + (ix as f64 + 0.5) * step).floor() as i32;
             let z = (-extent / 2.0 + (iz as f64 + 0.5) * step).floor() as i32;
-            let c = gen.sample_column(x, z);
+            gen.sample_column(x, z)
+        })
+        .collect();
+    let mut pixels = Vec::with_capacity(px * px);
+    {
+        for c in samples {
             let rgb = if !c.inside {
                 [10, 10, 14]
             } else if c.underwater {
@@ -323,6 +330,15 @@ pub fn hud(ui: &mut egui::Ui, h: &HudInfo) {
                         h.column.surface_y,
                         h.column.top_block.info().name,
                         if h.column.underwater { "  (under water)" } else { "" }
+                    )));
+                    let cl = h.column.shape.climate;
+                    ui.label(mono(format!(
+                        "Climate  C {:+.2}  E {:+.2}  PV {:+.2}  rough {:.1}  river {:.2}",
+                        cl.continentalness,
+                        cl.erosion,
+                        cl.peaks_valleys,
+                        h.column.shape.roughness,
+                        h.column.shape.river
                     )));
                     ui.label(mono(format!(
                         "Seed {}  {}  {}",

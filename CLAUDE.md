@@ -23,7 +23,8 @@ Platforms: Windows and Linux required, macOS (MoltenVK) nice to have.
 
 ```
 crates/worldgen   Pure generator library. NO graphics, NO windowing, NO I/O.
-                  rng, noise, block, palette, chunk, settings, generator.
+                  rng, noise, spline, terrain, block, palette, chunk,
+                  settings, generator. examples/noise_stats calibrates noise.
 crates/wg-map     CLI: renders top-down PNG maps straight from the generator,
                   and benchmarks chunk generation. Use it to check accuracy.
 crates/game       Binary `world-gen`: winit window, egui menus, ash/Vulkan
@@ -44,7 +45,9 @@ cargo clippy --all-targets       # must be warning-free
 cargo fmt                        # rustfmt.toml: max_width 120
 cargo run --release              # the game (default-run = world-gen)
 cargo run --release -p wg-map -- --seed 42 --extent 16000 --px 1024 --out map.png
+cargo run --release -p wg-map -- --seed 42 --layer height   # also: continentalness|erosion|pv|roughness
 cargo run --release -p wg-map -- --seed 42 --bench 32   # ms per chunk
+cargo run --release -p worldgen --example noise_stats   # climate noise percentiles
 ```
 
 Shaders live in `crates/game/shaders/*.vert|frag` (Vulkan GLSL) and are
@@ -64,8 +67,10 @@ sleep 25; DISPLAY=:99 import -window root shot.png
 ```
 
 Environment switches: `WG_VALIDATION=1` (Khronos validation layer, must
-print no errors), `WG_AUTOSTART=<seed>` (skip menus), `WG_SCREEN=create|settings`
-(open a menu), `WG_EXIT_AFTER_FRAMES=N`.
+print no errors), `WG_AUTOSTART=<seed>` (skip menus), `WG_CAMERA=x,z[,yaw,pitch,height]`
+(with autostart: place the camera), `WG_SCREEN=create|settings` (open a menu),
+`WG_EXIT_AFTER_FRAMES=N`. A `settings.ron` in the working directory sets
+render distance etc.
 
 ## Conventions
 
@@ -76,6 +81,11 @@ print no errors), `WG_AUTOSTART=<seed>` (skip menus), `WG_SCREEN=create|settings
   so adding a feature never changes existing terrain.
 - **Generation is pure:** `WorldGenerator` is `Send + Sync` with no mutable
   state; any chunk can be generated on any thread in any order.
+- **Terrain model:** climate noise → `terrain::TerrainShaper` (spline
+  curves) → base height `H` + roughness `A` → 3D density
+  `(H − y) + A·N > 0` on a 4×8×4 interpolation grid. Tune the world by
+  editing curve tables, then check with `wg-map` layers and the statistics
+  tests in `generator.rs`.
 - **Column sampling and chunks must agree:** `sample_column` is used by maps,
   the menu preview and the HUD; tests assert it matches `generate_chunk`.
 - **Coordinates:** blocks are `i32`, noise inputs `f64` and wrapped

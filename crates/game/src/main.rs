@@ -283,6 +283,17 @@ impl App {
             let mut s = self.settings.last_world.clone();
             s.seed = worldgen::settings::seed_from_text(&seed).unwrap_or(0);
             self.start_world(s);
+            // Optional camera placement for screenshots: WG_CAMERA=x,z[,yaw_deg,pitch_deg,height]
+            if let (Ok(spec), Some(sess)) = (std::env::var("WG_CAMERA"), self.session.as_mut()) {
+                let v: Vec<f64> = spec.split(',').filter_map(|p| p.trim().parse().ok()).collect();
+                if v.len() >= 2 {
+                    let ground = sess.chunks.generator().sample_column(v[0] as i32, v[1] as i32).surface_y;
+                    let above = v.get(4).copied().unwrap_or(40.0);
+                    sess.camera.pos = DVec3::new(v[0], ground.max(worldgen::SEA_LEVEL) as f64 + above, v[1]);
+                    sess.camera.yaw = v.get(2).copied().unwrap_or(0.0).to_radians() as f32;
+                    sess.camera.pitch = v.get(3).copied().unwrap_or(-20.0).to_radians() as f32;
+                }
+            }
         } else if let Ok(screen) = std::env::var("WG_SCREEN") {
             match screen.as_str() {
                 "create" => self.set_screen(Screen::CreateWorld),
