@@ -1,0 +1,13 @@
+[package]
+name = "worldgen"
+description = "Deterministic, GPU-free Minecraft-like world generator"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+serde.workspace = true
+
+[dev-dependencies]
+ron.workspace = true

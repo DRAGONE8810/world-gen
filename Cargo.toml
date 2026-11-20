@@ -1,0 +1,26 @@
+[workspace]
+resolver = "2"
+members = ["crates/worldgen", "crates/wg-map", "crates/game"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+rust-version = "1.87"
+
+[workspace.dependencies]
+worldgen = { path = "crates/worldgen" }
+serde = { version = "1", features = ["derive"] }
+ron = "0.12"
+rayon = "1.10"
+glam = "0.30"
+
+# World generation is CPU-heavy: keep it fast even in debug builds,
+# otherwise `cargo run` without --release feels broken.
+[profile.dev.package."*"]
+opt-level = 2
+[profile.dev.package.worldgen]
+opt-level = 3
+
+[profile.release]
+debug = 1

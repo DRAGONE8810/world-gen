@@ -1,0 +1,33 @@
+[package]
+name = "game"
+description = "Vulkan viewer and game menu for the world generator"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+default-run = "world-gen"
+
+[[bin]]
+name = "world-gen"
+path = "src/main.rs"
+
+[dependencies]
+worldgen.workspace = true
+serde.workspace = true
+ron.workspace = true
+rayon.workspace = true
+glam.workspace = true
+ash = "0.38"
+ash-window = "0.13"
+gpu-allocator = { version = "0.28", default-features = false, features = ["vulkan"] }
+winit = "0.30"
+raw-window-handle = "0.6"
+egui = "0.36"
+egui-winit = { version = "0.36", default-features = false, features = ["clipboard", "links", "wayland", "x11"] }
+egui-ash-renderer = { version = "0.13", features = ["gpu-allocator"] }
+bytemuck = { version = "1", features = ["derive"] }
+log = "0.4"
+env_logger = "0.11"
+
+[build-dependencies]
+naga = { version = "30", features = ["glsl-in", "spv-out"] }
