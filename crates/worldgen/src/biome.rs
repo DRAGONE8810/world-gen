@@ -19,7 +19,12 @@
 //! 2. **Oceanic islands** (rare cones raised from the deep sea) are volcanic
 //!    or mushroom fields.
 //! 3. **Coast.** Low land next to the sea is beach, snowy beach, mangrove,
-//!    salt flats (a sabkha), stony shore or fjord.
+//!    salt flats (a sabkha), stony shore or fjord, and on ordinary coasts
+//!    one of the beach types seen on Earth, by climate and lie of the land:
+//!    shingle (gravel) beaches on cool, stormy coasts; white coral sand in
+//!    the humid tropics; tidal mud flats and salt marsh on flat, humid
+//!    temperate coasts (the Wadden Sea); wide sand dunes behind flat, dry
+//!    coasts; plain sandy beaches elsewhere.
 //! 4. **Altitude.** Temperature drops with height, like the real lapse rate
 //!    of about 6.5 °C per km. High summits become frozen, jagged or stony
 //!    peaks. High slopes become groves, snowy slopes, meadows, cloud forest
@@ -29,7 +34,11 @@
 //!    snowy plains sit at the cold end, deserts and badlands at hot and dry,
 //!    jungles at hot and wet, and the temperate forests in between. The sign
 //!    of weirdness picks between sister biomes (forest or birch forest, for
-//!    example), so variants come in natural patches.
+//!    example), so variants come in natural patches. Sub-biomes add the
+//!    variety real biomes have inside them: rocky desert (reg and hamada)
+//!    beside sand seas, peat bogs in flat wet taiga, flooded forest (the
+//!    Amazon's várzea) in flat wet jungle, heather moorland on wet
+//!    temperate uplands.
 //!
 //! Real-world biomes that Minecraft doesn't have are marked
 //! [`Origin::RealWorld`] in the table below.
@@ -102,6 +111,10 @@ biomes! {
     StonyShore          "stony_shore"          map [162, 162, 132] grass [138, 182, 137] Minecraft,
     Fjord               "fjord"                map [ 90, 110, 130] grass [128, 175, 140] RealWorld,
     SaltFlats           "salt_flats"           map [245, 245, 235] grass [191, 183,  85] RealWorld,
+    CoastalDunes        "coastal_dunes"        map [238, 214, 140] grass [160, 180,  90] RealWorld,
+    ShingleBeach        "shingle_beach"        map [150, 145, 135] grass [130, 175, 120] RealWorld,
+    TropicalBeach       "tropical_beach"       map [255, 245, 210] grass [100, 185,  60] RealWorld,
+    TidalFlats          "tidal_flats"          map [110, 105,  90] grass [120, 150,  80] RealWorld,
     MangroveSwamp       "mangrove_swamp"       map [ 50, 110,  60] grass [141, 177,  39] Minecraft,
     // --- Oceanic islands -----------------------------------------------
     MushroomFields      "mushroom_fields"      map [255,   0, 255] grass [ 85, 201,  63] Minecraft,
@@ -115,6 +128,7 @@ biomes! {
     Meadow              "meadow"               map [ 96, 164,  69] grass [131, 187, 109] Minecraft,
     CloudForest         "cloud_forest"         map [ 30, 120,  90] grass [ 60, 160,  70] RealWorld,
     WindsweptHills      "windswept_hills"      map [ 96,  96,  96] grass [138, 182, 137] Minecraft,
+    Moor                "moor"                 map [120, 100, 110] grass [125, 120,  80] RealWorld,
     // --- Cold lowlands -------------------------------------------------
     Tundra              "tundra"               map [170, 160, 130] grass [150, 155, 100] RealWorld,
     SnowyPlains         "snowy_plains"         map [255, 255, 255] grass [128, 180, 151] Minecraft,
@@ -122,6 +136,7 @@ biomes! {
     Taiga               "taiga"                map [ 11, 102,  89] grass [134, 183, 131] Minecraft,
     OldGrowthTaiga      "old_growth_taiga"     map [ 89, 102,  81] grass [124, 170, 110] Minecraft,
     TemperateRainforest "temperate_rainforest" map [ 20,  80,  40] grass [ 70, 150,  60] RealWorld,
+    Bog                 "bog"                  map [ 70,  90,  70] grass [110, 140,  90] RealWorld,
     // --- Temperate lowlands --------------------------------------------
     Steppe              "steppe"               map [200, 190, 120] grass [175, 170,  95] RealWorld,
     Forest              "forest"               map [  5, 102,  33] grass [ 89, 174,  48] Minecraft,
@@ -133,10 +148,12 @@ biomes! {
     Chaparral           "chaparral"            map [170, 140,  70] grass [160, 160,  85] RealWorld,
     Savanna             "savanna"              map [189, 178,  95] grass [191, 183,  85] Minecraft,
     Desert              "desert"               map [250, 148,  24] grass [191, 183,  85] Minecraft,
+    RockyDesert         "rocky_desert"         map [180, 110,  70] grass [191, 183,  85] RealWorld,
     Badlands            "badlands"             map [217,  69,  21] grass [144, 129,  77] Minecraft,
     Karst               "karst"                map [140, 200, 160] grass [ 90, 175,  60] RealWorld,
     SparseJungle        "sparse_jungle"        map [ 98, 139,  23] grass [100, 185,  50] Minecraft,
     Jungle              "jungle"               map [ 83, 123,   9] grass [ 70, 190,  30] Minecraft,
+    FloodedJungle       "flooded_jungle"       map [ 40, 100,  50] grass [ 80, 180,  40] RealWorld,
 }
 
 /// Temperature bands (after altitude cooling).
@@ -254,13 +271,29 @@ pub fn select(shape: &Shape, surface_y: i32) -> Biome {
     if c < 0.0 && alt_n <= 14.0 && rugged {
         return if tb <= Cold { Fjord } else { StonyShore };
     }
-    if c < -0.03 && alt <= 3 {
-        return match (tb, hb) {
+    if c < -0.03 && alt <= 7 {
+        let flat = e > 0.15;
+        let beach = match (tb, hb) {
             (Frozen, _) => SnowyBeach,
             (Hot, Wet | VeryWet) => MangroveSwamp,
             (Warm | Hot, Arid) => SaltFlats, // coastal sabkha
+            // Mud flats and salt marsh where flat, humid coasts shelve
+            // gently (Wadden Sea, Bay of Fundy).
+            (Temperate, Medium | Wet | VeryWet) if e > 0.35 && w < -0.2 => TidalFlats,
+            // Storm-sorted gravel on cool, wet coasts (Britain, Norway,
+            // British Columbia).
+            (Cold, _) | (Temperate, Wet | VeryWet) if w > -0.15 => ShingleBeach,
+            // Coral sand in the humid tropics.
+            (Warm | Hot, Medium | Wet | VeryWet) if w > -0.35 => TropicalBeach,
+            // Wide dune belts behind flat, dry-ish coasts (the Landes,
+            // Namib coast, Outer Banks).
+            (_, Arid | Dry | Medium) if flat && w < 0.05 => CoastalDunes,
             _ => Beach,
         };
+        // Dunes pile up a few blocks higher than a beach reaches.
+        if alt <= if beach == CoastalDunes { 7 } else { 3 } {
+            return beach;
+        }
     }
 
     // 4. Mountains.
@@ -281,15 +314,22 @@ pub fn select(shape: &Shape, surface_y: i32) -> Biome {
             _ => {}
         }
     }
+    // Heather moorland on wet, cool uplands (Pennines, Scottish Highlands).
+    if alt_n > 30.0 && matches!(tb, Cold | Temperate) && hb >= Wet && w < -0.25 && e > -0.3 {
+        return Moor;
+    }
 
     // 5. Lowlands: Whittaker grid.
     let swampy = e > 0.35 && alt_n < 6.0;
+    let boggy = e > 0.3 && alt_n < 12.0 && w > 0.2;
     match (tb, hb) {
         (Frozen, Arid | Dry) => Tundra,
         (Frozen, Medium) => SnowyPlains,
         (Frozen, _) => SnowyTaiga,
 
         (Cold, Arid) => Steppe,
+        // Peat bogs where the boreal forest is flat and waterlogged.
+        (Cold, Medium | Wet) if boggy => Bog,
         (Cold, Dry | Medium) => Taiga,
         (Cold, Wet) => OldGrowthTaiga,
         (Cold, VeryWet) => TemperateRainforest,
@@ -318,6 +358,8 @@ pub fn select(shape: &Shape, surface_y: i32) -> Biome {
             }
         }
 
+        // Stony desert (reg, hamada) beside the sand seas.
+        (Warm, Arid) if w < -0.35 => RockyDesert,
         (Warm, Arid) => Desert,
         (Warm, Dry) => Chaparral,
         (Warm, Medium) => {
@@ -345,6 +387,8 @@ pub fn select(shape: &Shape, surface_y: i32) -> Biome {
         (Hot, Arid) => {
             if e < 0.0 {
                 Badlands
+            } else if w < -0.35 {
+                RockyDesert
             } else {
                 Desert
             }
@@ -357,6 +401,8 @@ pub fn select(shape: &Shape, surface_y: i32) -> Biome {
                 SparseJungle
             }
         }
+        // Seasonally flooded forest on flat, wet lowlands (várzea).
+        (Hot, Wet | VeryWet) if swampy && w > 0.15 => FloodedJungle,
         (Hot, Wet | VeryWet) => Jungle,
     }
 }

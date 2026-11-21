@@ -33,7 +33,9 @@ crates/worldgen   Pure generator library. NO graphics, NO windowing, NO I/O.
                   ETOPO 2022 at 0.1°, compiled in (make_earth_relief.py).
                   examples/noise_stats calibrates noise;
                   examples/find_biome finds the nearest column of a biome;
-                  examples/planet_stats prints realistic climate statistics.
+                  examples/planet_stats prints realistic climate statistics;
+                  examples/continent_stats compares continent shapes with Earth.
+                  tint: grass/foliage colour from the climate.
 crates/wg-map     CLI: renders top-down PNG maps straight from the generator,
                   and benchmarks chunk generation. Use it to check accuracy.
 crates/game       Binary `world-gen`: winit window, egui menus, ash/Vulkan
@@ -63,6 +65,7 @@ cargo run --release -p worldgen --example find_biome -- 42 jungle   # where to p
 cargo run --release -p worldgen --example find_biome -- 42 snowy_slopes 17696   # in a tall world
 cargo run --release -p wg-map -- --seed 42 --realistic earth --size-km 40000 --height 17696 --whole
 cargo run --release -p worldgen --example planet_stats -- 42 continents   # aridity classes vs Earth
+cargo run --release -p worldgen --example continent_stats -- continents 1 12   # continents, coasts vs Earth (WG_DUMP=dir writes PGMs)
 ```
 
 Shaders live in `crates/game/shaders/*.vert|frag` (Vulkan GLSL) and are
@@ -86,7 +89,7 @@ print no errors), `WG_AUTOSTART=<seed>` (skip menus), `WG_CAMERA=x,z[,yaw,pitch,
 (with autostart: place the camera), `WG_SCREEN=create|settings` (open a menu; `map` with autostart),
 `WG_EXIT_AFTER_FRAMES=N`, `WG_HEIGHT=<blocks>` (with autostart: world height),
 `WG_PLANET=continents|pangea|earth|islands` (with autostart: a Realistic world),
-`WG_QUALITY=fast|balanced|quality`, `WG_SIZE_KM=<km>`. A `settings.ron` in the working directory sets
+`WG_QUALITY=fast|balanced|quality`, `WG_SIZE_KM=<km>`, `WG_MAP_ZOOM=<blocks per point>` (map zoom). A `settings.ron` in the working directory sets
 render distance etc.
 
 ## Conventions
@@ -107,6 +110,11 @@ render distance etc.
   and the final surface height (`biome::select`). Surface blocks come from
   `surface_for(.., biome)`. Every biome must stay reachable: a test fails
   if one never appears over 48 km.
+- **Grass colour** is a `Tint` (one byte per column: a climate colour map,
+  or a few special biomes), not the biome, so borders fade. Chunks,
+  `ColumnSample` and `LodColumn` all carry it from `Tint::of`; the mesher
+  merges tinted faces by tint. Maps use `ColumnSample::orbit_color`
+  (ground + average canopy).
 - **Trees** use a jittered grid (`trees.rs`). A chunk places every tree
   within `TREE_REACH` of it, using `sample_column` for outside columns.
   Logs may replace air/water/leaves and leaves only air, in global cell
@@ -134,7 +142,11 @@ render distance etc.
   output when working on Realistic. A Realistic world simulates its
   planet once in `WorldGenerator::new` (0.3–8 s by `SimQuality`); the game
   does that on a background thread with a loading screen. Planet and
-  quality are part of the world's identity, like the seed.
+  quality are part of the world's identity, like the seed. The Continents
+  planet's crust is *planned* (`tectonics::plan_continents`: lobes,
+  peninsulas, gulfs, islands, Voronoi straits); check shape changes with
+  `continent_stats` and the `continents_are_many_separate_and_intricate`
+  test.
 - **Water level per column:** `Shape.water` is the water surface (a river
   or lake can sit above `SEA_LEVEL`). Fill water up to it, put sea ice at
   it, use `ColumnSample::water_top()` to stand on it; `underwater` means

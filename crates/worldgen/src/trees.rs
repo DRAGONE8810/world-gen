@@ -96,6 +96,12 @@ pub fn biome_trees(biome: Biome) -> (f64, &'static [(TreeKind, u32)]) {
         CloudForest => (0.75, &[(T::Jungle, 3), (T::Oak, 2), (T::Bush, 1)]),
         MangroveSwamp => (0.6, &[(T::Mangrove, 1)]),
         MushroomFields => (0.05, &[(T::RedMushroom, 1), (T::BrownMushroom, 1)]),
+        CoastalDunes => (0.01, &[(T::Bush, 1)]),
+        TropicalBeach => (0.03, &[(T::Bush, 2), (T::Jungle, 1)]),
+        RockyDesert => (0.01, &[(T::Cactus, 1), (T::Bush, 1)]),
+        Bog => (0.12, &[(T::Spruce, 3), (T::Bush, 1)]),
+        Moor => (0.02, &[(T::Bush, 3), (T::Spruce, 1)]),
+        FloodedJungle => (0.6, &[(T::Jungle, 3), (T::Mangrove, 1)]),
         _ => (0.0, &[]),
     }
 }

@@ -9,11 +9,32 @@
 //! the previous image stays on screen, stretched to the new view, so
 //! zooming and panning feel immediate. A coarse 128-pixel pass comes first,
 //! then the full-resolution one.
+//!
+//! The picture imitates a satellite photo rather than a block map:
+//!
+//! * each land pixel shows the ground *with the biome's average tree
+//!   canopy over it* (`ColumnSample::orbit_color`), so forests are dark
+//!   green, and grass follows the climate smoothly (`worldgen::tint`);
+//! * land colours are averaged with their land neighbours, which turns
+//!   pixel-sharp biome borders into narrow transitions but keeps coasts
+//!   crisp;
+//! * relief is hill-shaded from the sampled heights (light from the
+//!   north-west), exaggerated in proportion to the zoom so mountain ranges
+//!   still show on a whole planet;
+//! * water goes from turquoise shallows to dark deep sea;
+//! * an optional cloud layer: fractal noise, denser where the climate is
+//!   humid, drawn as a separate texture so its opacity can change without
+//!   resampling.
 
 use egui::{Color32, Pos2, Rect, Sense, Vec2};
 use std::sync::mpsc::{channel, Receiver};
 use std::sync::Arc;
+use worldgen::noise::{OctaveConfig, OctaveNoise};
+use worldgen::rng::derive_seed;
+use worldgen::spline::{lerp, smoothstep};
 use worldgen::{ColumnSample, WorldGenerator, SEA_LEVEL};
+
+use crate::config::MapClouds;
 
 /// Pixels per side of the full-resolution map image.
 const MAP_PX: usize = 512;
@@ -33,13 +54,14 @@ struct MapImage {
     blocks_per_px: f64,
     px: usize,
     texture: egui::TextureHandle,
+    clouds: egui::TextureHandle,
 }
 
 struct Job {
     center: (f64, f64),
     blocks_per_px: f64,
     px: usize,
-    rx: Receiver<egui::ColorImage>,
+    rx: Receiver<(egui::ColorImage, egui::ColorImage)>,
 }
 
 pub struct WorldMap {
@@ -56,13 +78,22 @@ pub struct WorldMap {
 impl WorldMap {
     /// Opens the map centred on the player, zoomed so the view spans ~4 km
     /// of a normal world (scaled for tall worlds).
+    /// `WG_MAP_ZOOM=<blocks per point>` overrides the zoom (screenshots).
     pub fn new(player: (f64, f64), terrain_scale: f64) -> Self {
-        Self { center: player, blocks_per_point: 8.0 * terrain_scale, image: None, job: None, needs_full: true }
+        let zoom = std::env::var("WG_MAP_ZOOM").ok().and_then(|v| v.parse().ok()).unwrap_or(8.0 * terrain_scale);
+        Self { center: player, blocks_per_point: zoom, image: None, job: None, needs_full: true }
     }
 
     /// Draws the map full-screen. `player` is the camera position (x, z)
     /// and `yaw` its heading.
-    pub fn ui(&mut self, ui: &mut egui::Ui, gen: &Arc<WorldGenerator>, player: (f64, f64), yaw: f32) -> MapAction {
+    pub fn ui(
+        &mut self,
+        ui: &mut egui::Ui,
+        gen: &Arc<WorldGenerator>,
+        player: (f64, f64),
+        yaw: f32,
+        clouds: &mut MapClouds,
+    ) -> MapAction {
         let mut action = MapAction::None;
         let half_world = gen.settings().size.max_extent() as f64 / 2.0;
         let max_bpp = (2.0 * half_world / 256.0).max(1.0);
@@ -127,12 +158,12 @@ impl WorldMap {
                     c.y + ((im.center.1 - img_span / 2.0 - self.center.1) / self.blocks_per_point) as f32,
                 );
                 let size = (img_span / self.blocks_per_point) as f32;
-                painter.image(
-                    im.texture.id(),
-                    Rect::from_min_size(min, Vec2::splat(size)),
-                    Rect::from_min_max(Pos2::ZERO, Pos2::new(1.0, 1.0)),
-                    Color32::WHITE,
-                );
+                let (at, uv) = (Rect::from_min_size(min, Vec2::splat(size)), Rect::from_min_max(Pos2::ZERO, Pos2::new(1.0, 1.0)));
+                painter.image(im.texture.id(), at, uv, Color32::WHITE);
+                if clouds.show && clouds.opacity > 0.0 {
+                    let a = (clouds.opacity.clamp(0.0, 1.0) * 255.0).round() as u8;
+                    painter.image(im.clouds.id(), at, uv, Color32::from_white_alpha(a));
+                }
             }
             // Player marker: a triangle pointing along the view direction.
             let to_screen = |x: f64, z: f64| {
@@ -192,6 +223,24 @@ impl WorldMap {
                 egui::FontId::proportional(24.0),
                 Color32::WHITE,
             );
+
+            // ---- Cloud controls (top right) ----
+            egui::Area::new(egui::Id::new("map_clouds"))
+                .anchor(egui::Align2::RIGHT_TOP, Vec2::new(-14.0, 14.0))
+                .show(ui.ctx(), |ui| {
+                    egui::Frame::popup(ui.style()).show(ui, |ui| {
+                        ui.checkbox(&mut clouds.show, "Clouds");
+                        ui.add_enabled_ui(clouds.show, |ui| {
+                            ui.horizontal(|ui| {
+                                ui.label("Opacity");
+                                let mut pct = clouds.opacity * 100.0;
+                                if ui.add(egui::Slider::new(&mut pct, 0.0..=100.0).suffix(" %").integer()).changed() {
+                                    clouds.opacity = pct / 100.0;
+                                }
+                            });
+                        });
+                    });
+                });
         });
         action
     }
@@ -200,7 +249,10 @@ impl WorldMap {
         let (tx, rx) = channel();
         let (gen, center, bpp) = (gen.clone(), self.center, span / px as f64);
         std::thread::spawn(move || {
-            let _ = tx.send(render(&gen, center, bpp, px, vscale));
+            let samples = sample(&gen, center, bpp, px);
+            let map = paint(&samples, px, bpp, vscale);
+            let clouds = paint_clouds(&samples, px, center, bpp, gen.settings().seed);
+            let _ = tx.send((map, clouds));
         });
         self.job = Some(Job { center, blocks_per_px: bpp, px, rx });
     }
@@ -208,10 +260,16 @@ impl WorldMap {
     fn poll(&mut self, ctx: &egui::Context) {
         let Some(job) = &self.job else { return };
         match job.rx.try_recv() {
-            Ok(img) => {
+            Ok((img, clouds)) => {
                 let texture = ctx.load_texture("world_map", img, egui::TextureOptions::NEAREST);
-                self.image =
-                    Some(MapImage { center: job.center, blocks_per_px: job.blocks_per_px, px: job.px, texture });
+                let clouds = ctx.load_texture("world_map_clouds", clouds, egui::TextureOptions::LINEAR);
+                self.image = Some(MapImage {
+                    center: job.center,
+                    blocks_per_px: job.blocks_per_px,
+                    px: job.px,
+                    texture,
+                    clouds,
+                });
                 self.job = None;
             }
             Err(std::sync::mpsc::TryRecvError::Empty) => ctx.request_repaint(),
@@ -220,41 +278,137 @@ impl WorldMap {
     }
 }
 
-/// Samples a `px × px` image centred on `center`, `bpp` blocks per pixel.
-fn render(gen: &WorldGenerator, center: (f64, f64), bpp: f64, px: usize, vscale: f64) -> egui::ColorImage {
+/// Samples a `px × px` grid of columns centred on `center`, `bpp` blocks
+/// per pixel (`None` beyond the representable coordinates).
+fn sample(gen: &WorldGenerator, center: (f64, f64), bpp: f64, px: usize) -> Vec<Option<ColumnSample>> {
     use rayon::prelude::*;
     let x0 = center.0 - bpp * px as f64 / 2.0;
     let z0 = center.1 - bpp * px as f64 / 2.0;
-    let pixels: Vec<Color32> = (0..px * px)
+    (0..px * px)
         .into_par_iter()
         .map(|i| {
             let x = (x0 + ((i % px) as f64 + 0.5) * bpp).floor();
             let z = (z0 + ((i / px) as f64 + 0.5) * bpp).floor();
-            if x.abs() > i32::MAX as f64 || z.abs() > i32::MAX as f64 {
-                return Color32::from_rgb(10, 10, 14);
+            (x.abs() <= i32::MAX as f64 && z.abs() <= i32::MAX as f64).then(|| gen.sample_column(x as i32, z as i32))
+        })
+        .collect()
+}
+
+/// Colour outside the world.
+const OUTSIDE: [u8; 3] = [10, 10, 14];
+
+/// Paints the satellite-style map from the samples (see the module docs).
+fn paint(samples: &[Option<ColumnSample>], px: usize, bpp: f64, vscale: f64) -> egui::ColorImage {
+    // Pixels blend only with their own kind: land with land, sea (water
+    // and pack ice) with sea, so coasts stay sharp.
+    let kind = |i: usize| match samples[i].as_ref() {
+        Some(s) if s.inside => 1 + (s.underwater || s.ice) as u8,
+        _ => 0,
+    };
+    let land = |i: usize| kind(i) == 1;
+    let base: Vec<[f32; 3]> =
+        samples.iter().map(|s| s.as_ref().map_or(OUTSIDE, |s| map_color(s, vscale)).map(|v| v as f32)).collect();
+    // Hill shading needs heights in default-world blocks per pixel; on
+    // coarse views real slopes vanish, so they're exaggerated with the zoom.
+    let height = |i: usize| samples[i].as_ref().map_or(0.0, |s| s.water_top() as f64);
+    let exaggerate = 0.35 * (bpp / 16.0).max(1.0).sqrt() * 2.5 / vscale;
+    let pixels = (0..px * px)
+        .map(|i| {
+            let (x, z) = (i % px, i / px);
+            if kind(i) == 0 {
+                let [r, g, b] = base[i].map(|v| v as u8);
+                return Color32::from_rgb(r, g, b);
             }
-            let [r, g, b] = map_color(&gen.sample_column(x as i32, z as i32), vscale);
+            // 3 × 3 average over neighbours of the same kind (centre
+            // weighted double).
+            let (mut sum, mut w) = ([0f32; 3], 0f32);
+            for dz in -1i32..=1 {
+                for dx in -1i32..=1 {
+                    let (nx, nz) = (x as i32 + dx, z as i32 + dz);
+                    if nx < 0 || nz < 0 || nx >= px as i32 || nz >= px as i32 {
+                        continue;
+                    }
+                    let j = nx as usize + nz as usize * px;
+                    if kind(j) == kind(i) {
+                        let k = if dx == 0 && dz == 0 { 2.0 } else { 1.0 };
+                        for c in 0..3 {
+                            sum[c] += k * base[j][c];
+                        }
+                        w += k;
+                    }
+                }
+            }
+            // Light from the north-west (top left): ground rising towards
+            // the south-east faces it.
+            let up_left = i - (x > 0) as usize - if z > 0 { px } else { 0 };
+            let down_right = i + (x + 1 < px) as usize + if z + 1 < px { px } else { 0 };
+            let slope = (height(down_right) - height(up_left)) / (2.83 * bpp.max(1.0));
+            let shade = if land(i) { (1.0 + slope * exaggerate).clamp(0.6, 1.4) as f32 } else { 1.0 };
+            let [r, g, b] = sum.map(|v| (v / w * shade).clamp(0.0, 255.0) as u8);
             Color32::from_rgb(r, g, b)
         })
         .collect();
     egui::ColorImage::new([px, px], pixels)
 }
 
-/// Map colour of a column: the top block, water darker with depth, land
-/// brighter with altitude so mountains read without hill shading.
+/// Map colour of a column before blending and shading: the column seen
+/// from orbit on land (canopy included), sea ice, or water from turquoise
+/// shallows to dark deep sea.
 pub fn map_color(c: &ColumnSample, vscale: f64) -> [u8; 3] {
     if !c.inside {
-        [10, 10, 14]
+        OUTSIDE
     } else if c.ice {
         worldgen::blocks::ICE.info().color
     } else if c.underwater {
-        let d = ((c.shape.water - c.surface_y) as f64 / (50.0 * vscale)).clamp(0.0, 1.0) as f32;
-        [(40.0 - d * 20.0) as u8, (90.0 - d * 40.0) as u8, (200.0 - d * 60.0) as u8]
+        let d = ((c.shape.water - c.surface_y) as f64 / (40.0 * vscale)).clamp(0.0, 1.0).sqrt();
+        let (shallow, deep) = ([62.0, 140.0, 178.0], [14.0, 38.0, 96.0]);
+        std::array::from_fn(|k| lerp(d, shallow[k], deep[k]) as u8)
     } else {
+        // Snow and bare rock high up read a little brighter, like sunlit
+        // peaks.
         let alt = ((c.surface_y - SEA_LEVEL) as f64 / (150.0 * vscale)).clamp(0.0, 1.0);
-        let k = 0.85 + 0.3 * alt;
-        c.top_color().map(|v| (v as f64 * k).min(255.0) as u8)
+        c.orbit_color().map(|v| (v as f64 * (0.95 + 0.12 * alt)).min(255.0) as u8)
     }
+}
+
+/// The cloud layer: white with alpha. Fractal noise whose finest octave is
+/// one pixel wide (finer ones would only alias), warped for swirls, and
+/// thresholded by a cloud cover that grows with humidity: rainforests and
+/// oceans are cloudy, deserts mostly clear.
+fn paint_clouds(
+    samples: &[Option<ColumnSample>],
+    px: usize,
+    center: (f64, f64),
+    bpp: f64,
+    seed: u64,
+) -> egui::ColorImage {
+    // Largest systems ~2,000 km (2^21 blocks), down to one pixel.
+    let first = -21;
+    let octaves = (1..=16).take_while(|&k| 2f64.powi(-(first + k - 1)) >= bpp).count().max(1);
+    let amps: Vec<f64> = (0..octaves).map(|k| 0.7f64.powi(k as i32)).collect();
+    let noise = OctaveNoise::new(derive_seed(seed, "map/clouds"), &OctaveConfig::new(first, &amps));
+    let warp_x = OctaveNoise::new(derive_seed(seed, "map/clouds_wx"), &OctaveConfig::new(-21, &[1.0, 0.6, 0.35]));
+    let warp_z = OctaveNoise::new(derive_seed(seed, "map/clouds_wz"), &OctaveConfig::new(-21, &[1.0, 0.6, 0.35]));
+    let x0 = center.0 - bpp * px as f64 / 2.0;
+    let z0 = center.1 - bpp * px as f64 / 2.0;
+    let pixels = (0..px * px)
+        .map(|i| {
+            let Some(s) = samples[i].as_ref().filter(|s| s.inside) else {
+                return Color32::TRANSPARENT;
+            };
+            let x = x0 + ((i % px) as f64 + 0.5) * bpp;
+            let z = z0 + ((i / px) as f64 + 0.5) * bpp;
+            let (wx, wz) = (x + 8.0e5 * warp_x.sample_2d(x, z), z + 8.0e5 * warp_z.sample_2d(x, z));
+            let n = noise.sample_2d(wx, wz);
+            let cover = (0.36 + 0.4 * s.shape.climate.humidity).clamp(0.06, 0.8);
+            // n is roughly normal around 0 with spread ~0.3: cut it so
+            // about `cover` of the sky is cloudy.
+            let cut = 0.3 * (1.0 - 2.0 * cover);
+            let a = smoothstep(cut - 0.03, cut + 0.16, n);
+            Color32::from_white_alpha((a * 255.0) as u8)
+        })
+        .collect();
+    egui::ColorImage::new([px, px], pixels)
 }
 
 /// `1234.5` → "1.2 km", `3.0` → "3 blocks".
@@ -280,10 +434,10 @@ mod tests {
             WorldGenerator::new(WorldSettings { seed: 42, size: WorldSize::from_blocks(16_000), ..Default::default() });
         // The whole 16 km world plus a margin: both water and land, and the
         // dark area outside the border.
-        let img = render(&g, (0.0, 0.0), 20_000.0 / 64.0, 64, 1.0);
+        let img = paint(&sample(&g, (0.0, 0.0), 20_000.0 / 64.0, 64), 64, 20_000.0 / 64.0, 1.0);
         let px: std::collections::HashSet<_> = img.pixels.iter().copied().collect();
         assert!(px.contains(&Color32::from_rgb(10, 10, 14)), "border not shown");
-        assert!(img.pixels.iter().any(|p| p.b() > 150 && p.r() < 80), "no water");
+        assert!(img.pixels.iter().any(|p| p.b() > 90 && p.r() < 70), "no water");
         assert!(img.pixels.iter().any(|p| p.g() > p.b()), "no land");
     }
 

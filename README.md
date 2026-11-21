@@ -13,13 +13,16 @@ deliberately plain.
 
 ## Status
 
-Six steps are in: foundation, terrain (continents, oceans, mountains,
-rivers), 48 biomes with trees, scale and speed (world height up to
+Seven steps are in: foundation, terrain (continents, oceans, mountains,
+rivers), 56 biomes with trees (five kinds of beach), scale and speed (world height up to
 17,696 blocks, a far view out to 256 chunks with LOD rings like Distant
 Horizons, binary greedy meshing, GPU-driven drawing, an in-game world
 map), a second, **realistic** generator, and a far view that can reach
 the **whole world**: tick *Whole world* in Settings (or pick the Quality
-preset) and fly up to see an entire planet at once.
+preset) and fly up to see an entire planet at once. Step 7 gave planets
+wilder continents (peninsulas, gulfs, inland seas, 4–8 per planet), made
+grass colours fade smoothly between biomes, and turned the world map into
+a satellite-style view with optional clouds.
 
 There are two generators:
 

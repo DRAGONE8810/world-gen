@@ -25,6 +25,7 @@
 use crate::biome::Biome;
 use crate::block::{blocks, BlockId};
 use crate::generator::{ColumnSample, WorldGenerator};
+use crate::tint::Tint;
 use crate::trees::{self, TREE_CELL, TREE_REACH};
 
 /// Cells up to this size get exact tree rasterisation.
@@ -40,8 +41,10 @@ pub struct LodColumn {
     pub top_y: i32,
     /// Block at `top_y`, for its colour.
     pub block: BlockId,
-    /// Biome of the ground, for grass and leaf tints.
+    /// Biome of the ground.
     pub biome: Biome,
+    /// Grass and leaf colour of the ground.
+    pub tint: Tint,
     /// Y of the terrain surface (below water or trees).
     pub ground_y: i32,
 }
@@ -55,7 +58,7 @@ impl LodColumn {
         } else {
             (s.surface_y, s.top_block)
         };
-        Self { inside: s.inside, top_y, block, biome: s.biome, ground_y: s.surface_y }
+        Self { inside: s.inside, top_y, block, biome: s.biome, tint: s.tint, ground_y: s.surface_y }
     }
 
     /// Applies one tree block the way chunk generation does: above the top

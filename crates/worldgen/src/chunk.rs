@@ -25,6 +25,7 @@ use crate::biome::Biome;
 use crate::block::{blocks, BlockId};
 use crate::palette::{PalettedSection, SECTION_SIZE, SECTION_VOLUME};
 use crate::settings::WorldHeight;
+use crate::tint::Tint;
 use serde::{Deserialize, Serialize};
 
 pub const CHUNK_SIZE: i32 = 16;
@@ -122,6 +123,8 @@ pub struct Chunk {
     /// Biome of each column (`x + z*16`). One per column, like Minecraft
     /// before 1.18: biomes here are 2D, chosen at the surface.
     pub biomes: [Biome; 256],
+    /// Grass and foliage colour of each column (`x + z*16`).
+    pub tints: [Tint; 256],
 }
 
 impl Chunk {
@@ -136,6 +139,7 @@ impl Chunk {
             window: Vec::new(),
             heightmap: [(height.min_y() - 1) as i16; 256],
             biomes: [Biome::default(); 256],
+            tints: [Tint::default(); 256],
         }
     }
 
@@ -159,6 +163,7 @@ impl Chunk {
             window,
             heightmap: [(height.min_y() - 1) as i16; 256],
             biomes: [Biome::default(); 256],
+            tints: [Tint::default(); 256],
         }
         .trimmed()
     }

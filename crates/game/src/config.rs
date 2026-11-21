@@ -24,6 +24,23 @@ pub struct GameSettings {
     pub show_debug: bool,
     /// Last used world settings, so "Create world" remembers them.
     pub last_world: WorldSettings,
+    /// Cloud layer of the world map.
+    pub map_clouds: MapClouds,
+}
+
+/// The world map's cloud layer: shown or not, and how opaque.
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct MapClouds {
+    pub show: bool,
+    /// 0 = invisible, 1 = fully opaque where the sky is overcast.
+    pub opacity: f32,
+}
+
+impl Default for MapClouds {
+    fn default() -> Self {
+        Self { show: true, opacity: 0.75 }
+    }
 }
 
 impl Default for GameSettings {
@@ -38,6 +55,7 @@ impl Default for GameSettings {
             vsync: true,
             show_debug: true,
             last_world: WorldSettings::default(),
+            map_clouds: MapClouds::default(),
         }
     }
 }

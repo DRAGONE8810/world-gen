@@ -39,6 +39,7 @@ use crate::realistic::RealisticWorld;
 use crate::rng::{derive_seed, hash_position, hash_position_f64, Xoroshiro128PlusPlus};
 use crate::settings::{Generator, WorldSettings, WorldType, SEA_LEVEL};
 use crate::terrain::{Shape, TerrainShaper};
+use crate::tint::Tint;
 use crate::trees::{self, Tree, TREE_CELL, TREE_REACH};
 
 /// Horizontal size of a density-noise cell, in blocks.
@@ -75,6 +76,8 @@ pub struct ColumnSample {
     /// Climate, base height and roughness (default for Flat worlds).
     pub shape: Shape,
     pub biome: Biome,
+    /// Grass and foliage colour (follows the climate smoothly).
+    pub tint: Tint,
     /// The water surface above this column is frozen (ice at sea level).
     pub ice: bool,
 }
@@ -104,6 +107,7 @@ impl ColumnSample {
             water: SEA_LEVEL,
         },
         biome: Biome::Plains,
+        tint: Tint(0),
         ice: false,
     };
 
@@ -123,10 +127,22 @@ impl ColumnSample {
         if self.ice {
             blocks::ICE.info().color
         } else if self.top_block == blocks::GRASS {
-            self.biome.grass_color()
+            self.tint.color()
         } else {
             self.top_block.info().color
         }
+    }
+
+    /// Colour of the column seen from orbit: like `top_color`, with the
+    /// biome's average tree canopy laid over the ground (a sampled column
+    /// has no trees, and a forest seen from above is its leaves).
+    pub fn orbit_color(&self) -> [u8; 3] {
+        let ground = self.top_color();
+        if !self.inside || self.ice || self.underwater {
+            return ground;
+        }
+        let (cover, leaves) = crate::tint::canopy(self.biome, self.tint);
+        std::array::from_fn(|c| (ground[c] as f64 + (leaves[c] as f64 - ground[c] as f64) * cover).round() as u8)
     }
 }
 
@@ -403,6 +419,11 @@ impl WorldGenerator {
                 B::SaltFlats => (SALT, SAND),
                 B::Volcanic => (BASALT, BASALT),
                 B::MushroomFields => (MYCELIUM, DIRT),
+                B::ShingleBeach if patch > 0.55 => (STONE, STONE),
+                B::ShingleBeach => (GRAVEL, GRAVEL),
+                B::TropicalBeach => (WHITE_SAND, WHITE_SAND),
+                B::TidalFlats if patch < -0.45 => (CLAY, CLAY),
+                B::TidalFlats => (MUD, MUD),
                 _ => (SAND, SAND),
             };
         }
@@ -425,6 +446,25 @@ impl WorldGenerator {
             B::OldGrowthTaiga if patch > 0.45 => (COARSE_DIRT, DIRT),
             B::OldGrowthTaiga => (PODZOL, DIRT),
             B::Desert | B::Beach => (SAND, SAND),
+            // Marram grass holds the older dunes.
+            B::CoastalDunes if patch > 0.5 => (GRASS, SAND),
+            B::CoastalDunes => (SAND, SAND),
+            B::ShingleBeach if patch > 0.55 => (STONE, STONE),
+            B::ShingleBeach if patch < -0.6 => (SAND, SAND),
+            B::ShingleBeach => (GRAVEL, GRAVEL),
+            B::TropicalBeach => (WHITE_SAND, WHITE_SAND),
+            // Salt marsh on the higher flats, mud and clay lower down.
+            B::TidalFlats if patch > 0.25 => (GRASS, MUD),
+            B::TidalFlats if patch < -0.45 => (CLAY, CLAY),
+            B::TidalFlats => (MUD, MUD),
+            B::RockyDesert if patch > 0.35 => (GRAVEL, GRAVEL),
+            B::RockyDesert if patch < -0.35 => (STONE, STONE),
+            B::RockyDesert => (RED_SAND, SANDSTONE),
+            B::Bog if patch > 0.3 => (PODZOL, DIRT),
+            B::Bog if patch < -0.25 => (MUD, MUD),
+            B::Moor if patch > 0.2 => (COARSE_DIRT, DIRT),
+            B::Moor if patch < -0.5 => (STONE, STONE),
+            B::FloodedJungle if patch < -0.2 => (MUD, MUD),
             B::SaltFlats => (SALT, SAND),
             B::Badlands if patch > -0.2 => (RED_SAND, TERRACOTTA),
             B::Badlands => (self.stripe(x, y, z), TERRACOTTA),
@@ -501,6 +541,7 @@ impl WorldGenerator {
                 inside: true,
                 shape: ColumnSample::OUTSIDE.shape,
                 biome: Biome::Plains,
+                tint: Tint::of(Biome::Plains, &ColumnSample::OUTSIDE.shape, y),
                 ice: false,
             };
         }
@@ -572,6 +613,7 @@ impl WorldGenerator {
             inside: true,
             shape,
             biome,
+            tint: Tint::of(biome, &shape, surface),
             ice: underwater && self.frozen_surface(x, z, biome),
         }
     }
@@ -653,6 +695,7 @@ impl WorldGenerator {
         let mut tops = [blocks::AIR; 256];
         let mut heightmap = [(min_y - 1) as i16; 256];
         let mut biomes = [Biome::default(); 256];
+        let mut tints = [Tint::default(); 256];
 
         // Fill dense [section][16^3] buffers first: sequential writes into
         // plain arrays are much faster than palette writes block by block.
@@ -784,6 +827,7 @@ impl WorldGenerator {
                 }
                 let biome = col_biome.unwrap_or_default();
                 biomes[i] = biome;
+                tints[i] = Tint::of(biome, &shapes[i], surface[i]);
                 let water = shapes[i].water;
                 if surface[i] < water && self.frozen_surface(x, z, biome) {
                     put(lx, water, lz, blocks::ICE);
@@ -832,6 +876,7 @@ impl WorldGenerator {
         let mut chunk = Chunk::assemble(pos, height, floor, window_start, sections.collect());
         chunk.heightmap = heightmap;
         chunk.biomes = biomes;
+        chunk.tints = tints;
         chunk
     }
 
@@ -1377,6 +1422,32 @@ mod tests {
         }
         let missing: Vec<_> = Biome::ALL.iter().filter(|b| !seen[**b as usize]).map(|b| b.name()).collect();
         assert!(missing.is_empty(), "biomes never generated: {missing:?}");
+    }
+
+    /// Grass colour follows the climate, not the biome: where the biome
+    /// changes between neighbouring grass columns, the colour barely does
+    /// (it used to jump to the other biome's colour).
+    #[test]
+    fn grass_colour_blends_across_biome_borders() {
+        let g = generator(42, WorldType::Normal);
+        let diff = |a: [u8; 3], b: [u8; 3]| a.iter().zip(&b).map(|(&x, &y)| (x as i32 - y as i32).abs()).max().unwrap();
+        let (mut borders, mut tint_jump, mut biome_jump) = (0, 0i64, 0i64);
+        for row in 0..40 {
+            let z = row * 600 - 12_000;
+            let mut prev = g.sample_column(-12_000, z);
+            for x in -11_999..12_000 {
+                let s = g.sample_column(x, z);
+                if s.biome != prev.biome && s.top_block == blocks::GRASS && prev.top_block == blocks::GRASS {
+                    borders += 1;
+                    tint_jump += diff(s.tint.color(), prev.tint.color()) as i64;
+                    biome_jump += diff(s.biome.grass_color(), prev.biome.grass_color()) as i64;
+                }
+                prev = s;
+            }
+        }
+        assert!(borders > 50, "only {borders} grass borders crossed");
+        let (t, b) = (tint_jump as f64 / borders as f64, biome_jump as f64 / borders as f64);
+        assert!(t < 8.0 && t < b / 3.0, "mean colour jump at borders: {t:.1} (by biome it would be {b:.1})");
     }
 
     /// Trees are generated per chunk, but a canopy may reach into the next

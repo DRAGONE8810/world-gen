@@ -27,7 +27,7 @@
 use bytemuck::{Pod, Zeroable};
 use worldgen::block::Opacity;
 use worldgen::palette::{SECTION_SIZE, SECTION_VOLUME};
-use worldgen::{blocks, Biome, BlockId, Chunk};
+use worldgen::{blocks, BlockId, Chunk, Tint};
 
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Pod, Zeroable, PartialEq, Eq, Hash)]
@@ -119,7 +119,7 @@ fn face_visible(b: BlockId, n: BlockId) -> bool {
 /// of terrain without any lighting system.
 const FACE_SHADE: [f32; 6] = [0.80, 0.80, 1.00, 0.50, 0.65, 0.65]; // +x -x +y -y +z -z
 
-type SectionMesher = fn(&[BlockId], &[Biome; 256], i32, &mut MeshData);
+type SectionMesher = fn(&[BlockId], &[Tint; 256], i32, &mut MeshData);
 
 pub fn mesh_chunk(chunk: &Chunk, nb: &Neighbours) -> MeshData {
     mesh_chunk_with(chunk, nb, greedy_section)
@@ -184,7 +184,7 @@ fn mesh_chunk_with(chunk: &Chunk, nb: &Neighbours, section_mesher: SectionMesher
             }
         }
 
-        section_mesher(&padded, &chunk.biomes, y0, &mut out);
+        section_mesher(&padded, &chunk.tints, y0, &mut out);
     }
 
     if out.vertices.is_empty() {
@@ -209,33 +209,34 @@ fn is_buried(chunk: &Chunk, nb: &Neighbours, s: usize) -> bool {
         && opaque(nb.pos_z, s)
 }
 
-/// Blocks whose colour depends on the biome (like Minecraft's grass and
-/// foliage tint): grass takes the biome's grass colour, oak leaves a darker
+/// Blocks whose colour depends on the column's tint (like Minecraft's grass
+/// and foliage colours): grass takes the tint colour, oak leaves a darker
 /// shade of it.
 #[inline]
 fn tinted(b: BlockId) -> bool {
     b == blocks::GRASS || b == blocks::OAK_LEAVES
 }
 
-/// Face colour of block `b` in `biome`, before face shading.
-pub fn block_color(b: BlockId, biome: Biome) -> [u8; 3] {
+/// Face colour of block `b` in a column of tint `tint`, before face
+/// shading.
+pub fn block_color(b: BlockId, tint: Tint) -> [u8; 3] {
     match b {
-        blocks::GRASS => biome.grass_color(),
-        blocks::OAK_LEAVES => biome.grass_color().map(|c| (c as f32 * 0.72) as u8),
+        blocks::GRASS => tint.color(),
+        blocks::OAK_LEAVES => tint.foliage_color(),
         _ => b.info().color,
     }
 }
 
-// The mask packs block id and biome into 8 bits each.
-const _: () = assert!(Biome::ALL.len() < 255);
+// The mask packs block id and tint into 8 bits each.
+const _: () = assert!(Tint::COUNT < 255);
 
 /// Merge key of a visible face: 0 = none; otherwise (block id + 1), plus
-/// (biome + 1) << 8 for tinted blocks. Block ids and biomes both fit in 8
+/// (tint + 1) << 8 for tinted blocks. Block ids and tints both fit in 8
 /// bits.
 #[inline]
-fn face_key(b: BlockId, biome: Biome) -> u16 {
+fn face_key(b: BlockId, tint: Tint) -> u16 {
     if tinted(b) {
-        (b.0 + 1) | ((biome as u16 + 1) << 8)
+        (b.0 + 1) | ((tint.0 as u16 + 1) << 8)
     } else {
         b.0 + 1
     }
@@ -244,9 +245,9 @@ fn face_key(b: BlockId, biome: Biome) -> u16 {
 /// Greedy-meshes one padded section into `out`, finding visible faces with
 /// bitmasks (see the module docs).
 ///
-/// The merge key is the block id, plus the biome for tinted blocks, so two
+/// The merge key is the block id, plus the tint for tinted blocks, so two
 /// grass faces only merge when they have the same colour.
-fn greedy_section(padded: &[BlockId], biomes: &[Biome; 256], y0: i32, out: &mut MeshData) {
+fn greedy_section(padded: &[BlockId], tints: &[Tint; 256], y0: i32, out: &mut MeshData) {
     // Per axis d, per interior column (i along u, j along v): bit k set when
     // the padded block at p[d] = k is opaque / not empty.
     let mut opaque = [[0u32; 256]; 3];
@@ -299,7 +300,7 @@ fn greedy_section(padded: &[BlockId], biomes: &[Biome; 256], y0: i32, out: &mut 
                     p[u] = i + 1;
                     p[v] = j + 1;
                     let b = padded[pidx(p[0], p[1], p[2])];
-                    masks[k - 1][col] = face_key(b, biomes[(p[0] - 1) + (p[2] - 1) * 16]);
+                    masks[k - 1][col] = face_key(b, tints[(p[0] - 1) + (p[2] - 1) * 16]);
                     slices |= 1 << (k - 1);
                 }
             }
@@ -351,11 +352,8 @@ fn merge_slice(
             base[v] = j as f32;
             base[1] += y0 as f32;
             let block = BlockId((m & 0xFF) - 1);
-            let biome = match m >> 8 {
-                0 => Biome::default(),
-                k => Biome::ALL[k as usize - 1],
-            };
-            emit_quad(out, base, u, v, w as f32, h as f32, positive, block_color(block, biome), face);
+            let tint = Tint((m >> 8).saturating_sub(1) as u8);
+            emit_quad(out, base, u, v, w as f32, h as f32, positive, block_color(block, tint), face);
             i += w;
         }
     }
@@ -364,9 +362,9 @@ fn merge_slice(
 /// The original per-block greedy mesher, kept as the reference the binary
 /// one is tested against.
 #[cfg(test)]
-fn greedy_section_reference(padded: &[BlockId], biomes: &[Biome; 256], y0: i32, out: &mut MeshData) {
-    // 0 = no face; otherwise (block id + 1) | (biome + 1) << 8 for tinted
-    // blocks. Block ids and biomes both fit in 8 bits.
+fn greedy_section_reference(padded: &[BlockId], tints: &[Tint; 256], y0: i32, out: &mut MeshData) {
+    // 0 = no face; otherwise (block id + 1) | (tint + 1) << 8 for tinted
+    // blocks. Block ids and tints both fit in 8 bits.
     let mut mask = [0u16; 256];
     for d in 0..3 {
         // u and v are the two axes spanning the face plane, chosen cyclically
@@ -395,8 +393,8 @@ fn greedy_section_reference(padded: &[BlockId], biomes: &[Biome; 256], y0: i32, 
                         let m = if !face_visible(b, n) {
                             0
                         } else if tinted(b) {
-                            let biome = biomes[(p[0] - 1) + (p[2] - 1) * 16];
-                            (b.0 + 1) | ((biome as u16 + 1) << 8)
+                            let tint = tints[(p[0] - 1) + (p[2] - 1) * 16];
+                            (b.0 + 1) | ((tint.0 as u16 + 1) << 8)
                         } else {
                             b.0 + 1
                         };
@@ -440,11 +438,8 @@ fn greedy_section_reference(padded: &[BlockId], biomes: &[Biome; 256], y0: i32, 
                         base[v] = j as f32;
                         base[1] += y0 as f32;
                         let block = BlockId((m & 0xFF) - 1);
-                        let biome = match m >> 8 {
-                            0 => Biome::default(),
-                            k => Biome::ALL[k as usize - 1],
-                        };
-                        emit_quad(out, base, u, v, w as f32, h as f32, positive, block_color(block, biome), face);
+                        let tint = Tint((m >> 8).saturating_sub(1) as u8);
+                        emit_quad(out, base, u, v, w as f32, h as f32, positive, block_color(block, tint), face);
                         i += w;
                     }
                 }
@@ -571,22 +566,23 @@ mod tests {
     }
 
     #[test]
-    fn grass_merges_only_within_one_biome() {
+    fn grass_merges_only_within_one_tint() {
+        let (a, b) = (Tint(40), Tint(200));
         let mut c = Chunk::empty(ChunkPos::new(0, 0), WorldHeight::default());
         for z in 0..16 {
             for x in 0..16 {
                 c.set(x, 64, z, blocks::GRASS);
-                c.biomes[x + z * 16] = if x < 8 { Biome::Plains } else { Biome::Jungle };
+                c.tints[x + z * 16] = if x < 8 { a } else { b };
             }
         }
         let m = mesh_chunk(&c, &NONE);
         // Top and bottom split into two quads each, the ±x sides are one
-        // biome each, the ±z sides split in two.
+        // tint each, the ±z sides split in two.
         assert_eq!(m.quad_count(), 2 + 2 + 1 + 1 + 2 + 2);
-        // Top faces are unshaded, so they carry the exact biome grass colours.
+        // Top faces are unshaded, so they carry the exact tint colours.
         let colors: std::collections::HashSet<_> = m.vertices.iter().map(|v| v.color()).collect();
-        for b in [Biome::Plains, Biome::Jungle] {
-            assert!(colors.contains(&b.grass_color()), "{b:?}");
+        for t in [a, b] {
+            assert!(colors.contains(&t.color()), "{t:?}");
         }
     }
 

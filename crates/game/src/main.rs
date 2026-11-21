@@ -132,6 +132,10 @@ impl App {
     }
 
     fn set_screen(&mut self, screen: Screen) {
+        if self.screen == Screen::Map && screen != Screen::Map {
+            // Keep the map's cloud settings for next time.
+            self.settings.save();
+        }
         self.screen = screen;
         self.keys.clear();
         if let Some(s) = &mut self.session {
@@ -302,7 +306,9 @@ impl App {
                     let gen = s.chunks.generator_arc().clone();
                     let player = (s.camera.pos.x, s.camera.pos.z);
                     if let Some(m) = &mut s.map {
-                        if let map::MapAction::Teleport(x, z) = m.ui(ui, &gen, player, s.camera.yaw) {
+                        if let map::MapAction::Teleport(x, z) =
+                            m.ui(ui, &gen, player, s.camera.yaw, &mut self.settings.map_clouds)
+                        {
                             teleport = Some((x, z));
                         }
                     }

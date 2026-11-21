@@ -16,6 +16,7 @@ seed when it is needed, so a 60,000 km world costs the same as a 1 km one.
 | 4 | Scale and speed: tall worlds (cubic chunks), LODs to 256 chunks, faster meshing, GPU-driven drawing, world map | **Done** (4a, 4b, 4c), see [devlog 04](devlog/04-scale.md); RTX 2080 frame-rate check pending on real hardware |
 | 5 | Realistic generator: whole-planet simulation (plate tectonics, climate, rivers, erosion, lakes), planets Continents / Pangea / Earth / Islands, simulation quality, graphics presets | **Done**, see [devlog 05](devlog/05-realistic.md) |
 | 6 | Whole-world far view: LOD to the world border and orbit, detail by height above ground, GPU mesh cache, faster tiles and bookkeeping | **Done**, see [devlog 06](devlog/06-far-view.md); RTX 2080 frame-rate check pending |
+| 7 | Coasts, continents and colours: no sea walls, LOD to 256k chunks, planned continents, beach types and sub-biomes, climate-blended grass, satellite map with clouds, random seed | **Done**, see [devlog 07](devlog/07-coasts-and-colours.md) |
 
 ## Step 1: Foundation ✔
 
@@ -150,3 +151,22 @@ modelled, not measured.
 Result: the whole 60,000 km world from the ground is ~13,600 tiles and
 ~200 MB of vertices, built in 6–13 s on 3 threads, nearest first.
 Pending: frame rate on an RTX 2080; a screen-space error metric.
+
+## Step 7: Coasts, continents and colours ✔
+
+- ✔ Dry depressions get a rim, so the sea never stops in a straight "wall"
+  (tested by marching from every dry column below sea level).
+- ✔ LOD distance up to 262,144 chunks (logarithmic slider); Random seed
+  button.
+- ✔ Continents planet planned from ellipse lobes, peninsulas, gulfs and
+  islands in four Earth-like characters, kept apart by Voronoi straits:
+  4–8 continents per seed (was mostly 2), largest ~⅓ of the land.
+- ✔ Five beach types (sand, shingle, tropical white sand, tidal flats,
+  coastal dunes) and sub-biomes (rocky desert, bog, moor, flooded
+  jungle): 56 biomes.
+- ✔ Grass and oak-leaf colour follows the climate (`Tint`), so biome
+  borders fade instead of jumping; +0.3 % quads.
+- ✔ World map like a satellite photo: canopy colours, soft borders, hill
+  shading, shelf colours, optional clouds with opacity.
+
+Next: clouds in the world; RTX 2080 frame-rate check.
