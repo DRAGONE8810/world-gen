@@ -20,6 +20,7 @@ pub mod biome;
 pub mod block;
 pub mod chunk;
 pub mod generator;
+pub mod lod;
 pub mod noise;
 pub mod palette;
 pub mod rng;

@@ -309,7 +309,33 @@ pub fn settings(ui: &mut egui::Ui, s: &mut GameSettings) -> bool {
             ui.add_space(20.0);
             egui::Grid::new("settings").num_columns(2).spacing([16.0, 12.0]).show(ui, |ui| {
                 ui.label("Render distance");
-                ui.add(egui::Slider::new(&mut s.render_distance, 2..=32).suffix(" chunks"));
+                ui.vertical(|ui| {
+                    ui.add(
+                        egui::Slider::new(&mut s.render_distance, 2..=crate::config::MAX_RENDER_DISTANCE)
+                            .suffix(" chunks"),
+                    );
+                    ui.label(RichText::new("Full detail, every block.").weak());
+                });
+                ui.end_row();
+                ui.label("LOD distance");
+                ui.vertical(|ui| {
+                    ui.add(egui::Slider::new(&mut s.lod_distance, 0..=crate::config::MAX_LOD_DISTANCE).suffix(" chunks"));
+                    let side = 2 * s.lod_distance.max(s.render_distance) as u64;
+                    ui.label(
+                        RichText::new(if s.lod_distance > s.render_distance {
+                            format!(
+                                "Simplified terrain out to {} blocks ({} × {} = {} chunks of area). Tall worlds see further, by their terrain scale.",
+                                group_thousands(s.lod_distance * 16),
+                                side,
+                                side,
+                                group_thousands((side * side) as u32)
+                            )
+                        } else {
+                            "Off: set it above the render distance.".to_string()
+                        })
+                        .weak(),
+                    );
+                });
                 ui.end_row();
                 ui.label("Field of view");
                 ui.add(egui::Slider::new(&mut s.fov_deg, 50.0..=110.0).suffix("°"));
@@ -422,8 +448,12 @@ pub fn hud(ui: &mut egui::Ui, h: &HudInfo) {
                         group_thousands(h.world.height.blocks())
                     )));
                     ui.label(mono(format!(
-                        "Chunks: {} loaded, {} meshed, {} drawn, {} jobs",
-                        h.stats.loaded_chunks, h.stats.meshed_chunks, h.drawn_chunks, h.stats.jobs_in_flight
+                        "Chunks: {} loaded, {} meshed   LOD tiles: {}",
+                        h.stats.loaded_chunks, h.stats.meshed_chunks, h.stats.lod_tiles
+                    )));
+                    ui.label(mono(format!(
+                        "Meshes drawn {}   {} to build, {} jobs",
+                        h.drawn_chunks, h.stats.pending, h.stats.jobs_in_flight
                     )));
                     ui.label(mono(format!(
                         "Triangles {:.2} M   block memory {:.1} MB",

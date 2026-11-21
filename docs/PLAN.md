@@ -13,7 +13,7 @@ seed when it is needed, so a 60,000 km world costs the same as a 1 km one.
 | 1 | Foundation: project layout, world settings, chunk storage, generator skeleton, game menu, Vulkan renderer, map tool | **Done**, see [devlog 01](devlog/01-foundation.md) |
 | 2 | Terrain: continents, oceans, erosion, mountains, rivers, 3D overhangs | **Done**, see [devlog 02](devlog/02-terrain.md) |
 | 3 | Biomes and trees | **Done**, see [devlog 03](devlog/03-biomes.md) |
-| 4 | Scale and speed: tall worlds (cubic chunks), LODs to 256 chunks, faster meshing, GPU-driven drawing, world map | **In progress**: 4a tall worlds done, see [devlog 04](devlog/04-scale.md) |
+| 4 | Scale and speed: tall worlds (cubic chunks), LODs to 256 chunks, faster meshing, GPU-driven drawing, world map | **In progress**: 4a tall worlds and 4b LOD rings done, see [devlog 04](devlog/04-scale.md) |
 
 ## Step 1: Foundation ✔
 
@@ -81,12 +81,14 @@ in three PRs: 4a tall worlds, 4b far view and LODs, 4c speed and world map.
   sections around the surface; stone below and air above are implied, so
   a 17,696-block chunk costs 3.3 KiB and 3.5 ms. 3D streaming of single
   sections waits for caves, when there is something to see underground.
-- **Two view distances:** full detail up to 64 chunks of radius, and an
-  **LOD distance** up to 256 chunks of radius (512 × 512 = 262,144 chunks),
-  in the style of Voxy and Distant Horizons.
-- **LODs:** rings of coarser chunks (2×, 4×, 8×, … block size) out to the
-  LOD distance, generated straight from the column sampler (heights, top
-  blocks, trees as coarse blobs), cached and rebuilt as the camera moves.
+- ✔ (4b) **Two view distances:** full detail up to 64 chunks of radius,
+  and an **LOD distance** up to 256 chunks of radius (512 × 512 = 262,144
+  chunks), in the style of Voxy and Distant Horizons. Tall worlds multiply
+  the LOD distance by their terrain scale.
+- ✔ (4b) **LODs:** a quadtree of tiles in rings of 2, 4, 8, … block cells
+  out to the LOD distance, sampled straight from the generator (ground,
+  water, ice, trees exact at small cells and by density at large ones),
+  swapped without holes as the camera moves. Reverse-Z depth.
 - **Binary greedy meshing** (bitmask face culling) and packed 8-byte vertices.
 - **GPU-driven drawing:** one big vertex/index pool, indirect draws.
 - Chunk cache and unloading tuned for the larger distances.

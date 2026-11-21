@@ -25,13 +25,14 @@ Platforms: Windows and Linux required, macOS (MoltenVK) nice to have.
 ```
 crates/worldgen   Pure generator library. NO graphics, NO windowing, NO I/O.
                   rng, noise, spline, terrain, biome, trees, block,
-                  palette, chunk, settings, generator.
+                  palette, chunk, settings, generator, lod (far-view sampling).
                   examples/noise_stats calibrates noise;
                   examples/find_biome finds the nearest column of a biome.
 crates/wg-map     CLI: renders top-down PNG maps straight from the generator,
                   and benchmarks chunk generation. Use it to check accuracy.
 crates/game       Binary `world-gen`: winit window, egui menus, ash/Vulkan
-                  renderer, greedy mesher, chunk streaming.
+                  renderer, greedy mesher, LOD quadtree + tile mesher (lod.rs),
+                  chunk/tile streaming (world.rs).
 docs/PLAN.md      The 4-step roadmap and its status.
 docs/devlog/      One log per step: detailed technical write-up + a short
                   plain-language summary for non-programmers.
@@ -49,7 +50,7 @@ cargo fmt                        # rustfmt.toml: max_width 120
 cargo run --release              # the game (default-run = world-gen)
 cargo run --release -p wg-map -- --seed 42 --extent 16000 --px 1024 --out map.png
 cargo run --release -p wg-map -- --seed 42 --layer biome    # also: height|continentalness|erosion|pv|roughness|temperature|humidity
-cargo run --release -p wg-map -- --seed 42 --bench 32   # ms per chunk
+cargo run --release -p wg-map -- --seed 42 --bench 32   # ms per chunk and per LOD tile
 cargo run --release -p worldgen --example noise_stats   # climate noise percentiles
 cargo run --release -p worldgen --example find_biome -- 42 jungle   # where to put WG_CAMERA
 cargo run --release -p worldgen --example find_biome -- 42 snowy_slopes 17696   # in a tall world
@@ -103,6 +104,12 @@ render distance etc.
 - **Column sampling and chunks must agree:** `sample_column` is used by maps,
   the menu preview, the HUD and tree placement; tests assert it matches
   `generate_chunk` (surface, top block, biome, sea ice).
+- **LODs:** `WorldGenerator::lod_grid` is the only source of far terrain;
+  at 1-block cells it must equal the generated chunk's top blocks (tested),
+  so any generator change that breaks that test must be mirrored there.
+  The game's quadtree (`lod.rs`) must keep its leaves gap- and overlap-free
+  and `draw_set` must never draw a mesh that isn't uploaded (tested).
+  Depth is reverse-Z with an infinite far plane.
 - **Coordinates:** blocks are `i32`, noise inputs `f64` and wrapped
   (`noise::wrap`); camera position is `f64`; the GPU only sees
   camera-relative `f32`.

@@ -1,14 +1,18 @@
 //! Player settings (the "Settings" menu), saved to `settings.ron` next to
 //! where the game is started.
 
+use crate::lod::Layout;
 use serde::{Deserialize, Serialize};
 use worldgen::WorldSettings;
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct GameSettings {
-    /// Radius of loaded chunks around the camera.
+    /// Radius of full-detail chunks around the camera.
     pub render_distance: u32,
+    /// Radius, in chunks, of the LOD rings drawn beyond the render
+    /// distance (0 or ≤ render distance: off).
+    pub lod_distance: u32,
     pub fov_deg: f32,
     pub mouse_sensitivity: f32,
     /// Blocks per second. The mouse wheel doubles or halves it in game.
@@ -23,6 +27,7 @@ impl Default for GameSettings {
     fn default() -> Self {
         Self {
             render_distance: 12,
+            lod_distance: 128,
             fov_deg: 70.0,
             mouse_sensitivity: 1.0,
             fly_speed: 20.0,
@@ -32,6 +37,11 @@ impl Default for GameSettings {
         }
     }
 }
+
+/// Full-detail radius range, in chunks.
+pub const MAX_RENDER_DISTANCE: u32 = 64;
+/// LOD radius range: 256 chunks = 512 × 512 = 262,144 chunks of area.
+pub const MAX_LOD_DISTANCE: u32 = 256;
 
 /// Fly speed range. The top end (2^20 ≈ 1 million blocks/s) crosses the
 /// full 60,000 km world in about a minute; chunk generation can't keep up at
@@ -48,7 +58,28 @@ const PATH: &str = "settings.ron";
 
 impl GameSettings {
     pub fn load() -> Self {
-        std::fs::read_to_string(PATH).ok().and_then(|s| ron::from_str(&s).ok()).unwrap_or_default()
+        let mut s: Self = std::fs::read_to_string(PATH).ok().and_then(|s| ron::from_str(&s).ok()).unwrap_or_default();
+        s.render_distance = s.render_distance.clamp(2, MAX_RENDER_DISTANCE);
+        s.lod_distance = s.lod_distance.min(MAX_LOD_DISTANCE);
+        s
+    }
+
+    /// The two view distances for the streamer in a world whose terrain is
+    /// magnified `terrain_scale` times (tall worlds). The LOD distance grows
+    /// with the terrain, so a 17,696-block world shows the same mountains
+    /// as a normal one, 46 × further away. That costs only a few more rings
+    /// (one per doubling of the distance), not 46² times the tiles.
+    pub fn layout(&self, terrain_scale: f64) -> Layout {
+        let lod = (self.lod_distance as f64 * terrain_scale.max(1.0)).round() as i32;
+        Layout {
+            detail: self.render_distance as i32,
+            lod: if self.lod_distance > self.render_distance { lod } else { 0 },
+        }
+    }
+
+    /// How far the view reaches, in blocks (where the fog ends).
+    pub fn view_distance_blocks(&self, terrain_scale: f64) -> f32 {
+        (self.layout(terrain_scale).lod.max(self.render_distance as i32) * 16) as f32
     }
 
     pub fn save(&self) {
