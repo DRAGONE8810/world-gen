@@ -10,7 +10,7 @@
 //! ```
 
 use rayon::prelude::*;
-use worldgen::{blocks, ColumnSample, WorldGenerator, WorldSettings, WorldSize, WorldType, SEA_LEVEL};
+use worldgen::{blocks, Biome, ColumnSample, WorldGenerator, WorldSettings, WorldSize, WorldType, SEA_LEVEL};
 
 struct Args {
     seed: u64,
@@ -22,6 +22,7 @@ struct Args {
     out: String,
     bench: Option<u32>,
     layer: Layer,
+    features: bool,
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -32,13 +33,17 @@ enum Layer {
     Erosion,
     PeaksValleys,
     Roughness,
+    Biome,
+    Temperature,
+    Humidity,
 }
 
 fn usage() -> ! {
     eprintln!(
         "usage: wg-map [--seed N|TEXT] [--type normal|amplified|large|islands|flat] [--size-km KM]\n\
          \x20             [--center X,Z] [--extent BLOCKS] [--px PIXELS] [--out FILE.png]\n\
-         \x20             [--layer surface|height|continentalness|erosion|pv|roughness]\n\
+         \x20             [--layer surface|height|biome|continentalness|erosion|pv|roughness|temperature|humidity]\n\
+         \x20             [--no-trees] [--legend]\n\
          \x20      wg-map --bench N   (time generating an N×N square of chunks on one thread)"
     );
     std::process::exit(2)
@@ -55,6 +60,7 @@ fn parse_args() -> Args {
         out: "map.png".into(),
         bench: None,
         layer: Layer::Surface,
+        features: true,
     };
     let mut it = std::env::args().skip(1);
     while let Some(flag) = it.next() {
@@ -88,9 +94,13 @@ fn parse_args() -> Args {
                     "erosion" | "e" => Layer::Erosion,
                     "pv" | "peaks" => Layer::PeaksValleys,
                     "roughness" => Layer::Roughness,
+                    "biome" | "biomes" => Layer::Biome,
+                    "temperature" | "t" => Layer::Temperature,
+                    "humidity" | "h" => Layer::Humidity,
                     _ => usage(),
                 }
             }
+            "--no-trees" => a.features = false,
             "--bench" => a.bench = Some(val().parse().unwrap_or_else(|_| usage())),
             "-h" | "--help" => usage(),
             _ => usage(),
@@ -105,7 +115,7 @@ fn main() {
         seed: args.seed,
         size: WorldSize::from_km(args.size_km),
         world_type: args.world_type,
-        features: true,
+        features: args.features,
     });
     if let Some(n) = args.bench {
         bench(&gen, n as i32);
@@ -132,6 +142,7 @@ fn main() {
     let mut land = 0u64;
     let mut inside = 0u64;
     let mut heights = Vec::with_capacity((px * px) as usize);
+    let mut biome_count = vec![0u64; Biome::ALL.len()];
     for iz in 0..px {
         for ix in 0..px {
             let s = samples[(iz * (px + 1) + ix) as usize];
@@ -139,6 +150,7 @@ fn main() {
                 inside += 1;
                 land += !s.underwater as u64;
                 heights.push(s.surface_y);
+                biome_count[s.biome as usize] += 1;
             }
             let se = samples[((iz + 1) * (px + 1) + ix + 1) as usize];
             let color = pixel_color(args.layer, &s, &se, blocks_per_px);
@@ -168,6 +180,21 @@ fn main() {
             p(0.99),
             heights[heights.len() - 1]
         );
+    }
+    if args.layer == Layer::Biome && inside > 0 {
+        // Share of the map area per biome, largest first.
+        let mut v: Vec<_> = Biome::ALL.iter().map(|b| (biome_count[*b as usize], *b)).collect();
+        v.sort_by_key(|e| std::cmp::Reverse(e.0));
+        let line: Vec<String> = v
+            .iter()
+            .filter(|(n, _)| *n > 0)
+            .map(|(n, b)| format!("{} {:.2}%", b.name(), *n as f64 * 100.0 / inside as f64))
+            .collect();
+        eprintln!("biomes: {}", line.join(", "));
+        let missing: Vec<_> = v.iter().filter(|(n, _)| *n == 0).map(|(_, b)| b.name()).collect();
+        if !missing.is_empty() {
+            eprintln!("not in this area: {}", missing.join(", "));
+        }
     }
 }
 
@@ -218,12 +245,22 @@ fn pixel_color(layer: Layer, s: &ColumnSample, se: &ColumnSample, blocks_per_px:
     };
     match layer {
         Layer::Surface => {
-            if s.underwater {
+            if s.ice {
+                shaded(blocks::ICE.info().color)
+            } else if s.underwater {
                 water(SEA_LEVEL - s.surface_y)
             } else {
-                shaded(s.top_block.info().color)
+                shaded(s.top_color())
             }
         }
+        Layer::Biome => {
+            // Flat biome colours, lightly hill-shaded so relief stays readable.
+            let c = s.biome.map_color();
+            let k = (1.0 + slope * 0.15).clamp(0.8, 1.15);
+            c.map(|v| (v as f64 * k).clamp(0.0, 255.0) as u8)
+        }
+        Layer::Temperature => ramp(s.shape.climate.temperature),
+        Layer::Humidity => ramp(s.shape.climate.humidity),
         Layer::Height => {
             if s.underwater {
                 water(SEA_LEVEL - s.surface_y)

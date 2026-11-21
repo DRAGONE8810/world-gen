@@ -23,8 +23,10 @@ Platforms: Windows and Linux required, macOS (MoltenVK) nice to have.
 
 ```
 crates/worldgen   Pure generator library. NO graphics, NO windowing, NO I/O.
-                  rng, noise, spline, terrain, block, palette, chunk,
-                  settings, generator. examples/noise_stats calibrates noise.
+                  rng, noise, spline, terrain, biome, trees, block,
+                  palette, chunk, settings, generator.
+                  examples/noise_stats calibrates noise;
+                  examples/find_biome finds the nearest column of a biome.
 crates/wg-map     CLI: renders top-down PNG maps straight from the generator,
                   and benchmarks chunk generation. Use it to check accuracy.
 crates/game       Binary `world-gen`: winit window, egui menus, ash/Vulkan
@@ -45,9 +47,10 @@ cargo clippy --all-targets       # must be warning-free
 cargo fmt                        # rustfmt.toml: max_width 120
 cargo run --release              # the game (default-run = world-gen)
 cargo run --release -p wg-map -- --seed 42 --extent 16000 --px 1024 --out map.png
-cargo run --release -p wg-map -- --seed 42 --layer height   # also: continentalness|erosion|pv|roughness
+cargo run --release -p wg-map -- --seed 42 --layer biome    # also: height|continentalness|erosion|pv|roughness|temperature|humidity
 cargo run --release -p wg-map -- --seed 42 --bench 32   # ms per chunk
 cargo run --release -p worldgen --example noise_stats   # climate noise percentiles
+cargo run --release -p worldgen --example find_biome -- 42 jungle   # where to put WG_CAMERA
 ```
 
 Shaders live in `crates/game/shaders/*.vert|frag` (Vulkan GLSL) and are
@@ -86,8 +89,18 @@ render distance etc.
   `(H − y) + A·N > 0` on a 4×8×4 interpolation grid. Tune the world by
   editing curve tables, then check with `wg-map` layers and the statistics
   tests in `generator.rs`.
+- **Biomes** are a pure function of the climate (+ temperature, humidity)
+  and the final surface height (`biome::select`). Surface blocks come from
+  `surface_for(.., biome)`. Every biome must stay reachable: a test fails
+  if one never appears over 48 km.
+- **Trees** use a jittered grid (`trees.rs`). A chunk places every tree
+  within `TREE_REACH` of it, using `sample_column` for outside columns.
+  Logs may replace air/water/leaves and leaves only air, in global cell
+  order, so overlaps don't depend on chunk order. Keep every tree shape
+  within `TREE_REACH` (tested).
 - **Column sampling and chunks must agree:** `sample_column` is used by maps,
-  the menu preview and the HUD; tests assert it matches `generate_chunk`.
+  the menu preview, the HUD and tree placement; tests assert it matches
+  `generate_chunk` (surface, top block, biome, sea ice).
 - **Coordinates:** blocks are `i32`, noise inputs `f64` and wrapped
   (`noise::wrap`); camera position is `f64`; the GPU only sees
   camera-relative `f32`.

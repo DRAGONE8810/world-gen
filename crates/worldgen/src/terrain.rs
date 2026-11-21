@@ -20,8 +20,13 @@
 //! Because the parameters are independent, every combination occurs
 //! somewhere: flat inland plains (high `c`, high `e`), coastal mountains
 //! (low `c`, low `e`, high `pv`), eroded badlands-style plateaus, and so on.
-//! Step 3 reuses the same parameters (plus temperature and humidity) to pick
-//! biomes, so biomes automatically agree with the land they sit on.
+//! Two more parameters, **temperature** and **humidity**, don't change the
+//! shape at all. Together with the four above they pick the biome (see
+//! `biome.rs`), so biomes automatically agree with the land they sit on.
+//!
+//! Finally, a rare **island** noise raises cone-shaped oceanic islands out of
+//! the deep ocean (think Hawaii or the Azores). They carry the volcanic and
+//! mushroom-field biomes.
 
 use crate::noise::{DoubleNoise, OctaveConfig};
 use crate::rng::derive_seed;
@@ -38,6 +43,11 @@ pub struct Climate {
     /// large negative weirdness give peaks, and |weirdness| ≈ 2/3 gives
     /// valleys. `pv = 1 − |3|w| − 2|`.
     pub peaks_valleys: f64,
+    /// Sea-level temperature, −1 (polar) … +1 (tropical). The biome code
+    /// cools it further with altitude.
+    pub temperature: f64,
+    /// −1 (arid) … +1 (very wet).
+    pub humidity: f64,
 }
 
 /// Output of the shaping stage for one column.
@@ -51,6 +61,8 @@ pub struct Shape {
     pub roughness: f64,
     /// River channel strength 0..1 (already applied to `height`).
     pub river: f64,
+    /// Oceanic island strength 0..1 (0 almost everywhere).
+    pub island: f64,
 }
 
 pub struct TerrainShaper {
@@ -59,6 +71,9 @@ pub struct TerrainShaper {
     weirdness: DoubleNoise,
     river: DoubleNoise,
     jagged: DoubleNoise,
+    temperature: DoubleNoise,
+    humidity: DoubleNoise,
+    islands: DoubleNoise,
     warp_x: DoubleNoise,
     warp_z: DoubleNoise,
     /// Horizontal stretch of all climate noise (4 for Large biomes).
@@ -79,6 +94,9 @@ const GAIN_CONTINENTALNESS: f64 = 2.45;
 const GAIN_EROSION: f64 = 2.4;
 const GAIN_WEIRDNESS: f64 = 2.3;
 const GAIN_RIVER: f64 = 2.3;
+const GAIN_TEMPERATURE: f64 = 2.3;
+const GAIN_HUMIDITY: f64 = 2.3;
+const GAIN_ISLAND: f64 = 1.9;
 
 impl TerrainShaper {
     pub fn new(seed: u64, world_type: WorldType) -> Self {
@@ -95,6 +113,14 @@ impl TerrainShaper {
             weirdness: n("climate/weirdness", -9, &[1.0; 4]),
             river: n("terrain/river", -11, &[1.0; 4]),
             jagged: n("terrain/jagged", -6, &[1.0, 1.0, 1.0]),
+            // Temperature changes slowly (zones ~4 km across, lowest octave
+            // 8 km) so a glacier never sits next to a jungle; humidity
+            // twice as fast, so each climate zone holds several biomes.
+            temperature: n("climate/temperature", -13, &[1.0; 4]),
+            humidity: n("climate/humidity", -12, &[1.0; 4]),
+            // Island-sized blobs (~250 m); only the rare strongest peaks of
+            // this noise, and only over deep ocean, become islands.
+            islands: n("terrain/islands", -9, &[1.0, 1.0]),
             warp_x: n("terrain/warp_x", -10, &[1.0, 1.0, 1.0]),
             warp_z: n("terrain/warp_z", -10, &[1.0, 1.0, 1.0]),
             scale: if world_type == WorldType::LargeBiomes { 4.0 } else { 1.0 },
@@ -159,7 +185,9 @@ impl TerrainShaper {
         let e = (self.erosion.sample_2d(wx, wz) * GAIN_EROSION).clamp(-1.0, 1.0);
         let w = (self.weirdness.sample_2d(wx, wz) * GAIN_WEIRDNESS).clamp(-1.0, 1.0);
         let pv = 1.0 - ((3.0 * w.abs()) - 2.0).abs();
-        Climate { continentalness: c, erosion: e, weirdness: w, peaks_valleys: pv }
+        let temperature = (self.temperature.sample_2d(wx, wz) * GAIN_TEMPERATURE).clamp(-1.0, 1.0);
+        let humidity = (self.humidity.sample_2d(wx, wz) * GAIN_HUMIDITY).clamp(-1.0, 1.0);
+        Climate { continentalness: c, erosion: e, weirdness: w, peaks_valleys: pv, temperature, humidity }
     }
 
     /// Full shaping for one column.
@@ -186,6 +214,22 @@ impl TerrainShaper {
 
         let mut height = SEA_LEVEL as f64 + self.base_height.eval(c) + relief;
 
+        // Oceanic islands: only over deep ocean, where the island noise has
+        // one of its rare high peaks. The noise rises smoothly towards the
+        // peak, so the island is a cone: a volcano-like summit up to ~70
+        // blocks above the sea with gentle flanks running into the sea floor.
+        let mut island = 0.0;
+        let deep_ocean = 1.0 - smoothstep(-0.45, -0.3, c);
+        if deep_ocean > 0.0 {
+            let (fx, fz) = (x as f64 / self.scale, z as f64 / self.scale);
+            let v = (self.islands.sample_2d(fx, fz) * GAIN_ISLAND).clamp(-1.0, 1.0);
+            island = smoothstep(0.62, 0.95, v) * deep_ocean;
+            if island > 0.0 {
+                height = height.max(SEA_LEVEL as f64 - 14.0 + 85.0 * island);
+                roughness = lerp(island.min(0.5) * 2.0, roughness, 1.5);
+            }
+        }
+
         // Rivers: a thin band where the river noise crosses zero. They are
         // carved down to just below sea level, fade out in high terrain and
         // naturally join the sea because the band continues into the ocean.
@@ -204,7 +248,7 @@ impl TerrainShaper {
             roughness = lerp(valley * allowed, roughness, 1.0);
         }
 
-        Shape { climate, height, roughness, river }
+        Shape { climate, height, roughness, river, island }
     }
 }
 

@@ -61,6 +61,40 @@ blocks! {
     11 OAK_LOG      "oak_log"       [102, 81, 50]    Opaque,
     12 OAK_LEAVES   "oak_leaves"    [58, 120, 35]    Translucent,
     13 CLAY         "clay"          [160, 166, 179]  Opaque,
+    // Step 3: biome ground blocks.
+    14 RED_SAND           "red_sand"            [190, 102, 33]   Opaque,
+    15 TERRACOTTA         "terracotta"          [152, 94, 67]    Opaque,
+    16 ORANGE_TERRACOTTA  "orange_terracotta"   [161, 83, 37]    Opaque,
+    17 YELLOW_TERRACOTTA  "yellow_terracotta"   [186, 133, 35]   Opaque,
+    18 RED_TERRACOTTA     "red_terracotta"      [143, 61, 46]    Opaque,
+    19 WHITE_TERRACOTTA   "white_terracotta"    [209, 178, 161]  Opaque,
+    20 BROWN_TERRACOTTA   "brown_terracotta"    [77, 51, 35]     Opaque,
+    21 PODZOL             "podzol"              [91, 63, 24]     Opaque,
+    22 MYCELIUM           "mycelium"            [111, 99, 105]   Opaque,
+    23 COARSE_DIRT        "coarse_dirt"         [119, 85, 59]    Opaque,
+    24 MUD                "mud"                 [60, 57, 60]     Opaque,
+    25 PACKED_ICE         "packed_ice"          [141, 180, 250]  Opaque,
+    26 BASALT             "basalt"              [72, 72, 78]     Opaque,
+    27 SALT               "salt_crust"          [236, 232, 222]  Opaque,
+    28 LIMESTONE          "limestone"           [196, 190, 170]  Opaque,
+    // Step 3: trees and plants.
+    29 BIRCH_LOG          "birch_log"           [216, 215, 210]  Opaque,
+    30 BIRCH_LEAVES       "birch_leaves"        [100, 150, 60]   Translucent,
+    31 SPRUCE_LOG         "spruce_log"          [58, 37, 16]     Opaque,
+    32 SPRUCE_LEAVES      "spruce_leaves"       [50, 90, 55]     Translucent,
+    33 JUNGLE_LOG         "jungle_log"          [85, 67, 25]     Opaque,
+    34 JUNGLE_LEAVES      "jungle_leaves"       [40, 140, 20]    Translucent,
+    35 ACACIA_LOG         "acacia_log"          [103, 96, 86]    Opaque,
+    36 ACACIA_LEAVES      "acacia_leaves"       [95, 135, 30]    Translucent,
+    37 DARK_OAK_LOG       "dark_oak_log"        [60, 46, 26]     Opaque,
+    38 DARK_OAK_LEAVES    "dark_oak_leaves"     [40, 85, 20]     Translucent,
+    39 MANGROVE_LOG       "mangrove_log"        [84, 56, 40]     Opaque,
+    40 MANGROVE_LEAVES    "mangrove_leaves"     [70, 125, 25]    Translucent,
+    41 MANGROVE_ROOTS     "mangrove_roots"      [74, 59, 38]     Opaque,
+    42 CACTUS             "cactus"              [85, 127, 43]    Opaque,
+    43 MUSHROOM_STEM      "mushroom_stem"       [203, 196, 185]  Opaque,
+    44 RED_MUSHROOM_BLOCK "red_mushroom_block"  [200, 46, 45]    Opaque,
+    45 BROWN_MUSHROOM_BLOCK "brown_mushroom_block" [149, 111, 81] Opaque,
 }
 
 impl BlockId {
@@ -78,6 +112,25 @@ impl BlockId {
     }
     pub fn count() -> usize {
         BLOCK_TABLE.len()
+    }
+    /// Logs, leaves, roots, cactus and mushroom blocks: everything trees
+    /// are built from. Used by tests and the column/chunk agreement checks.
+    pub fn is_tree_part(self) -> bool {
+        (blocks::OAK_LOG.0..=blocks::OAK_LEAVES.0).contains(&self.0)
+            || (blocks::BIRCH_LOG.0..=blocks::BROWN_MUSHROOM_BLOCK.0).contains(&self.0)
+    }
+    /// Leaves of any species (trees may grow their logs through these).
+    pub fn is_leaves(self) -> bool {
+        matches!(
+            self,
+            blocks::OAK_LEAVES
+                | blocks::BIRCH_LEAVES
+                | blocks::SPRUCE_LEAVES
+                | blocks::JUNGLE_LEAVES
+                | blocks::ACACIA_LEAVES
+                | blocks::DARK_OAK_LEAVES
+                | blocks::MANGROVE_LEAVES
+        )
     }
     pub fn by_name(name: &str) -> Option<BlockId> {
         BLOCK_TABLE.iter().position(|b| b.name == name).map(|i| BlockId(i as u16))

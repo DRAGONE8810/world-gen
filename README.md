@@ -8,11 +8,12 @@ world costs no more than a small one.
 Accuracy of the generated world comes first, then performance. Visuals are
 deliberately plain.
 
-![In game](docs/images/step1-ingame.png)
+![In game](docs/images/step3-ingame-forest.png)
 
 ## Status
 
-Step 1 of 4 (foundation) is done. See [docs/PLAN.md](docs/PLAN.md) for the
+Steps 1–3 of 4 are done: foundation, terrain (continents, oceans,
+mountains, rivers), and 48 biomes with trees. See [docs/PLAN.md](docs/PLAN.md) for the
 roadmap and [docs/devlog/](docs/devlog/) for a detailed log of each step,
 each with a short plain-language summary.
 
@@ -49,6 +50,7 @@ way to check what a seed looks like:
 
 ```sh
 cargo run --release -p wg-map -- --seed 42 --extent 16000 --px 1024 --out map.png
+cargo run --release -p wg-map -- --seed 42 --layer biome  # also: height, temperature, humidity, …
 cargo run --release -p wg-map -- --seed 42 --bench 32     # generation speed
 ```
 
@@ -56,7 +58,7 @@ cargo run --release -p wg-map -- --seed 42 --bench 32     # generation speed
 
 | Crate | Purpose |
 |---|---|
-| `crates/worldgen` | the generator: noise, chunks, settings, terrain. No graphics. |
+| `crates/worldgen` | the generator: noise, chunks, settings, terrain, biomes, trees. No graphics. |
 | `crates/wg-map` | map and benchmark tool |
 | `crates/game` | window, menus, Vulkan renderer, mesher, chunk streaming |
 
