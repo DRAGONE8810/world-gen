@@ -110,6 +110,9 @@ pub const RING_TILES: i32 = 8;
 pub const MAX_LEVEL: u8 = 22;
 /// Cells per tile edge (same as blocks per chunk edge).
 pub const TILE_CELLS: usize = CHUNK_SIZE as usize;
+/// Depth (blocks) of a tree crown on a far-view wall; below it the wall
+/// shows the ground.
+const CROWN: f32 = 6.0;
 
 /// A node of the LOD quadtree. Level 0 is a chunk at chunk coordinates
 /// (`x`, `z`); level `L` covers chunks `x·2^L ..< (x+1)·2^L` (same for z).
@@ -384,6 +387,7 @@ pub fn mesh_tile(gen: &WorldGenerator, key: NodeKey) -> MeshData {
             }
             let color = block_color(c.block, c.tint);
             let side = block_color(c.side, c.tint);
+            let under = block_color(c.ground, c.tint);
             let top = (c.top_y + 1) as f32;
             // A wall more than two cells tall is a cliff (a pillar, a
             // gorge, a mountain face): its top cell's height shows the
@@ -401,13 +405,28 @@ pub fn mesh_tile(gen: &WorldGenerator, key: NodeKey) -> MeshData {
                     continue;
                 }
                 let (x0, z0) = (i as f32, j as f32);
-                // Canopy above the ground keeps its colour; a ground cliff
-                // is rock below a top band.
+                // A canopy shows its colour only as deep as a crown: below
+                // it, between the trunks, you see the ground (a wall of
+                // leaves down to the ground would make far forests look
+                // much denser from the side than the real trees). A
+                // ground cliff is rock below a top band of its top block.
                 let ground = ((c.ground_y + 1) as f32).clamp(bottom, top);
-                let parts = if ground - bottom > cliff && side != color {
-                    [(ground.max(bottom), top, color), (ground - band, ground, color), (bottom, ground - band, side)]
+                let crown = (top - CROWN).max(ground);
+                let ground_col = if crown > ground { under } else { color };
+                let parts = if ground - bottom > cliff && side != ground_col {
+                    [
+                        (crown, top, color),
+                        (ground, crown, under),
+                        (ground - band, ground, ground_col),
+                        (bottom, ground - band, side),
+                    ]
                 } else {
-                    [(bottom, top, color), (0.0, 0.0, color), (0.0, 0.0, color)]
+                    [
+                        (crown.max(bottom), top, color),
+                        (bottom, crown.max(bottom), under),
+                        (0.0, 0.0, color),
+                        (0.0, 0.0, color),
+                    ]
                 };
                 for (lo, hi, col) in parts {
                     if hi <= lo {

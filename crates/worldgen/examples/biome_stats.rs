@@ -19,6 +19,7 @@ fn main() {
         "pangea" => Some(Planet::Pangea),
         "earth" => Some(Planet::Earth),
         "islands" => Some(Planet::Islands),
+        "mushoku" => Some(Planet::Mushoku),
         _ => None,
     });
     let settings = match planet {
@@ -40,12 +41,14 @@ fn main() {
     let step = 2 * half / n;
     let mut count: HashMap<Biome, u64> = HashMap::new();
     let mut land = 0u64;
+    let mut dithered = 0u64;
     for iz in 0..n {
         for ix in 0..n {
             let s = g.sample_column(-half + ix * step, -half + iz * step);
             if s.inside && !s.underwater {
                 *count.entry(s.biome).or_default() += 1;
                 land += 1;
+                dithered += (worldgen::biome::select(&s.shape, s.surface_y) != s.biome) as u64;
             }
         }
     }
@@ -57,6 +60,10 @@ fn main() {
     }
     let missing: Vec<_> = Biome::ALL.iter().filter(|b| !v.iter().any(|(x, _)| x == *b)).map(|b| b.name()).collect();
     println!("not seen: {missing:?}");
+    println!(
+        "{:.1} % of land columns take a neighbour's biome (inside a transition zone, on its far side)",
+        100.0 * dithered as f64 / land.max(1) as f64
+    );
 
     // Transition zones: along rows, at each change of land biome, does the
     // previous biome come back within 64 blocks?

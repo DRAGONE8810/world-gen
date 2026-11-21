@@ -70,6 +70,8 @@ pub struct Tectonics {
     pub crust: Grid<f32>,
     /// Plate index per cell (for maps and tests).
     pub plate: Grid<u16>,
+    /// Centres (km) of the islands the island rounds added (for tests).
+    pub islands: Vec<(f64, f64)>,
 }
 
 struct Plate {
@@ -529,7 +531,13 @@ pub fn build(seed: u64, planet: Planet, w: usize, h: usize, km: f64) -> Tectonic
         }
         _ => (0.32, 0.55, 0.15),
     };
-    let plans = if planet == Planet::Continents { plan_continents(seed, width_km, depth_km) } else { Vec::new() };
+    // Mushoku has the same planned continents (its difference is the
+    // climate, see `theme`).
+    let plans = if matches!(planet, Planet::Continents | Planet::Mushoku) {
+        plan_continents(seed, width_km, depth_km)
+    } else {
+        Vec::new()
+    };
     let mid_warp_x = fbm("realistic/crust_mid_warp_x", -10, 3);
     let mid_warp_z = fbm("realistic/crust_mid_warp_z", -10, 3);
     let strait_noise = fbm("realistic/crust_straits", -11, 2);
@@ -826,8 +834,10 @@ pub fn build(seed: u64, planet: Planet, w: usize, h: usize, km: f64) -> Tectonic
 
     old_orogens(seed, &mut rng, w, h, km, &signed, &mut elevation, &mut mountain, &mut strike_c, &mut strike_s);
     hotspots(&mut rng, planet, w, h, km, &plate, &plates, &crust, &mut elevation, &mut mountain);
+    let islands =
+        island_rounds(seed, planet, w, h, km, &signed, &mut elevation, &mut mountain, &mut strike_c, &mut strike_s);
 
-    Tectonics { elevation, mountain, strike_c, strike_s, crust, plate }
+    Tectonics { elevation, mountain, strike_c, strike_s, crust, plate, islands }
 }
 
 /// Grows `count` plates from random seeds. Each plate spreads at its own
@@ -1030,6 +1040,254 @@ fn hotspots(
     }
 }
 
+/// The kinds of island the island rounds add, each after real ones.
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum IslandKind {
+    /// A long bent arc over a subduction zone, with a volcanic spine
+    /// (Japan, Java, Sumatra).
+    Arc,
+    /// A long narrow island with a lower range along it (Cuba, Hispaniola).
+    Ridge,
+    /// A broad block of continental crust split off a continent, with a
+    /// plateau and a range (Greenland, Madagascar, Borneo, Great Britain).
+    Block,
+    /// A small island with its own steep cordillera (Taiwan, Puerto Rico,
+    /// Jamaica).
+    Cordillera,
+    /// A small low island of rolling hills, sometimes two lobes with a
+    /// sound between them (the Falklands).
+    Hilly,
+}
+
+/// The second and third "rounds" of islands: after the plates have made
+/// the continents and the arcs, these add the islands that sit off a
+/// continent's coast, on its shelf or just beyond it: large ones (Japan,
+/// Java, Cuba, Greenland) and medium ones (Taiwan, Puerto Rico, the
+/// Falklands). Each is a chain of one to five ellipses along a centre
+/// line (bent for an arc), its coast roughened by noise, and it gets its
+/// own range along its length: mountain intensity and the range axis are
+/// written like a cordillera's, so the terrain detail draws ridges that
+/// follow the island, on a scale set by the island's width. The small
+/// islands of the open ocean (atolls, volcanoes) are below the grid's
+/// resolution and are added later by `RealisticWorld` (`islets`).
+#[allow(clippy::too_many_arguments)]
+fn island_rounds(
+    seed: u64,
+    planet: Planet,
+    w: usize,
+    h: usize,
+    km: f64,
+    signed: &[f64],
+    elevation: &mut Grid<f32>,
+    mountain: &mut Grid<f32>,
+    strike_c: &mut Grid<f32>,
+    strike_s: &mut Grid<f32>,
+) -> Vec<(f64, f64)> {
+    use std::f64::consts::TAU;
+    let (large, medium) = match planet {
+        Planet::Pangea => (5, 12),
+        Planet::Islands => (2, 10),
+        Planet::Earth => return Vec::new(),
+        _ => (7, 18),
+    };
+    let mut rng = Xoroshiro128PlusPlus::from_seed(derive_seed(seed, "realistic/island_rounds"));
+    let coast_noise =
+        OctaveNoise::new(derive_seed(seed, "realistic/island_coast"), &OctaveConfig::new(-7, &[1.0, 0.5]));
+    let fine_noise = OctaveNoise::new(derive_seed(seed, "realistic/island_fine"), &OctaveConfig::new(-5, &[1.0, 0.5]));
+    let n = w * h;
+    // Ocean cells just off the crust edge: where an island can start.
+    let shore: Vec<usize> = (0..n).filter(|&i| signed[i] < 0.0 && signed[i] > -1.5 * km - 1.0).collect();
+    if shore.is_empty() {
+        return Vec::new();
+    }
+    let sd = |x: f64, z: f64| {
+        let (i, j) = (((x / km) as isize).clamp(0, w as isize - 1), ((z / km) as isize).clamp(0, h as isize - 1));
+        signed[i as usize + j as usize * w]
+    };
+    let elev = |e: &Grid<f32>, x: f64, z: f64| {
+        let (i, j) = (((x / km) as isize).clamp(0, w as isize - 1), ((z / km) as isize).clamp(0, h as isize - 1));
+        e.data[i as usize + j as usize * w] as f64
+    };
+    let (wk, dk) = (w as f64 * km, h as f64 * km);
+    // Placed islands as (x, z, reach) to keep them apart.
+    let mut placed: Vec<(f64, f64, f64)> = Vec::new();
+    for round in 0..large + medium {
+        let big = round < large;
+        let roll = rng.next_f64();
+        let kind = if big {
+            if roll < 0.35 {
+                IslandKind::Arc
+            } else if roll < 0.65 {
+                IslandKind::Ridge
+            } else {
+                IslandKind::Block
+            }
+        } else if roll < 0.65 {
+            IslandKind::Cordillera
+        } else {
+            IslandKind::Hilly
+        };
+        let r = |rng: &mut Xoroshiro128PlusPlus, a: f64, b: f64| a + (b - a) * rng.next_f64();
+        // (length, width, peak, plateau, mountain intensity), km and m.
+        let (len, wid, peak, plateau, mtn) = match kind {
+            IslandKind::Arc => {
+                (r(&mut rng, 900.0, 2200.0), r(&mut rng, 120.0, 240.0), r(&mut rng, 2600.0, 3800.0), 150.0, 0.75)
+            }
+            IslandKind::Ridge => {
+                (r(&mut rng, 700.0, 1300.0), r(&mut rng, 80.0, 160.0), r(&mut rng, 1000.0, 2200.0), 80.0, 0.5)
+            }
+            IslandKind::Block => (
+                r(&mut rng, 500.0, 1400.0),
+                r(&mut rng, 250.0, 600.0),
+                r(&mut rng, 1200.0, 2800.0),
+                r(&mut rng, 300.0, 800.0),
+                0.55,
+            ),
+            IslandKind::Cordillera => {
+                (r(&mut rng, 150.0, 420.0), r(&mut rng, 60.0, 150.0), r(&mut rng, 1300.0, 3900.0), 60.0, 0.85)
+            }
+            IslandKind::Hilly => {
+                (r(&mut rng, 120.0, 300.0), r(&mut rng, 70.0, 160.0), r(&mut rng, 250.0, 700.0), 50.0, 0.25)
+            }
+        };
+        let gap = if big { r(&mut rng, 60.0, 400.0) } else { r(&mut rng, 40.0, 300.0) };
+        // Find a spot: off a coast, in open water, clear of other islands.
+        let mut spot = None;
+        for _ in 0..40 {
+            let c = shore[rng.next_bounded(shore.len() as u32) as usize];
+            let (x, z) = (((c % w) as f64 + 0.5) * km, ((c / w) as f64 + 0.5) * km);
+            // Outward normal: down the signed distance.
+            let (gx, gz) = (sd(x + km, z) - sd(x - km, z), sd(x, z + km) - sd(x, z - km));
+            let gl = (gx * gx + gz * gz).sqrt();
+            if gl < 1e-6 {
+                continue;
+            }
+            let (nx, nz) = (-gx / gl, -gz / gl);
+            let off = gap + wid / 2.0;
+            let (cx, cz) = (x + nx * off, z + nz * off);
+            // Arcs and ridges run along the coast; blocks lie any way.
+            let (ax, az) = if matches!(kind, IslandKind::Block | IslandKind::Hilly) {
+                let a = rng.next_f64() * TAU;
+                (libm::cos(a), libm::sin(a))
+            } else {
+                let tilt = (rng.next_f64() - 0.5) * 0.5;
+                let (c0, s0) = (libm::cos(tilt), libm::sin(tilt));
+                (-nz * c0 - nx * s0, nx * c0 - nz * s0)
+            };
+            let reach = len / 2.0 + wid;
+            let inside = |px: f64, pz: f64| px > 150.0 && pz > 150.0 && px < wk - 150.0 && pz < dk - 150.0;
+            let clear =
+                (-4..=4).all(|k| {
+                    let t = k as f64 / 4.0 * len / 2.0;
+                    let (px, pz) = (cx + ax * t, cz + az * t);
+                    inside(px, pz) && elev(elevation, px, pz) < -300.0 && sd(px, pz) < -20.0
+                }) && placed.iter().all(|&(px, pz, pr)| ((px - cx).powi(2) + (pz - cz).powi(2)).sqrt() > pr + reach);
+            if clear {
+                spot = Some((cx, cz, ax, az, nx, nz));
+                break;
+            }
+        }
+        let Some((cx, cz, ax, az, nx, nz)) = spot else {
+            continue;
+        };
+        placed.push((cx, cz, len / 2.0 + wid));
+        // Centre line: ellipses along the axis; an arc bows out to sea.
+        let segs = match kind {
+            IslandKind::Arc => 4 + rng.next_bounded(2) as usize,
+            IslandKind::Ridge => 3,
+            IslandKind::Hilly if rng.next_f64() < 0.5 => 2,
+            _ => 1,
+        };
+        let bow = if kind == IslandKind::Arc { r(&mut rng, 0.08, 0.2) * len } else { 0.0 };
+        let split = kind == IslandKind::Hilly && segs == 2;
+        let mut ellipses = Vec::new();
+        for k in 0..segs {
+            let t = if segs == 1 {
+                0.0
+            } else {
+                (k as f64 / (segs - 1) as f64 - 0.5) * len * if split { 0.55 } else { 0.8 }
+            };
+            let f = if segs == 1 { 0.0 } else { 2.0 * t / len };
+            let off = bow * (1.0 - f * f);
+            let (ex, ez) = (cx + ax * t + nx * off, cz + az * t + nz * off);
+            // Local direction of the bent centre line.
+            let slope = -2.0 * bow * f / (len / 2.0);
+            let (tx, tz) = (ax + nx * slope, az + nz * slope);
+            let tl = (tx * tx + tz * tz).sqrt();
+            let rx = if segs == 1 {
+                len / 2.0
+            } else if split {
+                len * 0.3
+            } else {
+                len / (segs - 1) as f64 * 0.75
+            };
+            let taper = if segs > 2 && (k == 0 || k == segs - 1) { 0.7 } else { 1.0 };
+            let ry = wid / 2.0 * taper * r(&mut rng, 0.8, 1.1);
+            ellipses.push((ex, ez, tx / tl, tz / tl, rx, ry));
+        }
+        let salt = 1000.0 * rng.next_f64();
+        // Rasterise over the island's box.
+        let reach = len / 2.0 + bow + wid * 2.0 + 200.0;
+        let (i0, i1) =
+            (((cx - reach) / km).floor().max(0.0) as usize, (((cx + reach) / km).ceil() as usize).min(w - 1));
+        let (j0, j1) =
+            (((cz - reach) / km).floor().max(0.0) as usize, (((cz + reach) / km).ceil() as usize).min(h - 1));
+        for j in j0..=j1 {
+            for i in i0..=i1 {
+                let (x0, z0) = ((i as f64 + 0.5) * km, (j as f64 + 0.5) * km);
+                // Warped on the island's own scale (a third of its width
+                // and finer), so its outline has lobes, capes and bays
+                // instead of following the ellipses.
+                let sc = 128.0 / (0.6 * wid);
+                let (x, z) = (
+                    x0 + 0.45 * wid * coast_noise.sample_2d(x0 * sc + salt, z0 * sc),
+                    z0 + 0.45 * wid * coast_noise.sample_2d(x0 * sc - salt, z0 * sc + 77.0),
+                );
+                let (mut g, mut axis) = (f64::MIN, (ax, az));
+                for &(ex, ez, tx, tz, rx, ry) in &ellipses {
+                    let (dx, dz) = (x - ex, z - ez);
+                    let (a, b) = (dx * tx + dz * tz, -dx * tz + dz * tx);
+                    let q = ((a / rx).powi(2) + (b / ry).powi(2)).sqrt();
+                    if 1.0 - q > g {
+                        g = 1.0 - q;
+                        axis = (tx, tz);
+                    }
+                }
+                if g < -1.0 {
+                    continue;
+                }
+                // Bays and capes at finer scales.
+                g +=
+                    0.35 * coast_noise.sample_2d(x * sc * 3.0, z * sc * 3.0 - salt) + 0.15 * fine_noise.sample_2d(x, z);
+                let idx = i + j * w;
+                let old = elevation.data[idx] as f64;
+                let along = (0.6 + 0.9 * fine_noise.sample_2d(x * 0.5 + 900.0, z * 0.5)).clamp(0.3, 1.0);
+                let e = if g > 0.0 {
+                    let spine = smoothstep(0.15, 0.9, g).powf(1.3);
+                    25.0 * smoothstep(0.0, 0.05, g) + plateau * smoothstep(0.0, 0.4, g) + peak * spine * along
+                } else {
+                    let shelf = -120.0 * smoothstep(0.0, -0.15, g);
+                    lerp(smoothstep(-0.15, -0.6, g), shelf, old)
+                };
+                if e > old {
+                    elevation.data[idx] = e as f32;
+                }
+                // Rugged only along the spine, where the land is high: the
+                // terrain detail scales with it and would sink a low coast
+                // below the sea.
+                let m = mtn * smoothstep(0.25, 0.8, g) * along;
+                if m > mountain.data[idx] as f64 {
+                    mountain.data[idx] = m as f32;
+                    // The island's own range runs along it.
+                    strike_c.data[idx] = (axis.0 * axis.0 - axis.1 * axis.1) as f32;
+                    strike_s.data[idx] = (2.0 * axis.0 * axis.1) as f32;
+                }
+            }
+        }
+    }
+    placed.iter().map(|&(x, z, _)| (x, z)).collect()
+}
+
 /// Shape statistics of the land on a grid (elevation ≥ 0 is land), used to
 /// compare generated continents with the real Earth.
 #[derive(Clone, Debug)]
@@ -1188,5 +1446,31 @@ mod tests {
         }
         assert!(total as f64 / 8.0 >= 4.5, "mean {} continents", total as f64 / 8.0);
         assert!(largest / 8.0 < 0.5, "mean largest landmass {:.2}", largest / 8.0);
+    }
+
+    /// The island rounds place their islands (Japan- to Falklands-sized)
+    /// off the coasts, and each one is land, separate from the continent.
+    #[test]
+    fn island_rounds_add_islands_off_the_coasts() {
+        let (w, km) = (768, 40_000.0 / 768.0);
+        for seed in 1..=3 {
+            let t = build(seed, Planet::Continents, w, w, km);
+            assert!(t.islands.len() >= 18, "seed {seed}: only {} islands", t.islands.len());
+            let mut land = 0;
+            for &(x, z) in &t.islands {
+                let (i, j) = ((x / km) as isize, (z / km) as isize);
+                let high = (-2..=2)
+                    .flat_map(|a| (-2..=2).map(move |b| (a, b)))
+                    .map(|(a, b)| t.elevation.at(i + a, j + b))
+                    .fold(f32::MIN, f32::max);
+                land += (high > 0.0) as usize;
+            }
+            assert!(
+                land * 10 >= t.islands.len() * 9,
+                "seed {seed}: {land} of {} islands above the sea",
+                t.islands.len()
+            );
+        }
+        assert!(build(1, Planet::Earth, 360, 180, 40_000.0 / 360.0).islands.is_empty());
     }
 }

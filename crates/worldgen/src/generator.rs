@@ -39,7 +39,7 @@ use crate::realistic::RealisticWorld;
 use crate::region::{Flavour, Region, Regions};
 use crate::rng::{derive_seed, hash_position, hash_position_f64, Xoroshiro128PlusPlus};
 use crate::settings::{Generator, WorldSettings, WorldType, SEA_LEVEL};
-use crate::spline::smoothstep;
+use crate::spline::{lerp, smoothstep};
 use crate::terrain::{Shape, TerrainShaper};
 use crate::tint::Tint;
 use crate::trees::{self, Tree, TREE_CELL, TREE_REACH};
@@ -60,6 +60,10 @@ const NOISE_BOUND: f64 = 2.7;
 
 /// Vertical period of the badlands terracotta stripes.
 const BAND_PERIOD: usize = 32;
+/// Far-view cells this wide or wider sample "coarse" columns (see
+/// `sample_column_for_cell`): the ground patches and the biome dither
+/// patches are 8–32 blocks across.
+const COARSE_CELL: i32 = 32;
 
 /// What the generator knows about a single (x, z) column without building
 /// the chunk. Shared by chunk generation, the map tool, the menu preview and
@@ -113,6 +117,11 @@ impl ColumnSample {
             water: SEA_LEVEL,
             region: Region::NONE,
             pillar: 0.0,
+            blend_t: 1.0,
+            blend_h: 1.0,
+            purity: 0.0,
+            theme_t: [-9.0, 9.0],
+            theme_h: [-9.0, 9.0],
         },
         biome: Biome::Plains,
         tint: Tint(0),
@@ -190,6 +199,11 @@ pub struct WorldGenerator {
     regions: Regions,
     /// Flower colour patches (~10 blocks).
     flowers: OctaveNoise,
+    /// Landscape character over a few km: how wide biome transitions are
+    /// and how pure the ground is (see `column_shape`).
+    character: OctaveNoise,
+    /// Wavelength of `character`, blocks.
+    char_scale: f64,
     /// Horizontal stretch: 4 for "Large biomes", times the terrain scale.
     scale: f64,
     /// Terrain scale of the world height (1 for 384 blocks).
@@ -236,9 +250,23 @@ impl WorldGenerator {
             Shaper::Classic(_) => 3000.0 * scale,
             Shaper::Realistic(r) => 6.0 * r.cell_blocks(),
         };
+        // Region edges fade over ~900 blocks in a classic world and ~10 km
+        // on a planet (not a third of a 500 km region).
+        let region_edge = match &shaper {
+            Shaper::Classic(_) => 0.3,
+            Shaper::Realistic(r) => (10.0 * r.blocks_per_km() / region_cell).min(0.3),
+        };
+        // Landscape character changes over ~1 km in a classic world, ~40 km
+        // on a planet.
+        let char_scale = match &shaper {
+            Shaper::Classic(_) => 1024.0 * scale,
+            Shaper::Realistic(r) => 40.0 * r.blocks_per_km(),
+        };
         Self {
             dither: BiomeDither::new(seed),
-            regions: Regions::new(seed, region_cell),
+            regions: Regions::new(seed, region_cell, region_edge),
+            character: OctaveNoise::new(derive_seed(seed, "biome/character"), &OctaveConfig::new(0, &[1.0, 0.5])),
+            char_scale,
             flowers: OctaveNoise::new(derive_seed(seed, "surface/flowers"), &OctaveConfig::new(-3, &[1.0, 0.5])),
             shaper,
             // Features 64 blocks down to 8 blocks: blob-sized overhangs and
@@ -292,6 +320,14 @@ impl WorldGenerator {
     /// noise band stays inside the world.
     fn column_shape(&self, x: i32, z: i32) -> Shape {
         let mut s = self.shaper.shape(x, z);
+        // Character: in some places biomes meet in wide zones of mixed
+        // patches, in others almost on a line; some ground is patchy, some
+        // is pure.
+        let (cx, cz) = (x as f64 / self.char_scale, z as f64 / self.char_scale);
+        let width = lerp(smoothstep(-0.3, 0.3, self.character.sample_2d(cx, cz)), 0.1, 1.0);
+        s.blend_t *= width;
+        s.blend_h *= width;
+        s.purity = smoothstep(0.05, 0.3, self.character.sample_2d(cx + 71.3, cz - 29.1));
         s.region = self.regions.at(x, z);
         if s.region.flavour == Flavour::Pillars {
             self.raise_pillars(&mut s, x, z);
@@ -311,7 +347,11 @@ impl WorldGenerator {
         // Not on beaches or in the sea (absolute blocks), nor high in the
         // mountains (default-world blocks).
         let land = s.height - s.water as f64;
+        // Pillars stand on plains and in wide valleys, the remains of a
+        // flat-lying plateau: on a mountainside each one would start lower
+        // than the last and they would look like a staircase of columns.
         let suit = s.region.strength as f64
+            * smoothstep(-0.2, 0.15, cl.erosion)
             * smoothstep(0.0, 0.15, cl.temperature)
             * smoothstep(-0.15, 0.05, cl.humidity)
             * smoothstep(3.0, 8.0, land)
@@ -438,13 +478,18 @@ impl WorldGenerator {
 
     /// Top and filler blocks for a solid block exposed to air/water at
     /// height `y`, in a column of the given biome.
-    fn surface_for(&self, x: i32, y: i32, z: i32, shape: &Shape, biome: Biome) -> (BlockId, BlockId) {
+    /// `coarse`: for a far-view cell many blocks wide, which shows each
+    /// biome's main ground (patches a few blocks across would alias into a
+    /// repeating pattern when sampled once per cell).
+    fn surface_for(&self, x: i32, y: i32, z: i32, shape: &Shape, biome: Biome, coarse: bool) -> (BlockId, BlockId) {
         use blocks::*;
         use Biome as B;
         if self.is_flat() {
             return (GRASS, DIRT);
         }
-        let patch = self.patch_at(x, z);
+        // 0 is every biome's main ground; pure ground shrinks the patches
+        // of other soils away.
+        let patch = if coarse { 0.0 } else { self.patch_at(x, z) * (1.0 - shape.purity) };
         if y < shape.water - 1 {
             // Sea, lake and river beds.
             let depth = shape.water - y;
@@ -559,7 +604,7 @@ impl WorldGenerator {
             return (STONE, STONE);
         }
         if top == GRASS {
-            return (self.flowers_at(x, z, biome).unwrap_or(GRASS), filler);
+            return (self.flowers_at(x, z, biome, shape.purity, coarse).unwrap_or(GRASS), filler);
         }
         (top, filler)
     }
@@ -567,7 +612,7 @@ impl WorldGenerator {
     /// Grass in flower: which flowers (if any) cover a grass column. Each
     /// biome has a density and its own flowers; colours come in patches a
     /// few blocks across, the way wild flowers spread.
-    fn flowers_at(&self, x: i32, z: i32, biome: Biome) -> Option<BlockId> {
+    fn flowers_at(&self, x: i32, z: i32, biome: Biome, purity: f64, coarse: bool) -> Option<BlockId> {
         use blocks::*;
         use Biome as B;
         const MEADOW: &[BlockId] = &[POPPIES, DANDELIONS, CORNFLOWERS, DAISIES];
@@ -583,10 +628,17 @@ impl WorldGenerator {
             B::AutumnForest => (0.02, &[DAISIES]),
             _ => return None,
         };
-        // Denser in some places than others.
-        let n = self.flowers.sample_2d(x as f64, z as f64) * 2.2;
-        let local = density * (1.0 + 0.8 * n).clamp(0.2, 1.8);
-        let roll = (hash_position(self.surface_seed, x, 5, z) & 0xFFFF) as f64 / 65536.0;
+        // Denser in some places than others, and few on pure ground (a
+        // plain of nothing but grass). Far-view cells take the colour from
+        // the hash: the patch noise would alias there.
+        let h = hash_position(self.surface_seed, x, 5, z);
+        let n = if coarse {
+            ((h >> 32) & 0xFFFF) as f64 / 32768.0 - 1.0
+        } else {
+            self.flowers.sample_2d(x as f64, z as f64) * 2.2
+        };
+        let local = density * (1.0 + 0.8 * n).clamp(0.2, 1.8) * (1.0 - purity).powi(2);
+        let roll = (h & 0xFFFF) as f64 / 65536.0;
         if roll >= local {
             return None;
         }
@@ -637,6 +689,17 @@ impl WorldGenerator {
     }
 
     pub fn sample_column(&self, x: i32, z: i32) -> ColumnSample {
+        self.sample_column_at(x, z, false)
+    }
+
+    /// A column as a far-view cell of `cell` blocks sees it: large cells
+    /// show each biome's main ground and dither per cell (see
+    /// `surface_for`), so they don't alias into repeating patterns.
+    pub(crate) fn sample_column_for_cell(&self, x: i32, z: i32, cell: i32) -> ColumnSample {
+        self.sample_column_at(x, z, cell >= COARSE_CELL)
+    }
+
+    fn sample_column_at(&self, x: i32, z: i32, coarse: bool) -> ColumnSample {
         if !self.settings.size.contains_column(x, z) {
             return ColumnSample { surface_y: self.min_y - 1, ..ColumnSample::OUTSIDE };
         }
@@ -713,9 +776,9 @@ impl WorldGenerator {
             }
             y = cell_lo - 1;
         }
-        let biome = self.biome_at(&shape, surface, x, z);
+        let biome = self.biome_at(&shape, surface, x, z, coarse);
         let underwater = surface < shape.water;
-        let (top, filler) = self.surface_for(x, surface, z, &shape, biome);
+        let (top, filler) = self.surface_for(x, surface, z, &shape, biome, coarse);
         let filler_depth = 3 + (hash_position(self.surface_seed, x, 1, z) % 3) as i32;
         ColumnSample {
             surface_y: surface,
@@ -903,12 +966,12 @@ impl WorldGenerator {
                     }
                     let biome = *col_biome.get_or_insert_with(|| {
                         surface[i] = y;
-                        self.biome_at(shape, y, x, z)
+                        self.biome_at(shape, y, x, z, false)
                     });
                     if !solid_above {
                         // A newly exposed surface (the top, or under an overhang).
                         depth = 0;
-                        (top, filler) = self.surface_for(x, y, z, shape, biome);
+                        (top, filler) = self.surface_for(x, y, z, shape, biome, false);
                         if surface[i] == y {
                             tops[i] = top;
                         }
@@ -995,8 +1058,9 @@ impl WorldGenerator {
     /// The biome of a column (with the dither that makes borders into
     /// transition zones).
     #[inline]
-    fn biome_at(&self, shape: &Shape, surface_y: i32, x: i32, z: i32) -> Biome {
-        biome::select_with(shape, surface_y, &self.dither.ground(x, z))
+    fn biome_at(&self, shape: &Shape, surface_y: i32, x: i32, z: i32, coarse: bool) -> Biome {
+        let j = if coarse { self.dither.ground_coarse(x, z) } else { self.dither.ground(x, z) };
+        biome::select_with(shape, surface_y, &j)
     }
 
     /// Decides whether the tree candidate at (x, z) grows and what it is.
@@ -1011,11 +1075,13 @@ impl WorldGenerator {
         surface_y: i32,
         top: BlockId,
         shape: &Shape,
+        coarse: bool,
     ) -> Option<Tree> {
         let biome = if self.is_flat() {
             Biome::Plains
         } else {
-            biome::select_with(shape, surface_y, &self.dither.tree(x, z, hash))
+            let j = if coarse { self.dither.tree_coarse(hash) } else { self.dither.tree(x, z, hash) };
+            biome::select_with(shape, surface_y, &j)
         };
         trees::resolve(x, z, hash, biome, surface_y, top, self.max_y)
     }
@@ -1052,7 +1118,7 @@ impl WorldGenerator {
                         (s.surface_y, s.top_block, s.shape)
                     }
                 };
-                if let Some(t) = self.resolve_tree(x, z, hash, surface_y, top, &shape) {
+                if let Some(t) = self.resolve_tree(x, z, hash, surface_y, top, &shape, false) {
                     out.push(t);
                 }
             }
@@ -1310,6 +1376,75 @@ mod tests {
         assert_eq!(probe(&a), probe(&b));
         let c = WorldGenerator::new(WorldSettings { seed: 13, ..a.settings().clone() });
         assert_ne!(probe(&a), probe(&c));
+    }
+
+    /// Mushoku: every continent is ruled by one biome, and a biome
+    /// opposite to its theme (snow on a hot continent, desert on a wet
+    /// one, jungle on a cold one) never appears, mountains included.
+    #[test]
+    fn mushoku_continents_keep_their_theme() {
+        use crate::biome::Biome as B;
+        let g = realistic(Planet::Mushoku, 20_000.0, 2048);
+        let r = g.realistic().unwrap();
+        assert!(r.continent_themes().len() >= 3, "{:?}", r.continent_themes());
+        let snowy =
+            [B::SnowyPlains, B::SnowyTaiga, B::IceSheet, B::Tundra, B::FrozenPeaks, B::SnowySlopes, B::SnowyBeach];
+        let tropical = [
+            B::Jungle,
+            B::SparseJungle,
+            B::FloodedJungle,
+            B::Savanna,
+            B::ThornScrub,
+            B::TropicalDryForest,
+            B::MangroveSwamp,
+        ];
+        let arid = [B::Desert, B::RockyDesert, B::Badlands, B::SaltFlats];
+        let rainy = [B::Jungle, B::FloodedJungle, B::TemperateRainforest];
+        let (hw, hd) = (g.settings().size.half_width(), g.settings().size.half_depth());
+        let n = 260;
+        let mut groups: std::collections::BTreeMap<(i64, i64, i64, i64), Vec<B>> = Default::default();
+        for j in 0..n {
+            for i in 0..n {
+                let x = -hw + (2 * hw as i64 * i / n + hw as i64 / n) as i32;
+                let z = -hd + (2 * hd as i64 * j / n + hd as i64 / n) as i32;
+                let c = g.sample_column(x, z);
+                if c.underwater {
+                    continue;
+                }
+                let (t, h) = (c.shape.theme_t, c.shape.theme_h);
+                let b = c.biome;
+                if t[0] >= 0.25 {
+                    assert!(!snowy.contains(&b), "{b:?} on a hot continent at {x}, {z}");
+                }
+                if t[1] <= -0.1 {
+                    assert!(!tropical.contains(&b) && !arid.contains(&b), "{b:?} on a cold continent at {x}, {z}");
+                }
+                if h[1] <= 0.2 {
+                    assert!(!rainy.contains(&b), "{b:?} on a dry continent at {x}, {z}");
+                }
+                if h[0] >= 0.0 {
+                    assert!(!arid.contains(&b), "{b:?} on a wet continent at {x}, {z}");
+                }
+                if t[1] - t[0] < 1.6 {
+                    let key = |v: f64| (v * 100.0).round() as i64;
+                    groups.entry((key(t[0]), key(t[1]), key(h[0]), key(h[1]))).or_default().push(b);
+                }
+            }
+        }
+        // In each continent's heart (where its range holds unblended) one
+        // biome covers a good share of the land.
+        let mut hearts = 0;
+        for (key, list) in groups.iter().filter(|(_, l)| l.len() >= 300) {
+            let mut counts: std::collections::BTreeMap<&str, usize> = Default::default();
+            for b in list {
+                *counts.entry(b.name()).or_default() += 1;
+            }
+            let (top, k) = counts.iter().max_by_key(|(_, &k)| k).unwrap();
+            let share = *k as f64 / list.len() as f64;
+            assert!(share > 0.3, "{key:?}: {top} covers only {share:.2}: {counts:?}");
+            hearts += 1;
+        }
+        assert!(hearts >= 3, "{hearts} continent hearts");
     }
 
     /// Each planet has its intended share of land, and spawn is on land.

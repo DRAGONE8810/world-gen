@@ -79,6 +79,23 @@ pub struct Shape {
     /// Height (blocks) a regional pillar adds to this column; the biome
     /// rules measure altitude without it.
     pub pillar: f64,
+    /// Width of the biome transition zones here, as a share of the full
+    /// dither (`biome::DITHER_T` and `DITHER_H`), for temperature and
+    /// humidity. The realistic shaper sets them from how fast its climate
+    /// changes over the ground, so a zone is kilometres wide, not hundreds
+    /// of kilometres; the generator then varies them from place to place.
+    pub blend_t: f64,
+    pub blend_h: f64,
+    /// 0..1: how pure the ground is. Pure ground shows only its biome's
+    /// main soil (no patches of coarse dirt, podzol, gravel…) and few
+    /// flowers: a plain of nothing but grass.
+    pub purity: f64,
+    /// The temperature and humidity range a themed planet (Mushoku)
+    /// allows here: the biome rules clamp the climate into it, after the
+    /// altitude and the dither, so a continent never grows a biome
+    /// opposite to its theme. Unbounded ([-9, 9]) elsewhere.
+    pub theme_t: [f64; 2],
+    pub theme_h: [f64; 2],
 }
 
 impl Default for Shape {
@@ -93,6 +110,11 @@ impl Default for Shape {
             water: SEA_LEVEL,
             region: Region::NONE,
             pillar: 0.0,
+            blend_t: 1.0,
+            blend_h: 1.0,
+            purity: 0.0,
+            theme_t: [-9.0, 9.0],
+            theme_h: [-9.0, 9.0],
         }
     }
 }

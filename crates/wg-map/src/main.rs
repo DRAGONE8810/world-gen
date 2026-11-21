@@ -53,7 +53,7 @@ fn usage() -> ! {
          \x20             [--center X,Z] [--extent BLOCKS] [--px PIXELS] [--out FILE.png]\n\
          \x20             [--layer surface|height|biome|continentalness|erosion|pv|roughness|temperature|humidity]\n\
          \x20             [--no-trees] [--legend]\n\
-         \x20             [--realistic continents|pangea|earth|islands] [--quality fast|balanced|quality] [--whole]\n\
+         \x20             [--realistic continents|pangea|earth|islands|mushoku] [--quality fast|balanced|quality] [--whole]\n\
          \x20      wg-map --bench N   (time generating an N×N square of chunks, and N LOD tiles per level, on one thread)"
     );
     std::process::exit(2)
@@ -124,6 +124,7 @@ fn parse_args() -> Args {
                     "pangea" => Planet::Pangea,
                     "earth" => Planet::Earth,
                     "islands" => Planet::Islands,
+                    "mushoku" => Planet::Mushoku,
                     _ => usage(),
                 };
             }

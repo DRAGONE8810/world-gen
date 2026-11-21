@@ -29,6 +29,7 @@ fn main() {
         "pangea" => Some(Planet::Pangea),
         "earth" => Some(Planet::Earth),
         "islands" => Some(Planet::Islands),
+        "mushoku" => Some(Planet::Mushoku),
         _ => None,
     });
     let mut settings = WorldSettings { seed, size: WorldSize::full(), height, ..Default::default() };

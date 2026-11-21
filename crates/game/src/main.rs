@@ -378,7 +378,7 @@ impl App {
             if let Some(h) = std::env::var("WG_HEIGHT").ok().and_then(|h| h.trim().parse().ok()) {
                 s.height = worldgen::settings::WorldHeight::from_blocks(h);
             }
-            // WG_PLANET=continents|pangea|earth|islands: a realistic world;
+            // WG_PLANET=continents|pangea|earth|islands|mushoku: a realistic world;
             // WG_QUALITY=optimized|balanced|quality; WG_SIZE_KM=km.
             let pick = |var: &str, label: fn(usize) -> Option<&'static str>| {
                 let v = std::env::var(var).ok()?.trim().to_lowercase();

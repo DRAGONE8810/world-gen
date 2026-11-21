@@ -5,7 +5,7 @@
 //! sub-humid < 0.65, humid above). Real Earth, without Antarctica and
 //! Greenland: 7.5%, 12.1%, 17.7%, 9.9%, 52.8%.
 //!
-//! cargo run --release -p worldgen --example planet_stats -- [seed] [continents|pangea|islands]
+//! cargo run --release -p worldgen --example planet_stats -- [seed] [continents|pangea|islands|mushoku]
 
 use worldgen::realistic::{climate, tectonics};
 use worldgen::settings::Planet;
@@ -16,6 +16,7 @@ fn main() {
     let planet = match args.get(2).map(|s| s.as_str()) {
         Some("pangea") => Planet::Pangea,
         Some("islands") => Planet::Islands,
+        Some("mushoku") => Planet::Mushoku,
         _ => Planet::Continents,
     };
     let (w, h) = (768, 768);
