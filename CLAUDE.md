@@ -25,13 +25,15 @@ Platforms: Windows and Linux required, macOS (MoltenVK) nice to have.
 ```
 crates/worldgen   Pure generator library. NO graphics, NO windowing, NO I/O.
                   rng, noise, spline, terrain, biome, trees, block,
-                  palette, chunk, settings, generator.
+                  palette, chunk, settings, generator, lod (far-view sampling).
                   examples/noise_stats calibrates noise;
                   examples/find_biome finds the nearest column of a biome.
 crates/wg-map     CLI: renders top-down PNG maps straight from the generator,
                   and benchmarks chunk generation. Use it to check accuracy.
 crates/game       Binary `world-gen`: winit window, egui menus, ash/Vulkan
-                  renderer, greedy mesher, chunk streaming.
+                  renderer (render/: GPU-driven, pool.rs range allocator),
+                  binary greedy mesher (mesh.rs), LOD quadtree + tile mesher
+                  (lod.rs), chunk/tile streaming (world.rs), world map (map.rs).
 docs/PLAN.md      The 4-step roadmap and its status.
 docs/devlog/      One log per step: detailed technical write-up + a short
                   plain-language summary for non-programmers.
@@ -49,7 +51,7 @@ cargo fmt                        # rustfmt.toml: max_width 120
 cargo run --release              # the game (default-run = world-gen)
 cargo run --release -p wg-map -- --seed 42 --extent 16000 --px 1024 --out map.png
 cargo run --release -p wg-map -- --seed 42 --layer biome    # also: height|continentalness|erosion|pv|roughness|temperature|humidity
-cargo run --release -p wg-map -- --seed 42 --bench 32   # ms per chunk
+cargo run --release -p wg-map -- --seed 42 --bench 32   # ms per chunk and per LOD tile
 cargo run --release -p worldgen --example noise_stats   # climate noise percentiles
 cargo run --release -p worldgen --example find_biome -- 42 jungle   # where to put WG_CAMERA
 cargo run --release -p worldgen --example find_biome -- 42 snowy_slopes 17696   # in a tall world
@@ -73,7 +75,7 @@ sleep 25; DISPLAY=:99 import -window root shot.png
 
 Environment switches: `WG_VALIDATION=1` (Khronos validation layer, must
 print no errors), `WG_AUTOSTART=<seed>` (skip menus), `WG_CAMERA=x,z[,yaw,pitch,height]`
-(with autostart: place the camera), `WG_SCREEN=create|settings` (open a menu),
+(with autostart: place the camera), `WG_SCREEN=create|settings` (open a menu; `map` with autostart),
 `WG_EXIT_AFTER_FRAMES=N`, `WG_HEIGHT=<blocks>` (with autostart: world height). A `settings.ron` in the working directory sets
 render distance etc.
 
@@ -103,6 +105,19 @@ render distance etc.
 - **Column sampling and chunks must agree:** `sample_column` is used by maps,
   the menu preview, the HUD and tree placement; tests assert it matches
   `generate_chunk` (surface, top block, biome, sea ice).
+- **LODs:** `WorldGenerator::lod_grid` is the only source of far terrain;
+  at 1-block cells it must equal the generated chunk's top blocks (tested),
+  so any generator change that breaks that test must be mirrored there.
+  The game's quadtree (`lod.rs`) must keep its leaves gap- and overlap-free
+  and `draw_set` must never draw a mesh that isn't uploaded (tested).
+  Depth is reverse-Z with an infinite far plane.
+- **Rendering:** vertices are 8 bytes (`mesh::Vertex`: x, z in cells, y +
+  `Y_BIAS`, sRGB colour); quads share one index buffer, so meshes carry no
+  indices. Meshes live in shared vertex pools (`render/pool.rs`); a range
+  is freed only after the frames in flight that used it have finished.
+  Each visible mesh is one draw record + one indirect command, drawn with
+  one `vkCmdDrawIndexedIndirect` per pool (direct draws as a fallback).
+  The binary mesher must match `greedy_section_reference` (tested).
 - **Coordinates:** blocks are `i32`, noise inputs `f64` and wrapped
   (`noise::wrap`); camera position is `f64`; the GPU only sees
   camera-relative `f32`.

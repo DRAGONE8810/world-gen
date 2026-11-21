@@ -193,6 +193,9 @@ impl WorldGenerator {
     pub fn settings(&self) -> &WorldSettings {
         &self.settings
     }
+    pub(crate) fn tree_seed(&self) -> u64 {
+        self.tree_seed
+    }
 
     fn is_flat(&self) -> bool {
         self.settings.world_type == WorldType::Flat

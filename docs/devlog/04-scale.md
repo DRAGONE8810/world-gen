@@ -4,13 +4,17 @@ Step 4 is big, so it lands in parts, each with its own pull request:
 
 | Part | What | Status |
 |------|------|--------|
-| 4a | Tall worlds: world height from 256 to 17,696 blocks | This PR |
-| 4b | Far view: two distance settings, LOD rings out to 256 chunks | Next |
-| 4c | Speed: binary greedy meshing, packed vertices, GPU-driven drawing, in-game world map | After 4b |
+| 4a | Tall worlds: world height from 256 to 17,696 blocks | Done (PR #5) |
+| 4b | Far view: two distance settings, LOD rings out to 256 chunks | Done (PR #6) |
+| 4c | Speed: binary greedy meshing, packed vertices, GPU-driven drawing, in-game world map | Done (this PR) |
 
-![A snowy mountainside 3,400 blocks above the sea in a 17,696-block-tall world, seed 42](../images/step4-ingame-17696.jpg)
+![The same spot with and without the far view: render distance 16, then 16 plus LOD distance 256](../images/step4-lod-off-on.jpg)
 
 ## In plain words (no coding knowledge needed)
+
+### Part 4a: tall worlds
+
+![A snowy mountainside 3,400 blocks above the sea in a 17,696-block-tall world, seed 42](../images/step4-ingame-17696.jpg)
 
 **What changed:** you can now choose how tall the world is, the same way
 you choose how wide it is. The "Create world" screen has a new **World
@@ -58,9 +62,91 @@ ones check that:
 The normal 384-block world comes out the same as before: same height
 statistics and same speed.
 
+### Part 4b: seeing far
+
+**What changed:** the Settings screen now has two distances instead of
+one:
+
+- **Render distance**, up to 64 chunks (was 32): the area around you that
+  is built block by block, exactly as before.
+- **LOD distance**, up to 256 chunks: beyond the render distance, the
+  world continues as a simplified version of itself out to 4 km in every
+  direction, so you see coastlines, forests, mountains and islands on the
+  horizon instead of fog. 256 chunks in every direction is a 512 × 512
+  square, the 262,144 chunks you asked for.
+
+**How it works:** this is the trick that Distant Horizons and Voxy use.
+Far away, the world is drawn with bigger "blocks": 2 blocks wide just past
+the render distance, then 4, 8, 16, … each ring twice as coarse as the one
+before. Something twice as far looks half as big, so you can't tell the
+difference, and the far rings cost very little. Each coarse block takes
+its height and colour from the real world at that spot, including trees,
+water and snow, so the far view is the same world, not a painting. When
+you move, new rings are built in the background, and the old ones stay on
+screen until the new ones are ready, so the horizon never shows holes.
+
+In tall worlds the mountains are tens of km wide, so the far view
+stretches with them: a 17,696-block world shows mountains up to 188 km
+away.
+
+![A 17,696-block world: the near mountain is real blocks, the ranges on the horizon are 100+ km away](../images/step4-lod-17696.jpg)
+
+**What it costs:** the whole 4 km view (1,156 chunks plus 3,401 coarse
+tiles) is 0.6 million triangles, about 3 times what the chunks alone
+draw. It takes about 12 seconds of processor time to build once, spread
+over all processor cores, and then only the edges are rebuilt as you move.
+
+**How we know it's right:** 83 automatic tests (12 more than part 4a). The
+most important new one builds the far view at full detail (1-block cells)
+and checks that it matches the real chunks block for block, trees
+included. Others check that the rings cover the view exactly once (no
+gaps, no overlaps), that neighbouring rings differ by one step of detail,
+that moving the camera never draws two things in the same place or
+something that isn't ready, and that old rings are thrown away once
+replaced.
+
+![The far view from above: real chunks around the camera, coarser rings beyond, seamlessly joined](../images/step4-lod-above.jpg)
+
+### Part 4c: speed and the world map
+
+**What changed:**
+
+- **Chunks are built 12 times faster.** Turning blocks into triangles
+  used to take 1.3 ms per chunk; now it takes 0.1 ms. The game checks a
+  whole column of 16 blocks with a handful of processor instructions instead of one
+  block at a time.
+- **Meshes take a third of the graphics memory.** Every corner of every
+  square now fits in 8 bytes instead of 16, and squares share one list of
+  corner numbers instead of each chunk carrying its own: 4.7 KB per chunk
+  instead of 13 KB.
+- **The whole view is drawn with one command.** Before, the game asked
+  the graphics card to draw each chunk and each far tile separately, about
+  1,300 requests per frame at the default settings, and 16,000 at render
+  distance 64. Now everything lives in one big block of graphics memory,
+  the game writes a short list of "draw this piece, here", and hands the
+  card the whole list at once. This is what modern engines call
+  *GPU-driven drawing*, and it is what makes render distance 64 usable.
+- **World map (press M, or "World map" in the pause menu).** A top-down
+  map of the world, drawn straight from the seed. Drag to move, mouse
+  wheel to zoom (from single blocks to the whole world), double-click to
+  teleport there. The red arrow is you, pointing where you look.
+
+![The world map at 8 blocks per pixel: the red arrow is the player](../images/step4-map.jpg)
+
+![Zoomed out to 61 km](../images/step4-map-zoomed-out.jpg)
+
+**How we know it's right:** 89 automatic tests (6 more than part 4b). The
+new fast chunk builder is checked against the old, slow one on many
+chunks: both must produce exactly the same squares. The memory manager
+for the shared graphics memory is checked with thousands of random
+allocations: no two pieces may ever overlap. The map has a test that its
+picture really shows land and sea where the world has them.
+
+![The default view (render 16, LOD 256): 1,301 meshes drawn with 1 draw call](../images/step4-gpu-driven.jpg)
+
 ---
 
-## Technical log
+## Technical log, part 4a: tall worlds
 
 ### World height setting (`settings.rs`)
 
@@ -226,3 +312,302 @@ In game (lavapipe software renderer, 1280×800, render distance 22,
   the LOD rings in part 4b are for.
 - There are no caves yet, so the floor section and the window are all
   that is ever needed.
+
+---
+
+## Technical log, part 4b: LOD rings
+
+### Sampling far terrain (`worldgen::lod`)
+
+`WorldGenerator::lod_grid(x0, z0, cell, n)` returns an `n × n` grid of
+`LodColumn { inside, top_y, block, biome, ground_y }`, one per
+`cell × cell` block square. It lives in `worldgen` because it is
+generation logic and must be testable without a GPU.
+
+- **Ground:** `sample_column` at the centre of the cell: the real
+  surface, not an average. Under water the top is the water (or ice)
+  surface at sea level.
+- **Trees, cells ≤ 8 blocks:** every tree candidate within
+  `TREE_REACH` of the grid is resolved and built with the chunk
+  generator's own `trees::resolve`/`trees::build`, in the same global cell
+  order, and each block is rasterised into its cell with the chunk's
+  overlap rules (logs replace water and leaves; leaves replace nothing).
+  The trunk's ground comes from the cell sample when the trunk is inside
+  the grid (exact for 1-block cells) and from a fresh `sample_column`
+  otherwise.
+- **Trees, larger cells:** only the candidate of the tree-grid cell
+  under the LOD cell's centre is tested. The fraction of cells showing
+  canopy then equals the forest's density, which is what the eye sees at
+  that distance.
+
+Tests:
+
+- `one_block_cells_match_generated_chunks_exactly`: for 4 chunks each of
+  seeds 42 and 7 (Normal), 3 (Amplified) and 42 at height 2,000, a
+  1-block LOD grid equals the highest non-air block of every column of
+  the generated chunk, block id included (logs, leaves, water, ice).
+- `coarse_cells_follow_the_terrain`: 16-block cells over 1 km² report the
+  real surface at their centre and at most a tree above it.
+- `coarse_canopy_matches_forest_density`: in a forest and a desert of
+  seed 42, the share of canopy cells at 16-block cells is within 0.1 of
+  the share in the exact 1-block grid (forest 0.12 vs 0.18, desert 0.016
+  vs 0).
+- `outside_the_border_is_empty`.
+
+### The quadtree (`game::lod`)
+
+`NodeKey { level, x, z }`: level 0 is a chunk; a level-`L` tile covers
+`2^L × 2^L` chunks with 16 × 16 cells of `2^L` blocks. Starting from the
+coarsest level that reaches the LOD distance, a node splits while its
+Chebyshev distance (in chunks) to the camera chunk is below
+
+```
+split_dist(1)   = render_distance + 1
+split_dist(L+1) = split_dist(L) + RING_TILES · 2^L        (RING_TILES = 8)
+```
+
+so every ring is 8 of its own tiles wide and neighbouring leaves differ by
+at most one level. With render distance 16 and LOD distance 256 that is
+1,156 chunks (the render distance, rounded out to whole level-1 tiles)
+plus 3,401 tiles in rings of 2, 4, 8 and 16-block cells. The same area in
+chunks would be 263,169 chunks.
+
+Tests: `leaves_tile_the_view_without_gaps_or_overlaps` (6 layouts × 3
+camera positions, including x = 123,457 chunks; every chunk of the view
+square covered exactly once, chunks up to the render distance are level
+0), `neighbouring_leaves_differ_by_at_most_one_level`,
+`detail_halves_as_distance_doubles`, `world_border_prunes_nodes`.
+
+### Swapping without holes
+
+`Layout::draw_set` walks the quadtree again with the set of meshes that
+are *ready* (on the GPU):
+
+- a leaf that is ready draws itself;
+- a leaf that isn't, but whose four children are (the camera moved away
+  and four tiles are merging into one), draws the children;
+- a node that should split but whose finer meshes aren't all ready yet
+  draws itself, if it is ready.
+
+Meshes that are neither leaves nor drawn are evicted. The streamer hands
+the renderer at most `MAX_UPLOADS_PER_FRAME` meshes per frame, exactly
+what the renderer uploads in one frame, so "ready" really means "on the
+GPU" and a swap never shows a frame with a hole.
+`lod_rings_stream_swap_and_evict` streams a view, jumps 30 chunks away
+and checks every intermediate frame: nothing drawn that isn't uploaded,
+never two meshes over the same chunk, and at the end exactly the new
+leaves left on the GPU.
+
+### Tile meshes
+
+18 × 18 cells are sampled (one border cell each side). Tops are greedy
+merged by (height, block, tinted colour). Each cell gets a wall to every
+lower neighbour; on the tile edge the wall reaches one more cell size
+down (a "skirt") so a neighbour tile of another level never shows a
+crack. Vertices use the chunk format and pipeline, positioned relative to
+the tile corner.
+
+### Renderer
+
+- Meshes are keyed by `NodeKey`; each frame draws the streamer's draw
+  list instead of every mesh, with frustum culling on the tile's box.
+- **Reverse-Z with an infinite far plane** (`perspective_infinite_reverse_rh`,
+  depth cleared to 0, `GREATER_OR_EQUAL`). With the old 0.1-near
+  standard depth, D32F resolution at 4 km was about 15 blocks; reversed,
+  float depth keeps ~7 significant digits at any distance. Test:
+  `depth_is_reversed` (surfaces 0.5 blocks apart at 4,000 blocks get
+  different depths). Frustum planes with no normal (the infinite far
+  plane) accept everything.
+- Fog ends at the LOD distance (horizontal distance, as before).
+
+### Settings and streaming
+
+- `render_distance` 2..=64, new `lod_distance` 0..=256 (default 12 and
+  128); old `settings.ron` files load with the default LOD distance.
+- In tall worlds the effective LOD distance is multiplied by the terrain
+  scale: 256 → 11,797 chunks at 17,696 blocks, 8,090 tiles (top level 10).
+- The streamer (`world.rs`) schedules leaves nearest first: chunks (and
+  their neighbours) are generated then meshed as before, tiles are sampled
+  and meshed in one job. Block data is kept 2 chunks past the chunk
+  radius.
+- HUD: `LOD tiles`, meshes drawn, pieces left to build. The log prints
+  how long the first full view took.
+
+### Measurements
+
+Tile sampling, one thread (`wg-map --bench 32`, an 18 × 18 grid per
+tile):
+
+| Level (cell) | ms/tile, height 384 | ms/tile, height 17,696 |
+|-------------:|--------------------:|-----------------------:|
+| 1 (2 blocks) | 2.82 | 3.89 |
+| 2 (4)        | 2.56 | 4.18 |
+| 3 (8)        | 3.29 | 5.17 |
+| 4 (16)       | 3.38 | 3.37 |
+| 6 (64)       | 3.54 | 3.13 |
+| 8 (256)      | 2.94 | 2.83 |
+
+A tile costs about 3 chunks of generation but covers up to 65,536
+chunks of area.
+
+In game, seed 42 at (96, −672), 1280×800, lavapipe software renderer on
+the 4-core cloud container (so the CPU renders *and* generates):
+
+| Setup | First full view | Meshes drawn | Triangles | FPS |
+|-------|----------------:|-------------:|----------:|----:|
+| Render 16, LOD off | 6.2 s | 301 | 0.21 M | 23 |
+| Render 12, LOD 128 | n/a | 868 | 0.44 M | 17 |
+| Render 16, LOD 256 | 28.9 s | 1,301 | 0.61 M | 16 |
+| Render 16, LOD 256, height 17,696 (LOD 11,797) | 77.2 s | 1,739 | 2.45 M | 10 |
+
+The validation layer reports no errors. On a real GPU these triangle
+counts are small (an RTX 2080 draws hundreds of millions per second);
+the remaining costs are one draw call per mesh and 16-byte vertices,
+which part 4c replaces with indirect drawing and packed vertices.
+
+### Known limitations (4b)
+
+- Rendering 64 chunks of full detail is allowed but heavy until part 4c
+  (16,641 chunk meshes with 16-byte vertices and one draw call each).
+- A tile is rebuilt from scratch when it comes back into view; there is
+  no cache yet.
+- Caves and overhangs are not visible in LOD tiles (they are a top-down
+  view); in the 1-block test they don't matter because only the top block
+  is compared.
+
+---
+
+## Technical log, part 4c: speed and the world map
+
+### Binary face culling (`mesh.rs`)
+
+The mesher still works on a padded 18³ copy of each section, but face
+culling no longer tests neighbours block by block. For each axis, each of
+the 16 × 16 columns along that axis becomes two `u32` bitmasks of its 18
+blocks (bit *i* = block *i*, padding included): `o` = opaque blocks and
+`n` = non-empty blocks; `t = n & !o` are the translucent ones (water,
+ice, leaves). The faces of the whole column towards one direction are
+
+```text
+o_nb, n_nb = o >> 1, n >> 1          // the neighbour masks (<< 1 for the − direction)
+faces = (o & !o_nb) | (t & !n_nb)
+```
+
+masked to bits 1..=16 (the padding is never meshed). An opaque block
+shows a face unless its neighbour is opaque; a transparent block (water,
+ice, leaves) shows one only towards air. Only set bits are visited
+(`trailing_zeros`), and only for those the block is read again to get
+its colour key (`face_key`). The faces are written into a 16 × 16 slice
+per layer and merged into rectangles by the same `merge_slice` as
+before, so the output is unchanged.
+
+`greedy_section_reference` (the old block-by-block mesher) is kept under
+`cfg(test)`; `binary_mesher_matches_the_reference_mesher` generates
+chunks from three seeds (Normal and Amplified, heights 384 and
+5,000), meshes them with both and requires identical quad lists.
+
+### Packed vertices and shared indices
+
+A vertex is now two `u32` (8 bytes, was 16):
+
+| Word | Bits | Content |
+|------|------|---------|
+| `a` | 0–4 | x in cells (0…16) |
+| `a` | 5–9 | z in cells (0…16) |
+| `a` | 10–25 | y + 32,768 (`Y_BIAS`), so −32,768…32,767 covers every world height |
+| `b` | 0–23 | sRGB colour with the face shade baked in |
+
+x and z are in *cells* of the mesh's own cell size, so the same format
+serves 1-block chunks and LOD tiles of any level: the draw record carries
+the mesh's origin and cell size, and the vertex shader computes
+`origin + vec3(x·cell, y, z·cell)`. Y stays in blocks because tiles have
+real heights.
+
+Every quad is 4 vertices with the index pattern `0 1 2 0 2 3`, so one
+device-local index buffer (`create_quad_indices`, grown on demand from
+65,536 quads) serves every mesh; `MeshData` has no indices any more.
+
+### GPU-driven drawing (`render/`)
+
+- **Vertex pools.** Meshes are suballocated from device-local pools of
+  16 Mi vertices (128 MiB) each; a new pool is created when one is full.
+  `render/pool.rs` is a first-fit free list sorted by offset that merges
+  neighbours on release (tests: `allocates_frees_and_merges`,
+  `random_churn_never_overlaps` with 20,000 random operations). Freed
+  ranges go back to the allocator only after the frame that last used
+  them has finished on the GPU (`freed_ranges` per frame in flight).
+- **Draw records.** Each frame in flight has a host-visible storage
+  buffer of `vec4(origin − camera, cell size)` records and a buffer of
+  `VkDrawIndexedIndirectCommand`. For every visible mesh the CPU writes
+  one of each (`firstInstance` = record index, `vertexOffset` = the
+  mesh's place in the pool). The shader reads its record through
+  `gl_InstanceIndex`. The origin is computed relative to the camera in
+  `f64` on the CPU, so far tiles keep full precision.
+- **One call per pool.** Draws are sorted by pool and each pool is
+  drawn with one `vkCmdDrawIndexedIndirect`. That needs the
+  `multiDrawIndirect` and `drawIndirectFirstInstance` features, which
+  desktop GPUs and drivers of the last decade support; without
+  them the renderer falls back to one direct draw per mesh, using the
+  same records. The log says which path is used.
+- The HUD shows draw calls and GPU mesh memory.
+
+### World map (`map.rs`)
+
+`WorldMap` keeps a view (centre, blocks per pixel) and one image. A
+background job samples `sample_column` once per pixel with rayon,
+covering the larger side of the panel, first at 128 px then at 512 px;
+only one job runs at a time and a finished job whose view is stale is
+redrawn from the newest view. While a job runs, the last image is drawn
+stretched to the current view, so panning and zooming feel immediate.
+Colours are the top block's colour, water darkened by depth and land
+brightened slightly with altitude (both scaled by `terrain_scale`). Zoom
+goes from 1/8 block per point out to the whole world; double-click teleports the camera to
+40 blocks above the surface and resumes the game. `WG_SCREEN=map` with
+`WG_AUTOSTART` opens it directly (used for the screenshots). Tests:
+`map_image_shows_the_world`, `block_formatting`.
+
+### Measurements
+
+Meshing, release, seed 42, 64 chunks around spawn
+(`cargo test --release -p game mesh_bench -- --ignored --nocapture`):
+
+| | ms / chunk | GPU KiB / chunk |
+|---|---:|---:|
+| Before (4b) | 1.279 | 13.0 |
+| After (4c) | 0.106 | 4.7 |
+
+In game, same spot and machine as 4b (lavapipe on 4 CPU cores, which
+renders *and* generates, so frame rates are not representative of a
+real GPU):
+
+| Setup | Meshes drawn | Draw calls | GPU meshes | Triangles | FPS |
+|-------|-------------:|-----------:|-----------:|----------:|----:|
+| Render 16, LOD 256 | 1,301 | 1 | 36.8 MB | 0.61 M | 13 |
+| Render 64, LOD 256 (still loading after 300 s) | 3,701 | 1 | 62.7 MB | 1.47 M | 10 |
+
+At render distance 64 the view needs 16,641 chunks; after 300 s on the
+container 12,869 were meshed and 10,048 still queued, with no LOD tiles
+yet, because the streamer builds nearest first and every tile is farther
+than every chunk. Meshing is now a small part of that time; terrain
+generation (0.9 ms per chunk) dominates, so a CPU with more cores fills
+the view proportionally faster.
+
+![Render distance 64 while loading: 3,701 meshes, 1 draw call](../images/step4-rd64.jpg)
+
+The validation layer reports no errors, with the log line
+`Indirect drawing: multi-draw`.
+
+### Known limitations (4c)
+
+- **Not yet measured on an RTX 2080 or 3060.** Lavapipe draws on the
+  CPU, so these numbers say nothing about real frame rates. The 60 FPS
+  budget at render 16 + LOD 256 still needs a check on the owner's
+  machine (0.6 M triangles and one draw call should be far below what
+  either card handles).
+- Frustum culling still runs per mesh on the CPU (about 16,000 box tests
+  at render 64); moving it into a compute shader is possible if it ever
+  shows up in a profile.
+- Render distance 64 takes minutes to fill on a 4-core machine; the
+  bottleneck is terrain generation, not meshing or drawing.
+- LOD tiles are still rebuilt when they come back into view (no cache).
+
