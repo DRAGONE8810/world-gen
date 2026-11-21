@@ -13,11 +13,12 @@ deliberately plain.
 
 ## Status
 
-Steps 1–3 of 4 are done: foundation, terrain (continents, oceans,
-mountains, rivers), and 48 biomes with trees. Step 4 (scale and speed) is
-in progress: configurable world height and a far view (LOD rings out to
-256 chunks, like Distant Horizons) are in; faster drawing and a world map
-are next. See [docs/PLAN.md](docs/PLAN.md) for the
+All 4 steps are in: foundation, terrain (continents, oceans, mountains,
+rivers), 48 biomes with trees, and scale and speed: world height up to
+17,696 blocks, a far view out to 256 chunks (LOD rings, like Distant
+Horizons), binary greedy meshing, GPU-driven drawing and an in-game world
+map. The 60 FPS budget on an RTX 2080 is still to be confirmed on real
+hardware. See [docs/PLAN.md](docs/PLAN.md) for the
 roadmap and [docs/devlog/](docs/devlog/) for a detailed log of each step,
 each with a short plain-language summary.
 
@@ -45,6 +46,7 @@ Linux; shaders are compiled by the build itself.
 | Space / Shift | up / down |
 | Mouse wheel | fly speed ×2 (up) / ÷2 (down), 0.25 to ~1 million blocks/s |
 | Ctrl | 5× speed |
+| M | world map (drag, wheel to zoom, double-click to teleport) |
 | Esc | pause menu |
 | F3 | debug overlay |
 
@@ -66,7 +68,7 @@ cargo run --release -p wg-map -- --seed 42 --size-km 60000 --height 17696 --exte
 |---|---|
 | `crates/worldgen` | the generator: noise, chunks, settings, terrain, biomes, trees. No graphics. |
 | `crates/wg-map` | map and benchmark tool |
-| `crates/game` | window, menus, Vulkan renderer, mesher, chunk streaming |
+| `crates/game` | window, menus, world map, Vulkan renderer (GPU-driven), binary greedy mesher, LOD quadtree, chunk and tile streaming |
 
 ## Tests
 

@@ -18,6 +18,8 @@ pub enum Screen {
     },
     Playing,
     Paused,
+    /// The world map, opened from the game with M.
+    Map,
 }
 
 pub enum Action {
@@ -375,6 +377,10 @@ pub fn pause_menu(ui: &mut egui::Ui, actions: &mut Vec<Action>) {
                 actions.push(Action::Resume);
             }
             ui.add_space(8.0);
+            if big_button(ui, "World map").clicked() {
+                actions.push(Action::Goto(Screen::Map));
+            }
+            ui.add_space(8.0);
             if big_button(ui, "Settings").clicked() {
                 actions.push(Action::Goto(Screen::Settings { from_pause: true }));
             }
@@ -395,6 +401,8 @@ pub struct HudInfo<'a> {
     pub stats: crate::world::Stats,
     pub drawn_chunks: usize,
     pub drawn_triangles: u64,
+    pub gpu_vertex_bytes: u64,
+    pub draw_calls: usize,
     pub gpu: &'a str,
     pub pending: usize,
     pub show_debug: bool,
@@ -452,13 +460,14 @@ pub fn hud(ui: &mut egui::Ui, h: &HudInfo) {
                         h.stats.loaded_chunks, h.stats.meshed_chunks, h.stats.lod_tiles
                     )));
                     ui.label(mono(format!(
-                        "Meshes drawn {}   {} to build, {} jobs",
-                        h.drawn_chunks, h.stats.pending, h.stats.jobs_in_flight
+                        "Meshes drawn {} in {} draw calls   {} to build, {} jobs",
+                        h.drawn_chunks, h.draw_calls, h.stats.pending, h.stats.jobs_in_flight
                     )));
                     ui.label(mono(format!(
-                        "Triangles {:.2} M   block memory {:.1} MB",
+                        "Triangles {:.2} M   blocks {:.1} MB   GPU meshes {:.1} MB",
                         h.drawn_triangles as f64 / 1e6,
-                        h.stats.chunk_memory_bytes as f64 / 1e6
+                        h.stats.chunk_memory_bytes as f64 / 1e6,
+                        h.gpu_vertex_bytes as f64 / 1e6
                     )));
                 },
             );

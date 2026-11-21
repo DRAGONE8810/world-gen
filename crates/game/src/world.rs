@@ -120,6 +120,11 @@ impl ChunkManager {
         &self.gen
     }
 
+    /// Shared handle, for work on other threads (the world map).
+    pub fn generator_arc(&self) -> &Arc<WorldGenerator> {
+        &self.gen
+    }
+
     /// The meshes to draw this frame.
     pub fn draw_list(&self) -> &[NodeKey] {
         &self.draw

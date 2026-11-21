@@ -5,8 +5,8 @@ Step 4 is big, so it lands in parts, each with its own pull request:
 | Part | What | Status |
 |------|------|--------|
 | 4a | Tall worlds: world height from 256 to 17,696 blocks | Done (PR #5) |
-| 4b | Far view: two distance settings, LOD rings out to 256 chunks | Done (this PR) |
-| 4c | Speed: binary greedy meshing, packed vertices, GPU-driven drawing, in-game world map | Next |
+| 4b | Far view: two distance settings, LOD rings out to 256 chunks | Done (PR #6) |
+| 4c | Speed: binary greedy meshing, packed vertices, GPU-driven drawing, in-game world map | Done (this PR) |
 
 ![The same spot with and without the far view: render distance 16, then 16 plus LOD distance 256](../images/step4-lod-off-on.jpg)
 
@@ -106,6 +106,43 @@ something that isn't ready, and that old rings are thrown away once
 replaced.
 
 ![The far view from above: real chunks around the camera, coarser rings beyond, seamlessly joined](../images/step4-lod-above.jpg)
+
+### Part 4c: speed and the world map
+
+**What changed:**
+
+- **Chunks are built 12 times faster.** Turning blocks into triangles
+  used to take 1.3 ms per chunk; now it takes 0.1 ms. The game checks a
+  whole column of 16 blocks with a handful of processor instructions instead of one
+  block at a time.
+- **Meshes take a third of the graphics memory.** Every corner of every
+  square now fits in 8 bytes instead of 16, and squares share one list of
+  corner numbers instead of each chunk carrying its own: 4.7 KB per chunk
+  instead of 13 KB.
+- **The whole view is drawn with one command.** Before, the game asked
+  the graphics card to draw each chunk and each far tile separately, about
+  1,300 requests per frame at the default settings, and 16,000 at render
+  distance 64. Now everything lives in one big block of graphics memory,
+  the game writes a short list of "draw this piece, here", and hands the
+  card the whole list at once. This is what modern engines call
+  *GPU-driven drawing*, and it is what makes render distance 64 usable.
+- **World map (press M, or "World map" in the pause menu).** A top-down
+  map of the world, drawn straight from the seed. Drag to move, mouse
+  wheel to zoom (from single blocks to the whole world), double-click to
+  teleport there. The red arrow is you, pointing where you look.
+
+![The world map at 8 blocks per pixel: the red arrow is the player](../images/step4-map.jpg)
+
+![Zoomed out to 61 km](../images/step4-map-zoomed-out.jpg)
+
+**How we know it's right:** 89 automatic tests (6 more than part 4b). The
+new fast chunk builder is checked against the old, slow one on many
+chunks: both must produce exactly the same squares. The memory manager
+for the shared graphics memory is checked with thousands of random
+allocations: no two pieces may ever overlap. The map has a test that its
+picture really shows land and sea where the world has them.
+
+![The default view (render 16, LOD 256): 1,301 meshes drawn with 1 draw call](../images/step4-gpu-driven.jpg)
 
 ---
 
@@ -437,3 +474,140 @@ which part 4c replaces with indirect drawing and packed vertices.
 - Caves and overhangs are not visible in LOD tiles (they are a top-down
   view); in the 1-block test they don't matter because only the top block
   is compared.
+
+---
+
+## Technical log, part 4c: speed and the world map
+
+### Binary face culling (`mesh.rs`)
+
+The mesher still works on a padded 18³ copy of each section, but face
+culling no longer tests neighbours block by block. For each axis, each of
+the 16 × 16 columns along that axis becomes two `u32` bitmasks of its 18
+blocks (bit *i* = block *i*, padding included): `o` = opaque blocks and
+`n` = non-empty blocks; `t = n & !o` are the translucent ones (water,
+ice, leaves). The faces of the whole column towards one direction are
+
+```text
+o_nb, n_nb = o >> 1, n >> 1          // the neighbour masks (<< 1 for the − direction)
+faces = (o & !o_nb) | (t & !n_nb)
+```
+
+masked to bits 1..=16 (the padding is never meshed). An opaque block
+shows a face unless its neighbour is opaque; a transparent block (water,
+ice, leaves) shows one only towards air. Only set bits are visited
+(`trailing_zeros`), and only for those the block is read again to get
+its colour key (`face_key`). The faces are written into a 16 × 16 slice
+per layer and merged into rectangles by the same `merge_slice` as
+before, so the output is unchanged.
+
+`greedy_section_reference` (the old block-by-block mesher) is kept under
+`cfg(test)`; `binary_mesher_matches_the_reference_mesher` generates
+chunks from three seeds (Normal and Amplified, heights 384 and
+5,000), meshes them with both and requires identical quad lists.
+
+### Packed vertices and shared indices
+
+A vertex is now two `u32` (8 bytes, was 16):
+
+| Word | Bits | Content |
+|------|------|---------|
+| `a` | 0–4 | x in cells (0…16) |
+| `a` | 5–9 | z in cells (0…16) |
+| `a` | 10–25 | y + 32,768 (`Y_BIAS`), so −32,768…32,767 covers every world height |
+| `b` | 0–23 | sRGB colour with the face shade baked in |
+
+x and z are in *cells* of the mesh's own cell size, so the same format
+serves 1-block chunks and LOD tiles of any level: the draw record carries
+the mesh's origin and cell size, and the vertex shader computes
+`origin + vec3(x·cell, y, z·cell)`. Y stays in blocks because tiles have
+real heights.
+
+Every quad is 4 vertices with the index pattern `0 1 2 0 2 3`, so one
+device-local index buffer (`create_quad_indices`, grown on demand from
+65,536 quads) serves every mesh; `MeshData` has no indices any more.
+
+### GPU-driven drawing (`render/`)
+
+- **Vertex pools.** Meshes are suballocated from device-local pools of
+  16 Mi vertices (128 MiB) each; a new pool is created when one is full.
+  `render/pool.rs` is a first-fit free list sorted by offset that merges
+  neighbours on release (tests: `allocates_frees_and_merges`,
+  `random_churn_never_overlaps` with 20,000 random operations). Freed
+  ranges go back to the allocator only after the frame that last used
+  them has finished on the GPU (`freed_ranges` per frame in flight).
+- **Draw records.** Each frame in flight has a host-visible storage
+  buffer of `vec4(origin − camera, cell size)` records and a buffer of
+  `VkDrawIndexedIndirectCommand`. For every visible mesh the CPU writes
+  one of each (`firstInstance` = record index, `vertexOffset` = the
+  mesh's place in the pool). The shader reads its record through
+  `gl_InstanceIndex`. The origin is computed relative to the camera in
+  `f64` on the CPU, so far tiles keep full precision.
+- **One call per pool.** Draws are sorted by pool and each pool is
+  drawn with one `vkCmdDrawIndexedIndirect`. That needs the
+  `multiDrawIndirect` and `drawIndirectFirstInstance` features, which
+  desktop GPUs and drivers of the last decade support; without
+  them the renderer falls back to one direct draw per mesh, using the
+  same records. The log says which path is used.
+- The HUD shows draw calls and GPU mesh memory.
+
+### World map (`map.rs`)
+
+`WorldMap` keeps a view (centre, blocks per pixel) and one image. A
+background job samples `sample_column` once per pixel with rayon,
+covering the larger side of the panel, first at 128 px then at 512 px;
+only one job runs at a time and a finished job whose view is stale is
+redrawn from the newest view. While a job runs, the last image is drawn
+stretched to the current view, so panning and zooming feel immediate.
+Colours are the top block's colour, water darkened by depth and land
+brightened slightly with altitude (both scaled by `terrain_scale`). Zoom
+goes from 1/8 block per point out to the whole world; double-click teleports the camera to
+40 blocks above the surface and resumes the game. `WG_SCREEN=map` with
+`WG_AUTOSTART` opens it directly (used for the screenshots). Tests:
+`map_image_shows_the_world`, `block_formatting`.
+
+### Measurements
+
+Meshing, release, seed 42, 64 chunks around spawn
+(`cargo test --release -p game mesh_bench -- --ignored --nocapture`):
+
+| | ms / chunk | GPU KiB / chunk |
+|---|---:|---:|
+| Before (4b) | 1.279 | 13.0 |
+| After (4c) | 0.106 | 4.7 |
+
+In game, same spot and machine as 4b (lavapipe on 4 CPU cores, which
+renders *and* generates, so frame rates are not representative of a
+real GPU):
+
+| Setup | Meshes drawn | Draw calls | GPU meshes | Triangles | FPS |
+|-------|-------------:|-----------:|-----------:|----------:|----:|
+| Render 16, LOD 256 | 1,301 | 1 | 36.8 MB | 0.61 M | 13 |
+| Render 64, LOD 256 (still loading after 300 s) | 3,701 | 1 | 62.7 MB | 1.47 M | 10 |
+
+At render distance 64 the view needs 16,641 chunks; after 300 s on the
+container 12,869 were meshed and 10,048 still queued, with no LOD tiles
+yet, because the streamer builds nearest first and every tile is farther
+than every chunk. Meshing is now a small part of that time; terrain
+generation (0.9 ms per chunk) dominates, so a CPU with more cores fills
+the view proportionally faster.
+
+![Render distance 64 while loading: 3,701 meshes, 1 draw call](../images/step4-rd64.jpg)
+
+The validation layer reports no errors, with the log line
+`Indirect drawing: multi-draw`.
+
+### Known limitations (4c)
+
+- **Not yet measured on an RTX 2080 or 3060.** Lavapipe draws on the
+  CPU, so these numbers say nothing about real frame rates. The 60 FPS
+  budget at render 16 + LOD 256 still needs a check on the owner's
+  machine (0.6 M triangles and one draw call should be far below what
+  either card handles).
+- Frustum culling still runs per mesh on the CPU (about 16,000 box tests
+  at render 64); moving it into a compute shader is possible if it ever
+  shows up in a profile.
+- Render distance 64 takes minutes to fill on a 4-core machine; the
+  bottleneck is terrain generation, not meshing or drawing.
+- LOD tiles are still rebuilt when they come back into view (no cache).
+

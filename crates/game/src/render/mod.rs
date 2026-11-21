@@ -1,9 +1,17 @@
 //! Vulkan renderer (via `ash`).
 //!
 //! Deliberately simple: one render pass, one pipeline for terrain, egui drawn
-//! on top. What matters for scale is already here:
+//! on top. What matters for scale:
 //!
-//! * **GPU-only vertex memory.** Chunk meshes are copied through a staging
+//! * **GPU-driven drawing.** All meshes (chunks and LOD tiles) live in a
+//!   few large device-local vertex pools ([`pool`]). Each frame the CPU
+//!   writes one small record per visible mesh (an indirect draw command and
+//!   its position) and the whole terrain is drawn with one
+//!   `vkCmdDrawIndexedIndirect` per pool, instead of thousands of draw calls.
+//! * **Shared quad indices.** Every quad uses the same 6-index pattern, so a
+//!   single index buffer serves all meshes; meshes store only 8-byte
+//!   vertices.
+//! * **GPU-only vertex memory.** Meshes are copied through a staging
 //!   buffer into device-local memory, the fastest memory for the GPU to read.
 //! * **Camera-relative rendering.** Positions sent to the GPU are relative to
 //!   the camera, computed in `f64` on the CPU (see `terrain.vert`).
@@ -11,13 +19,14 @@
 //! * **Frames in flight.** The CPU records frame N+1 while the GPU draws
 //!   frame N; buffers are only freed once the GPU is done with them.
 
+mod pool;
 mod swapchain;
 
 use crate::camera::{Camera, Frustum};
 use crate::lod::NodeKey;
 use crate::mesh::{MeshData, Vertex};
 use ash::vk;
-use glam::{Vec3, Vec4};
+use glam::Vec3;
 use gpu_allocator::vulkan::{Allocation, AllocationCreateDesc, AllocationScheme, Allocator, AllocatorCreateDesc};
 use gpu_allocator::MemoryLocation;
 use raw_window_handle::{HasDisplayHandle, HasWindowHandle};
@@ -36,12 +45,20 @@ pub const MAX_UPLOADS_PER_FRAME: usize = 48;
 static VERT_SPV: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/terrain.vert.spv"));
 static FRAG_SPV: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/terrain.frag.spv"));
 
+/// Vertices per pool: 16 Mi × 8 bytes = 128 MiB. More pools are added
+/// when one fills up.
+const POOL_VERTICES: u64 = 16 << 20;
+/// Initial size of the shared quad index buffer (grown on demand).
+const INITIAL_QUADS: u32 = 1 << 16;
+/// Initial per-frame capacity of draw records (grown on demand).
+const INITIAL_DRAWS: usize = 4096;
+
 #[repr(C)]
 #[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
 struct PushConstants {
     view_proj: [f32; 16],
-    offset_fog: [f32; 4],
-    fog_color: [f32; 4],
+    /// rgb: linear fog colour, w: fog end distance.
+    fog: [f32; 4],
 }
 
 struct GpuBuffer {
@@ -49,12 +66,26 @@ struct GpuBuffer {
     alloc: Allocation,
 }
 
+/// A mesh's place in a vertex pool.
 struct GpuMesh {
-    vertices: GpuBuffer,
-    indices: GpuBuffer,
-    index_count: u32,
+    pool: usize,
+    first_vertex: u64,
+    quads: u32,
     min_y: f32,
     max_y: f32,
+}
+
+struct VertexPool {
+    buffer: GpuBuffer,
+    ranges: pool::RangeAllocator,
+}
+
+/// Host-visible per-frame buffers: draw records for the shader and the
+/// indirect commands that reference them.
+struct DrawBuffers {
+    records: GpuBuffer,
+    commands: GpuBuffer,
+    capacity: usize,
 }
 
 struct Frame {
@@ -64,6 +95,10 @@ struct Frame {
     /// Buffers that were in use when this frame was recorded and can be
     /// freed once its fence signals.
     garbage: Vec<GpuBuffer>,
+    /// Pool ranges (pool, first vertex, count) released the same way.
+    freed_ranges: Vec<(usize, u64, u64)>,
+    draws: DrawBuffers,
+    descriptor_set: vk::DescriptorSet,
 }
 
 /// Everything the UI layer hands to the renderer for one frame.
@@ -77,6 +112,10 @@ pub struct FrameStats {
     pub drawn_chunks: usize,
     pub drawn_triangles: u64,
     pub gpu_meshes: usize,
+    /// Bytes of vertex data on the GPU.
+    pub gpu_vertex_bytes: u64,
+    /// Draw calls recorded for the terrain.
+    pub draw_calls: usize,
 }
 
 pub struct Renderer {
@@ -94,6 +133,14 @@ pub struct Renderer {
     render_pass: vk::RenderPass,
     pipeline_layout: vk::PipelineLayout,
     pipeline: vk::Pipeline,
+    set_layout: vk::DescriptorSetLayout,
+    descriptor_pool: vk::DescriptorPool,
+    /// Multi-draw indirect with firstInstance is available (all desktop
+    /// GPUs); otherwise the same records are drawn with direct calls.
+    indirect: bool,
+    pools: Vec<VertexPool>,
+    quad_indices: GpuBuffer,
+    quad_capacity: u32,
     command_pool: vk::CommandPool,
     upload_pool: vk::CommandPool,
     frames: Vec<Frame>,
@@ -101,6 +148,7 @@ pub struct Renderer {
     meshes: HashMap<NodeKey, GpuMesh>,
     pending_uploads: Vec<(NodeKey, MeshData)>,
     pending_garbage: Vec<GpuBuffer>,
+    pending_ranges: Vec<(usize, u64, u64)>,
     egui: ManuallyDrop<egui_ash_renderer::Renderer<egui_ash_renderer::allocator::GpuAllocator>>,
     vsync: bool,
     needs_recreate: bool,
@@ -214,11 +262,17 @@ impl Renderer {
         let priorities = [1.0];
         let queue_info =
             [vk::DeviceQueueCreateInfo::default().queue_family_index(queue_family).queue_priorities(&priorities)];
+        let supported = instance.get_physical_device_features(physical);
+        let indirect = supported.multi_draw_indirect == vk::TRUE && supported.draw_indirect_first_instance == vk::TRUE;
+        let features =
+            vk::PhysicalDeviceFeatures::default().multi_draw_indirect(indirect).draw_indirect_first_instance(indirect);
+        log::info!("Indirect drawing: {}", if indirect { "multi-draw" } else { "not supported, direct draws" });
         let device = instance.create_device(
             physical,
             &vk::DeviceCreateInfo::default()
                 .queue_create_infos(&queue_info)
-                .enabled_extension_names(&device_extensions),
+                .enabled_extension_names(&device_extensions)
+                .enabled_features(&features),
             None,
         )?;
         let queue = device.get_device_queue(queue_family, 0);
@@ -252,7 +306,28 @@ impl Renderer {
             vk::SwapchainKHR::null(),
         )?;
 
-        let (pipeline_layout, pipeline) = create_pipeline(&device, render_pass)?;
+        let set_layout = device.create_descriptor_set_layout(
+            &vk::DescriptorSetLayoutCreateInfo::default().bindings(&[vk::DescriptorSetLayoutBinding::default()
+                .binding(0)
+                .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
+                .descriptor_count(1)
+                .stage_flags(vk::ShaderStageFlags::VERTEX)]),
+            None,
+        )?;
+        let descriptor_pool = device.create_descriptor_pool(
+            &vk::DescriptorPoolCreateInfo::default().max_sets(FRAMES_IN_FLIGHT as u32).pool_sizes(&[
+                vk::DescriptorPoolSize {
+                    ty: vk::DescriptorType::STORAGE_BUFFER,
+                    descriptor_count: FRAMES_IN_FLIGHT as u32,
+                },
+            ]),
+            None,
+        )?;
+        let set_layouts = [set_layout; FRAMES_IN_FLIGHT];
+        let descriptor_sets = device.allocate_descriptor_sets(
+            &vk::DescriptorSetAllocateInfo::default().descriptor_pool(descriptor_pool).set_layouts(&set_layouts),
+        )?;
+        let (pipeline_layout, pipeline) = create_pipeline(&device, render_pass, set_layout)?;
 
         // ---- Per-frame resources ------------------------------------------
         let command_pool = device.create_command_pool(
@@ -274,15 +349,21 @@ impl Renderer {
                 .command_buffer_count(FRAMES_IN_FLIGHT as u32),
         )?;
         let mut frames = Vec::new();
-        for cmd in cmds {
+        for (cmd, descriptor_set) in cmds.into_iter().zip(descriptor_sets) {
+            let draws = create_draw_buffers(&device, &allocator, INITIAL_DRAWS);
+            write_descriptor(&device, descriptor_set, &draws);
             frames.push(Frame {
                 cmd,
                 image_available: device.create_semaphore(&vk::SemaphoreCreateInfo::default(), None)?,
                 in_flight: device
                     .create_fence(&vk::FenceCreateInfo::default().flags(vk::FenceCreateFlags::SIGNALED), None)?,
                 garbage: Vec::new(),
+                freed_ranges: Vec::new(),
+                draws,
+                descriptor_set,
             });
         }
+        let quad_indices = create_quad_indices(&device, &allocator, queue, upload_pool, INITIAL_QUADS)?;
 
         let egui = egui_ash_renderer::Renderer::with_gpu_allocator(
             allocator.clone(),
@@ -311,6 +392,12 @@ impl Renderer {
             render_pass,
             pipeline_layout,
             pipeline,
+            set_layout,
+            descriptor_pool,
+            indirect,
+            pools: Vec::new(),
+            quad_indices,
+            quad_capacity: INITIAL_QUADS,
             command_pool,
             upload_pool,
             frames,
@@ -318,6 +405,7 @@ impl Renderer {
             meshes: HashMap::new(),
             pending_uploads: Vec::new(),
             pending_garbage: Vec::new(),
+            pending_ranges: Vec::new(),
             egui: ManuallyDrop::new(egui),
             vsync,
             needs_recreate: false,
@@ -349,8 +437,7 @@ impl Renderer {
     pub fn remove_mesh(&mut self, pos: NodeKey) {
         self.pending_uploads.retain(|(p, _)| *p != pos);
         if let Some(m) = self.meshes.remove(&pos) {
-            self.pending_garbage.push(m.vertices);
-            self.pending_garbage.push(m.indices);
+            self.pending_ranges.push((m.pool, m.first_vertex, m.quads as u64 * 4));
         }
     }
 
@@ -395,71 +482,65 @@ impl Renderer {
         let _ = self.allocator.lock().unwrap().free(b.alloc);
     }
 
-    /// Records copies for queued meshes into `cmd`. Staging buffers go to
-    /// the current frame's garbage list.
+    /// Records copies for queued meshes into `cmd`: one staging buffer for
+    /// the batch, one copy per mesh into its pool range. The staging buffer
+    /// (and any outgrown index buffer) goes to the current frame's garbage.
     fn record_uploads(&mut self, cmd: vk::CommandBuffer) {
         let n = self.pending_uploads.len().min(MAX_UPLOADS_PER_FRAME);
         if n == 0 {
             return;
         }
         let batch: Vec<_> = self.pending_uploads.drain(..n).collect();
+        let f = self.frame_index;
         let mut garbage = Vec::new();
-        for (pos, mesh) in batch {
-            if let Some(old) = self.meshes.remove(&pos) {
-                garbage.push(old.vertices);
-                garbage.push(old.indices);
+
+        // Grow the shared index buffer if a mesh has more quads than it covers.
+        let most_quads = batch.iter().map(|(_, m)| m.quad_count() as u32).max().unwrap_or(0);
+        if most_quads > self.quad_capacity {
+            let cap = most_quads.next_power_of_two();
+            let new = unsafe {
+                create_quad_indices(&self.device, &self.allocator, self.queue, self.upload_pool, cap)
+                    .expect("index buffer")
+            };
+            garbage.push(std::mem::replace(&mut self.quad_indices, new));
+            self.quad_capacity = cap;
+        }
+
+        let total: usize = batch.iter().map(|(_, m)| std::mem::size_of_val(m.vertices.as_slice())).sum();
+        let mut staging = (total > 0).then(|| {
+            self.create_buffer(total as u64, vk::BufferUsageFlags::TRANSFER_SRC, MemoryLocation::CpuToGpu, "staging")
+        });
+        let mut src_offset = 0u64;
+        for (key, mesh) in batch {
+            if let Some(old) = self.meshes.remove(&key) {
+                self.frames[f].freed_ranges.push((old.pool, old.first_vertex, old.quads as u64 * 4));
             }
-            if mesh.indices.is_empty() {
+            if mesh.vertices.is_empty() {
                 continue;
             }
-            let vbytes: &[u8] = bytemuck::cast_slice(&mesh.vertices);
-            let ibytes: &[u8] = bytemuck::cast_slice(&mesh.indices);
-            let total = (vbytes.len() + ibytes.len()) as u64;
-            let mut staging =
-                self.create_buffer(total, vk::BufferUsageFlags::TRANSFER_SRC, MemoryLocation::CpuToGpu, "staging");
-            {
-                let dst = staging.alloc.mapped_slice_mut().expect("staging is host visible");
-                dst[..vbytes.len()].copy_from_slice(vbytes);
-                dst[vbytes.len()..total as usize].copy_from_slice(ibytes);
-            }
-            let vertices = self.create_buffer(
-                vbytes.len() as u64,
-                vk::BufferUsageFlags::VERTEX_BUFFER | vk::BufferUsageFlags::TRANSFER_DST,
-                MemoryLocation::GpuOnly,
-                "chunk vertices",
-            );
-            let indices = self.create_buffer(
-                ibytes.len() as u64,
-                vk::BufferUsageFlags::INDEX_BUFFER | vk::BufferUsageFlags::TRANSFER_DST,
-                MemoryLocation::GpuOnly,
-                "chunk indices",
-            );
+            let count = mesh.vertices.len() as u64;
+            let (pool, first_vertex) = self.alloc_vertices(count);
+            let bytes: &[u8] = bytemuck::cast_slice(&mesh.vertices);
+            let staging = staging.as_mut().expect("staging exists when there are vertices");
+            staging.alloc.mapped_slice_mut().expect("staging is host visible")
+                [src_offset as usize..src_offset as usize + bytes.len()]
+                .copy_from_slice(bytes);
+            let vsize = std::mem::size_of::<Vertex>() as u64;
             unsafe {
                 self.device.cmd_copy_buffer(
                     cmd,
                     staging.buffer,
-                    vertices.buffer,
-                    &[vk::BufferCopy { src_offset: 0, dst_offset: 0, size: vbytes.len() as u64 }],
-                );
-                self.device.cmd_copy_buffer(
-                    cmd,
-                    staging.buffer,
-                    indices.buffer,
-                    &[vk::BufferCopy { src_offset: vbytes.len() as u64, dst_offset: 0, size: ibytes.len() as u64 }],
+                    self.pools[pool].buffer.buffer,
+                    &[vk::BufferCopy { src_offset, dst_offset: first_vertex * vsize, size: bytes.len() as u64 }],
                 );
             }
-            garbage.push(staging);
+            src_offset += bytes.len() as u64;
             self.meshes.insert(
-                pos,
-                GpuMesh {
-                    vertices,
-                    indices,
-                    index_count: mesh.indices.len() as u32,
-                    min_y: mesh.min_y,
-                    max_y: mesh.max_y,
-                },
+                key,
+                GpuMesh { pool, first_vertex, quads: mesh.quad_count() as u32, min_y: mesh.min_y, max_y: mesh.max_y },
             );
         }
+        garbage.extend(staging);
         // Make the copies visible to the vertex input stage.
         let barrier = vk::MemoryBarrier::default()
             .src_access_mask(vk::AccessFlags::TRANSFER_WRITE)
@@ -475,7 +556,32 @@ impl Renderer {
                 &[],
             );
         }
-        self.frames[self.frame_index].garbage.extend(garbage);
+        self.frames[f].garbage.extend(garbage);
+    }
+
+    /// A range of `count` vertices in some pool, adding a pool when all are full.
+    fn alloc_vertices(&mut self, count: u64) -> (usize, u64) {
+        for (i, p) in self.pools.iter_mut().enumerate() {
+            if let Some(first) = p.ranges.alloc(count) {
+                return (i, first);
+            }
+        }
+        let size = POOL_VERTICES.max(count);
+        let buffer = self.create_buffer(
+            size * std::mem::size_of::<Vertex>() as u64,
+            vk::BufferUsageFlags::VERTEX_BUFFER | vk::BufferUsageFlags::TRANSFER_DST,
+            MemoryLocation::GpuOnly,
+            "vertex pool",
+        );
+        let mut ranges = pool::RangeAllocator::new(size);
+        let first = ranges.alloc(count).expect("fresh pool fits the mesh");
+        self.pools.push(VertexPool { buffer, ranges });
+        log::info!("vertex pool {} created ({} MiB)", self.pools.len(), (size * 8) >> 20);
+        (self.pools.len() - 1, first)
+    }
+
+    fn gpu_vertex_bytes(&self) -> u64 {
+        self.pools.iter().map(|p| p.ranges.used() * std::mem::size_of::<Vertex>() as u64).sum()
     }
 
     fn recreate_swapchain(&mut self, size: (u32, u32)) -> Result<(), vk::Result> {
@@ -511,7 +617,13 @@ impl Renderer {
         sky: [f32; 3],
         ui: UiFrame,
     ) -> FrameStats {
-        let mut stats = FrameStats { drawn_chunks: 0, drawn_triangles: 0, gpu_meshes: self.meshes.len() };
+        let mut stats = FrameStats {
+            drawn_chunks: 0,
+            drawn_triangles: 0,
+            gpu_meshes: self.meshes.len(),
+            gpu_vertex_bytes: self.gpu_vertex_bytes(),
+            draw_calls: 0,
+        };
         if window_size.0 == 0 || window_size.1 == 0 {
             return stats; // minimised
         }
@@ -535,8 +647,13 @@ impl Renderer {
             for b in garbage {
                 self.free_buffer(b);
             }
+            for (pool, first, count) in std::mem::take(&mut self.frames[f].freed_ranges) {
+                self.pools[pool].ranges.free(first, count);
+            }
             let pending = std::mem::take(&mut self.pending_garbage);
             self.frames[f].garbage.extend(pending);
+            let pending = std::mem::take(&mut self.pending_ranges);
+            self.frames[f].freed_ranges.extend(pending);
 
             let image_index = match self.swapchain_loader.acquire_next_image(
                 self.swapchain.handle,
@@ -606,7 +723,10 @@ impl Renderer {
                 // (fog hides the edge instead).
                 let view_proj = camera.view_proj(self.aspect());
                 let frustum = Frustum::from_matrix(view_proj);
-                self.device.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::GRAPHICS, self.pipeline);
+
+                // One record per visible mesh, grouped by pool.
+                let mut per_pool: Vec<Vec<(vk::DrawIndexedIndirectCommand, [f32; 4])>> =
+                    (0..self.pools.len()).map(|_| Vec::new()).collect();
                 for key in draw_list {
                     let Some(mesh) = self.meshes.get(key) else { continue };
                     // Mesh origin relative to the camera, in f64 then f32.
@@ -620,23 +740,95 @@ impl Renderer {
                     if !frustum.intersects_aabb(min, max) {
                         continue;
                     }
-                    let pc = PushConstants {
-                        view_proj: view_proj.to_cols_array(),
-                        offset_fog: Vec4::new(ox, oy, oz, view_distance).to_array(),
-                        fog_color: [lin[0], lin[1], lin[2], 1.0],
+                    let command = vk::DrawIndexedIndirectCommand {
+                        index_count: mesh.quads * 6,
+                        instance_count: 1,
+                        first_index: 0,
+                        vertex_offset: mesh.first_vertex as i32,
+                        first_instance: 0, // set below
                     };
-                    self.device.cmd_push_constants(
-                        cmd,
-                        self.pipeline_layout,
-                        vk::ShaderStageFlags::VERTEX | vk::ShaderStageFlags::FRAGMENT,
-                        0,
-                        bytemuck::bytes_of(&pc),
-                    );
-                    self.device.cmd_bind_vertex_buffers(cmd, 0, &[mesh.vertices.buffer], &[0]);
-                    self.device.cmd_bind_index_buffer(cmd, mesh.indices.buffer, 0, vk::IndexType::UINT32);
-                    self.device.cmd_draw_indexed(cmd, mesh.index_count, 1, 0, 0, 0);
+                    per_pool[mesh.pool].push((command, [ox, oy, oz, key.cell_blocks() as f32]));
                     stats.drawn_chunks += 1;
-                    stats.drawn_triangles += mesh.index_count as u64 / 3;
+                    stats.drawn_triangles += mesh.quads as u64 * 2;
+                }
+                let total = stats.drawn_chunks;
+                if total > self.frames[f].draws.capacity {
+                    // This frame's buffers are idle (its fence was waited).
+                    let cap = total.next_power_of_two();
+                    let old = std::mem::replace(
+                        &mut self.frames[f].draws,
+                        create_draw_buffers(&self.device, &self.allocator, cap),
+                    );
+                    self.free_buffer(old.records);
+                    self.free_buffer(old.commands);
+                    write_descriptor(&self.device, self.frames[f].descriptor_set, &self.frames[f].draws);
+                }
+                {
+                    let draws = &mut self.frames[f].draws;
+                    let mut records: Vec<[f32; 4]> = Vec::with_capacity(total);
+                    let mut commands: Vec<vk::DrawIndexedIndirectCommand> = Vec::with_capacity(total);
+                    for group in &per_pool {
+                        for (c, r) in group {
+                            commands
+                                .push(vk::DrawIndexedIndirectCommand { first_instance: records.len() as u32, ..*c });
+                            records.push(*r);
+                        }
+                    }
+                    let rbytes: &[u8] = bytemuck::cast_slice(&records);
+                    draws.records.alloc.mapped_slice_mut().expect("host visible")[..rbytes.len()]
+                        .copy_from_slice(rbytes);
+                    let cbytes = std::slice::from_raw_parts(
+                        commands.as_ptr() as *const u8,
+                        std::mem::size_of_val(commands.as_slice()),
+                    );
+                    draws.commands.alloc.mapped_slice_mut().expect("host visible")[..cbytes.len()]
+                        .copy_from_slice(cbytes);
+                }
+
+                self.device.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::GRAPHICS, self.pipeline);
+                self.device.cmd_bind_descriptor_sets(
+                    cmd,
+                    vk::PipelineBindPoint::GRAPHICS,
+                    self.pipeline_layout,
+                    0,
+                    &[self.frames[f].descriptor_set],
+                    &[],
+                );
+                let pc = PushConstants {
+                    view_proj: view_proj.to_cols_array(),
+                    fog: [lin[0], lin[1], lin[2], view_distance],
+                };
+                self.device.cmd_push_constants(
+                    cmd,
+                    self.pipeline_layout,
+                    vk::ShaderStageFlags::VERTEX | vk::ShaderStageFlags::FRAGMENT,
+                    0,
+                    bytemuck::bytes_of(&pc),
+                );
+                self.device.cmd_bind_index_buffer(cmd, self.quad_indices.buffer, 0, vk::IndexType::UINT32);
+                let stride = std::mem::size_of::<vk::DrawIndexedIndirectCommand>() as u32;
+                let mut first = 0usize;
+                for (pool, group) in per_pool.iter().enumerate() {
+                    if group.is_empty() {
+                        continue;
+                    }
+                    self.device.cmd_bind_vertex_buffers(cmd, 0, &[self.pools[pool].buffer.buffer], &[0]);
+                    if self.indirect {
+                        self.device.cmd_draw_indexed_indirect(
+                            cmd,
+                            self.frames[f].draws.commands.buffer,
+                            (first * stride as usize) as u64,
+                            group.len() as u32,
+                            stride,
+                        );
+                        stats.draw_calls += 1;
+                    } else {
+                        for (i, (c, _)) in group.iter().enumerate() {
+                            self.device.cmd_draw_indexed(cmd, c.index_count, 1, 0, c.vertex_offset, (first + i) as u32);
+                        }
+                        stats.draw_calls += group.len();
+                    }
+                    first += group.len();
                 }
             }
 
@@ -695,16 +887,17 @@ impl Drop for Renderer {
         unsafe {
             self.device.device_wait_idle().ok();
             ManuallyDrop::drop(&mut self.egui);
-            let meshes: Vec<_> = self.meshes.drain().map(|(_, m)| m).collect();
-            for m in meshes {
-                self.free_buffer(m.vertices);
-                self.free_buffer(m.indices);
-            }
+            self.meshes.clear();
             let mut all_garbage = std::mem::take(&mut self.pending_garbage);
             for f in &mut self.frames {
                 all_garbage.append(&mut f.garbage);
+                let draws = std::mem::replace(&mut f.draws, DrawBuffers::empty());
+                all_garbage.extend(draws.into_buffers());
             }
-            for b in all_garbage {
+            all_garbage.extend(self.pools.drain(..).map(|p| p.buffer));
+            let indices = std::mem::replace(&mut self.quad_indices, GpuBuffer::null());
+            all_garbage.push(indices);
+            for b in all_garbage.into_iter().filter(|b| b.buffer != vk::Buffer::null()) {
                 self.free_buffer(b);
             }
             for f in &self.frames {
@@ -715,6 +908,8 @@ impl Drop for Renderer {
             self.device.destroy_command_pool(self.upload_pool, None);
             self.device.destroy_pipeline(self.pipeline, None);
             self.device.destroy_pipeline_layout(self.pipeline_layout, None);
+            self.device.destroy_descriptor_pool(self.descriptor_pool, None);
+            self.device.destroy_descriptor_set_layout(self.set_layout, None);
             std::mem::take(&mut self.swapchain).destroy(&self.device, &self.swapchain_loader, &self.allocator);
             self.device.destroy_render_pass(self.render_pass, None);
             ManuallyDrop::drop(&mut self.allocator);
@@ -788,6 +983,7 @@ unsafe fn create_render_pass(
 unsafe fn create_pipeline(
     device: &ash::Device,
     render_pass: vk::RenderPass,
+    set_layout: vk::DescriptorSetLayout,
 ) -> Result<(vk::PipelineLayout, vk::Pipeline), vk::Result> {
     let load = |bytes: &[u8]| -> Result<vk::ShaderModule, vk::Result> {
         let words =
@@ -801,8 +997,11 @@ unsafe fn create_pipeline(
         offset: 0,
         size: std::mem::size_of::<PushConstants>() as u32,
     }];
-    let layout =
-        device.create_pipeline_layout(&vk::PipelineLayoutCreateInfo::default().push_constant_ranges(&push), None)?;
+    let set_layouts = [set_layout];
+    let layout = device.create_pipeline_layout(
+        &vk::PipelineLayoutCreateInfo::default().push_constant_ranges(&push).set_layouts(&set_layouts),
+        None,
+    )?;
 
     let stages = [
         vk::PipelineShaderStageCreateInfo::default().stage(vk::ShaderStageFlags::VERTEX).module(vs).name(c"main"),
@@ -813,14 +1012,10 @@ unsafe fn create_pipeline(
         stride: std::mem::size_of::<Vertex>() as u32,
         input_rate: vk::VertexInputRate::VERTEX,
     }];
+    // Two packed u32 words, decoded in terrain.vert.
     let attributes = [
-        vk::VertexInputAttributeDescription {
-            location: 0,
-            binding: 0,
-            format: vk::Format::R32G32B32_SFLOAT,
-            offset: 0,
-        },
-        vk::VertexInputAttributeDescription { location: 1, binding: 0, format: vk::Format::R8G8B8A8_UNORM, offset: 12 },
+        vk::VertexInputAttributeDescription { location: 0, binding: 0, format: vk::Format::R32_UINT, offset: 0 },
+        vk::VertexInputAttributeDescription { location: 1, binding: 0, format: vk::Format::R32_UINT, offset: 4 },
     ];
     let vertex_input = vk::PipelineVertexInputStateCreateInfo::default()
         .vertex_binding_descriptions(&bindings)
@@ -862,4 +1057,140 @@ unsafe fn create_pipeline(
     device.destroy_shader_module(vs, None);
     device.destroy_shader_module(fs, None);
     Ok((layout, pipeline))
+}
+
+impl GpuBuffer {
+    fn null() -> Self {
+        Self { buffer: vk::Buffer::null(), alloc: Allocation::default() }
+    }
+}
+
+impl DrawBuffers {
+    fn empty() -> Self {
+        Self { records: GpuBuffer::null(), commands: GpuBuffer::null(), capacity: 0 }
+    }
+    fn into_buffers(self) -> [GpuBuffer; 2] {
+        [self.records, self.commands]
+    }
+}
+
+fn create_host_buffer(
+    device: &ash::Device,
+    allocator: &Mutex<Allocator>,
+    size: u64,
+    usage: vk::BufferUsageFlags,
+    name: &str,
+) -> GpuBuffer {
+    unsafe {
+        let buffer = device
+            .create_buffer(
+                &vk::BufferCreateInfo::default().size(size).usage(usage).sharing_mode(vk::SharingMode::EXCLUSIVE),
+                None,
+            )
+            .expect("create_buffer");
+        let requirements = device.get_buffer_memory_requirements(buffer);
+        let alloc = allocator
+            .lock()
+            .unwrap()
+            .allocate(&AllocationCreateDesc {
+                name,
+                requirements,
+                location: MemoryLocation::CpuToGpu,
+                linear: true,
+                allocation_scheme: AllocationScheme::GpuAllocatorManaged,
+            })
+            .expect("GPU out of memory");
+        device.bind_buffer_memory(buffer, alloc.memory(), alloc.offset()).expect("bind_buffer_memory");
+        GpuBuffer { buffer, alloc }
+    }
+}
+
+fn create_draw_buffers(device: &ash::Device, allocator: &Mutex<Allocator>, capacity: usize) -> DrawBuffers {
+    let records = create_host_buffer(
+        device,
+        allocator,
+        (capacity * 16) as u64,
+        vk::BufferUsageFlags::STORAGE_BUFFER,
+        "draw records",
+    );
+    let commands = create_host_buffer(
+        device,
+        allocator,
+        (capacity * std::mem::size_of::<vk::DrawIndexedIndirectCommand>()) as u64,
+        vk::BufferUsageFlags::INDIRECT_BUFFER,
+        "indirect commands",
+    );
+    DrawBuffers { records, commands, capacity }
+}
+
+fn write_descriptor(device: &ash::Device, set: vk::DescriptorSet, draws: &DrawBuffers) {
+    let info = [vk::DescriptorBufferInfo { buffer: draws.records.buffer, offset: 0, range: vk::WHOLE_SIZE }];
+    let write = vk::WriteDescriptorSet::default()
+        .dst_set(set)
+        .dst_binding(0)
+        .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
+        .buffer_info(&info);
+    unsafe { device.update_descriptor_sets(&[write], &[]) };
+}
+
+/// The shared index buffer: quad q uses vertices 4q…4q+3 as two triangles
+/// (0, 1, 2) and (0, 2, 3). Filled once through a staging buffer and a
+/// one-off command buffer.
+unsafe fn create_quad_indices(
+    device: &ash::Device,
+    allocator: &Mutex<Allocator>,
+    queue: vk::Queue,
+    pool: vk::CommandPool,
+    quads: u32,
+) -> Result<GpuBuffer, vk::Result> {
+    let indices: Vec<u32> = (0..quads).flat_map(|q| [0, 1, 2, 0, 2, 3].map(|i| q * 4 + i)).collect();
+    let bytes: &[u8] = bytemuck::cast_slice(&indices);
+    let mut staging =
+        create_host_buffer(device, allocator, bytes.len() as u64, vk::BufferUsageFlags::TRANSFER_SRC, "index staging");
+    staging.alloc.mapped_slice_mut().expect("host visible")[..bytes.len()].copy_from_slice(bytes);
+    let buffer = device.create_buffer(
+        &vk::BufferCreateInfo::default()
+            .size(bytes.len() as u64)
+            .usage(vk::BufferUsageFlags::INDEX_BUFFER | vk::BufferUsageFlags::TRANSFER_DST)
+            .sharing_mode(vk::SharingMode::EXCLUSIVE),
+        None,
+    )?;
+    let requirements = device.get_buffer_memory_requirements(buffer);
+    let alloc = allocator
+        .lock()
+        .unwrap()
+        .allocate(&AllocationCreateDesc {
+            name: "quad indices",
+            requirements,
+            location: MemoryLocation::GpuOnly,
+            linear: true,
+            allocation_scheme: AllocationScheme::GpuAllocatorManaged,
+        })
+        .expect("GPU out of memory");
+    device.bind_buffer_memory(buffer, alloc.memory(), alloc.offset())?;
+    let cmd = device.allocate_command_buffers(
+        &vk::CommandBufferAllocateInfo::default()
+            .command_pool(pool)
+            .level(vk::CommandBufferLevel::PRIMARY)
+            .command_buffer_count(1),
+    )?[0];
+    device.begin_command_buffer(
+        cmd,
+        &vk::CommandBufferBeginInfo::default().flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT),
+    )?;
+    device.cmd_copy_buffer(
+        cmd,
+        staging.buffer,
+        buffer,
+        &[vk::BufferCopy { src_offset: 0, dst_offset: 0, size: bytes.len() as u64 }],
+    );
+    device.end_command_buffer(cmd)?;
+    let cmds = [cmd];
+    device.queue_submit(queue, &[vk::SubmitInfo::default().command_buffers(&cmds)], vk::Fence::null())?;
+    // Rare (start-up and when a bigger mesh appears), so a full wait is fine.
+    device.queue_wait_idle(queue)?;
+    device.free_command_buffers(pool, &cmds);
+    device.destroy_buffer(staging.buffer, None);
+    let _ = allocator.lock().unwrap().free(staging.alloc);
+    Ok(GpuBuffer { buffer, alloc })
 }

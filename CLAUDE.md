@@ -31,8 +31,9 @@ crates/worldgen   Pure generator library. NO graphics, NO windowing, NO I/O.
 crates/wg-map     CLI: renders top-down PNG maps straight from the generator,
                   and benchmarks chunk generation. Use it to check accuracy.
 crates/game       Binary `world-gen`: winit window, egui menus, ash/Vulkan
-                  renderer, greedy mesher, LOD quadtree + tile mesher (lod.rs),
-                  chunk/tile streaming (world.rs).
+                  renderer (render/: GPU-driven, pool.rs range allocator),
+                  binary greedy mesher (mesh.rs), LOD quadtree + tile mesher
+                  (lod.rs), chunk/tile streaming (world.rs), world map (map.rs).
 docs/PLAN.md      The 4-step roadmap and its status.
 docs/devlog/      One log per step: detailed technical write-up + a short
                   plain-language summary for non-programmers.
@@ -74,7 +75,7 @@ sleep 25; DISPLAY=:99 import -window root shot.png
 
 Environment switches: `WG_VALIDATION=1` (Khronos validation layer, must
 print no errors), `WG_AUTOSTART=<seed>` (skip menus), `WG_CAMERA=x,z[,yaw,pitch,height]`
-(with autostart: place the camera), `WG_SCREEN=create|settings` (open a menu),
+(with autostart: place the camera), `WG_SCREEN=create|settings` (open a menu; `map` with autostart),
 `WG_EXIT_AFTER_FRAMES=N`, `WG_HEIGHT=<blocks>` (with autostart: world height). A `settings.ron` in the working directory sets
 render distance etc.
 
@@ -110,6 +111,13 @@ render distance etc.
   The game's quadtree (`lod.rs`) must keep its leaves gap- and overlap-free
   and `draw_set` must never draw a mesh that isn't uploaded (tested).
   Depth is reverse-Z with an infinite far plane.
+- **Rendering:** vertices are 8 bytes (`mesh::Vertex`: x, z in cells, y +
+  `Y_BIAS`, sRGB colour); quads share one index buffer, so meshes carry no
+  indices. Meshes live in shared vertex pools (`render/pool.rs`); a range
+  is freed only after the frames in flight that used it have finished.
+  Each visible mesh is one draw record + one indirect command, drawn with
+  one `vkCmdDrawIndexedIndirect` per pool (direct draws as a fallback).
+  The binary mesher must match `greedy_section_reference` (tested).
 - **Coordinates:** blocks are `i32`, noise inputs `f64` and wrapped
   (`noise::wrap`); camera position is `f64`; the GPU only sees
   camera-relative `f32`.

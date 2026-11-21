@@ -13,7 +13,7 @@ seed when it is needed, so a 60,000 km world costs the same as a 1 km one.
 | 1 | Foundation: project layout, world settings, chunk storage, generator skeleton, game menu, Vulkan renderer, map tool | **Done**, see [devlog 01](devlog/01-foundation.md) |
 | 2 | Terrain: continents, oceans, erosion, mountains, rivers, 3D overhangs | **Done**, see [devlog 02](devlog/02-terrain.md) |
 | 3 | Biomes and trees | **Done**, see [devlog 03](devlog/03-biomes.md) |
-| 4 | Scale and speed: tall worlds (cubic chunks), LODs to 256 chunks, faster meshing, GPU-driven drawing, world map | **In progress**: 4a tall worlds and 4b LOD rings done, see [devlog 04](devlog/04-scale.md) |
+| 4 | Scale and speed: tall worlds (cubic chunks), LODs to 256 chunks, faster meshing, GPU-driven drawing, world map | **Done** (4a, 4b, 4c), see [devlog 04](devlog/04-scale.md); RTX 2080 frame-rate check pending on real hardware |
 
 ## Step 1: Foundation ✔
 
@@ -89,9 +89,17 @@ in three PRs: 4a tall worlds, 4b far view and LODs, 4c speed and world map.
   out to the LOD distance, sampled straight from the generator (ground,
   water, ice, trees exact at small cells and by density at large ones),
   swapped without holes as the camera moves. Reverse-Z depth.
-- **Binary greedy meshing** (bitmask face culling) and packed 8-byte vertices.
-- **GPU-driven drawing:** one big vertex/index pool, indirect draws.
-- Chunk cache and unloading tuned for the larger distances.
-- In-game world map (top-down, zoomable to the whole world).
-- Performance budget verified against an RTX 2080: 60 FPS at render
-  distance 16 plus the LOD rings.
+- ✔ (4c) **Binary greedy meshing** (bitmask face culling, 12× faster:
+  0.11 ms per chunk) and packed 8-byte vertices with a shared quad index
+  buffer (4.7 KiB of GPU memory per chunk, was 13).
+- ✔ (4c) **GPU-driven drawing:** meshes suballocated from 128 MiB vertex
+  pools, one indirect draw per pool (1 draw call for the whole default
+  view), direct-draw fallback.
+- ✔ (4b) Unloading for the larger distances: chunks kept 2 rings past
+  the view, meshes evicted once neither a leaf nor drawn. A cache for LOD
+  tiles that come back into view is left for later.
+- ✔ (4c) **In-game world map** (M): top-down, from 1/8 block per pixel
+  to the whole world, drag, zoom, double-click to teleport.
+- Performance budget on an RTX 2080: 60 FPS at render distance 16 plus
+  the LOD rings. Not measurable in the cloud container (software
+  renderer); to be confirmed on the owner's machine.

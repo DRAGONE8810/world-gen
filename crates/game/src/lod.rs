@@ -253,7 +253,8 @@ pub fn mesh_tile(gen: &WorldGenerator, key: NodeKey) -> MeshData {
     let grid = gen.lod_grid(bx - s, bz - s, s, N);
     let at = |i: usize, j: usize| &grid[i + j * N];
     let mut out = MeshData { min_y: f32::MAX, max_y: f32::MIN, ..Default::default() };
-    let sf = s as f32;
+    // x and z are in cells (the renderer scales them by the cell size), y
+    // in blocks.
 
     // Tops, greedy-merged by (height, block, biome tint).
     let key_of = |c: &worldgen::lod::LodColumn| -> Option<(i32, BlockId, [u8; 3])> {
@@ -282,8 +283,8 @@ pub fn mesh_tile(gen: &WorldGenerator, key: NodeKey) -> MeshData {
                 row[i..i + w].fill(true);
             }
             // +y face: u = z, v = x (see `emit_quad`).
-            let base = [i as f32 * sf, (k.0 + 1) as f32, j as f32 * sf];
-            emit_quad(&mut out, base, 2, 0, h as f32 * sf, w as f32 * sf, true, k.2, 2);
+            let base = [i as f32, (k.0 + 1) as f32, j as f32];
+            emit_quad(&mut out, base, 2, 0, h as f32, w as f32, true, k.2, 2);
         }
     }
 
@@ -306,14 +307,14 @@ pub fn mesh_tile(gen: &WorldGenerator, key: NodeKey) -> MeshData {
                 if bottom >= top {
                     continue;
                 }
-                let (x0, z0) = (i as f32 * sf, j as f32 * sf);
+                let (x0, z0) = (i as f32, j as f32);
                 match face {
                     // ±x faces: u = y, v = z.
-                    0 => emit_quad(&mut out, [x0 + sf, bottom, z0], 1, 2, top - bottom, sf, true, color, 0),
-                    1 => emit_quad(&mut out, [x0, bottom, z0], 1, 2, top - bottom, sf, false, color, 1),
+                    0 => emit_quad(&mut out, [x0 + 1.0, bottom, z0], 1, 2, top - bottom, 1.0, true, color, 0),
+                    1 => emit_quad(&mut out, [x0, bottom, z0], 1, 2, top - bottom, 1.0, false, color, 1),
                     // ±z faces: u = x, v = y.
-                    4 => emit_quad(&mut out, [x0, bottom, z0 + sf], 0, 1, sf, top - bottom, true, color, 4),
-                    _ => emit_quad(&mut out, [x0, bottom, z0], 0, 1, sf, top - bottom, false, color, 5),
+                    4 => emit_quad(&mut out, [x0, bottom, z0 + 1.0], 0, 1, 1.0, top - bottom, true, color, 4),
+                    _ => emit_quad(&mut out, [x0, bottom, z0], 0, 1, 1.0, top - bottom, false, color, 5),
                 }
             }
         }
@@ -458,9 +459,8 @@ mod tests {
         for level in [1u8, 3, 6] {
             let m = mesh_tile(&g, NodeKey { level, x: 0, z: 0 });
             assert!(!m.vertices.is_empty());
-            let size = (16 << level) as f32;
             for v in &m.vertices {
-                assert!((0.0..=size).contains(&v.pos[0]) && (0.0..=size).contains(&v.pos[2]), "{:?}", v.pos);
+                assert!(v.x() <= 16 && v.z() <= 16, "{v:?}");
             }
             assert!(m.min_y < m.max_y);
             // Greedy tops: far fewer than one quad per cell plus 4 walls.

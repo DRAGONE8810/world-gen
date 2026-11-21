@@ -9,6 +9,7 @@
 mod camera;
 mod config;
 mod lod;
+mod map;
 mod mesh;
 mod render;
 mod ui;
@@ -38,6 +39,8 @@ struct Session {
     settings: WorldSettings,
     chunks: ChunkManager,
     camera: Camera,
+    /// The world map while it is open.
+    map: Option<map::WorldMap>,
 }
 
 struct App {
@@ -55,7 +58,7 @@ struct App {
     last_frame: Instant,
     fps: f32,
     frame_ms: f32,
-    last_draw: (usize, u64),
+    last_draw: (usize, u64, u64, usize),
     /// Screenshot-test mode: quit after this many frames.
     exit_after_frames: Option<u64>,
     frames: u64,
@@ -81,7 +84,7 @@ impl App {
             last_frame: Instant::now(),
             fps: 0.0,
             frame_ms: 0.0,
-            last_draw: (0, 0),
+            last_draw: (0, 0, 0, 0),
             exit_after_frames,
             frames: 0,
             fatal: None,
@@ -99,13 +102,18 @@ impl App {
         if let Some(r) = &mut self.renderer {
             r.clear_meshes();
         }
-        self.session = Some(Session { settings, chunks: ChunkManager::new(gen), camera });
+        self.session = Some(Session { settings, chunks: ChunkManager::new(gen), camera, map: None });
         self.set_screen(Screen::Playing);
     }
 
     fn set_screen(&mut self, screen: Screen) {
         self.screen = screen;
         self.keys.clear();
+        if let Some(s) = &mut self.session {
+            // The map opens centred on the player each time.
+            s.map = (screen == Screen::Map)
+                .then(|| map::WorldMap::new((s.camera.pos.x, s.camera.pos.z), s.settings.height.terrain_scale()));
+        }
         if let Some(w) = &self.window {
             let capture = screen == Screen::Playing;
             if capture {
@@ -201,6 +209,7 @@ impl App {
         let ctx = self.egui_ctx.clone();
         let gpu = self.renderer.as_ref().map(|r| r.gpu_name.clone()).unwrap_or_default();
         let mut settings_done = false;
+        let mut teleport = None;
         let output = ctx.run_ui(raw, |ui| match self.screen {
             Screen::MainMenu => ui::main_menu(ui, &mut actions),
             Screen::CreateWorld => ui::create_world(ui, &mut self.form, &mut actions),
@@ -221,6 +230,8 @@ impl App {
                             stats: s.chunks.stats,
                             drawn_chunks: self.last_draw.0,
                             drawn_triangles: self.last_draw.1,
+                            gpu_vertex_bytes: self.last_draw.2,
+                            draw_calls: self.last_draw.3,
                             gpu: &gpu,
                             pending: s.chunks.stats.pending_chunks,
                             show_debug: self.settings.show_debug,
@@ -232,7 +243,25 @@ impl App {
                     ui::pause_menu(ui, &mut actions);
                 }
             }
+            Screen::Map => {
+                if let Some(s) = &mut self.session {
+                    let gen = s.chunks.generator_arc().clone();
+                    let player = (s.camera.pos.x, s.camera.pos.z);
+                    if let Some(m) = &mut s.map {
+                        if let map::MapAction::Teleport(x, z) = m.ui(ui, &gen, player, s.camera.yaw) {
+                            teleport = Some((x, z));
+                        }
+                    }
+                }
+            }
         });
+        if let Some((x, z)) = teleport {
+            if let Some(s) = &mut self.session {
+                let ground = s.chunks.generator().sample_column(x.floor() as i32, z.floor() as i32).surface_y;
+                s.camera.pos = DVec3::new(x, ground.max(worldgen::SEA_LEVEL) as f64 + 40.0, z);
+            }
+            actions.push(Action::Resume);
+        }
         egui_state.handle_platform_output(&window, output.platform_output);
 
         if settings_done {
@@ -263,7 +292,7 @@ impl App {
                     pixels_per_point: output.pixels_per_point,
                 },
             );
-            self.last_draw = (stats.drawn_chunks, stats.drawn_triangles);
+            self.last_draw = (stats.drawn_chunks, stats.drawn_triangles, stats.gpu_vertex_bytes, stats.draw_calls);
         }
 
         for a in actions {
@@ -277,7 +306,8 @@ impl App {
     }
 
     /// Scripted start used for automated screenshots: `WG_AUTOSTART=seed`
-    /// jumps straight into a world, `WG_SCREEN=create|settings` opens a menu.
+    /// jumps straight into a world, `WG_SCREEN=create|settings` opens a menu
+    /// (`WG_SCREEN=map` with autostart opens the world map).
     fn autostart(&mut self) {
         if let Ok(seed) = std::env::var("WG_AUTOSTART") {
             let mut s = self.settings.last_world.clone();
@@ -297,6 +327,9 @@ impl App {
                     sess.camera.yaw = v.get(2).copied().unwrap_or(0.0).to_radians() as f32;
                     sess.camera.pitch = v.get(3).copied().unwrap_or(-20.0).to_radians() as f32;
                 }
+            }
+            if std::env::var("WG_SCREEN").is_ok_and(|v| v == "map") {
+                self.set_screen(Screen::Map);
             }
         } else if let Ok(screen) = std::env::var("WG_SCREEN") {
             match screen.as_str() {
@@ -369,6 +402,8 @@ impl ApplicationHandler for App {
                         match (code, self.screen) {
                             (KeyCode::Escape, Screen::Playing) => self.set_screen(Screen::Paused),
                             (KeyCode::Escape, Screen::Paused) => self.set_screen(Screen::Playing),
+                            (KeyCode::KeyM, Screen::Playing) => self.set_screen(Screen::Map),
+                            (KeyCode::KeyM | KeyCode::Escape, Screen::Map) => self.set_screen(Screen::Playing),
                             (KeyCode::F3, _) => {
                                 self.settings.show_debug = !self.settings.show_debug;
                             }
