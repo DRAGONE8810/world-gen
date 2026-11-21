@@ -176,7 +176,7 @@ pub fn create_world(ui: &mut egui::Ui, form: &mut WorldForm, actions: &mut Vec<A
                     let h = WorldHeight::from_blocks(form.height);
                     ui.label(
                         RichText::new(format!(
-                            "{}y {} to {} · sea at {} · terrain ×{:.2}",
+                            "{}y {} to {} · sea at {}{}",
                             if h.blocks() != form.height {
                                 format!("rounded to {} · ", group_thousands(h.blocks()))
                             } else {
@@ -185,7 +185,11 @@ pub fn create_world(ui: &mut egui::Ui, form: &mut WorldForm, actions: &mut Vec<A
                             h.min_y(),
                             h.max_y(),
                             SEA_LEVEL,
-                            h.terrain_scale()
+                            if form.generator == Generator::Classic {
+                                format!(" · terrain ×{:.2}", h.terrain_scale())
+                            } else {
+                                String::new()
+                            }
                         ))
                         .weak(),
                     );

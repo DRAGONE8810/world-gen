@@ -774,3 +774,56 @@ fn mountains_from_relief(e: &Grid<f32>, km: f64) -> (Grid<f32>, Grid<f32>, Grid<
     }
     (m, sc, ss)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::settings::{SimQuality, WorldSize};
+
+    fn earth() -> RealisticWorld {
+        RealisticWorld::new(&WorldSettings {
+            generator: crate::settings::Generator::Realistic,
+            planet: Planet::Earth,
+            quality: SimQuality::Fast,
+            size: WorldSize::from_km(40_000.0),
+            ..Default::default()
+        })
+    }
+
+    fn cell(r: &RealisticWorld, lat: f64, lon: f64) -> (isize, isize) {
+        (((lon + 180.0) / 360.0 * r.w as f64) as isize, ((90.0 - lat) / 180.0 * r.h as f64) as isize)
+    }
+
+    /// The real Earth gets its real lakes at their real levels (the
+    /// Caspian below sea level), and no lakes where the coarse relief only
+    /// looks closed (the Congo basin).
+    #[test]
+    fn earth_has_its_real_lakes() {
+        let r = earth();
+        let lake_near = |lat: f64, lon: f64| {
+            let (i, j) = cell(&r, lat, lon);
+            (-2..=2)
+                .flat_map(|a| (-2..=2).map(move |b| (a, b)))
+                .map(|(a, b)| r.lake.at(i + a, j + b))
+                .fold(NO_LAKE, f32::max)
+        };
+        let caspian = lake_near(42.0, 50.5);
+        assert!((-40.0..-20.0).contains(&caspian), "Caspian level {caspian}");
+        let superior = lake_near(47.7, -87.5);
+        assert!((150.0..200.0).contains(&superior), "Lake Superior level {superior}");
+        assert!(lake_near(-1.0, 33.0) > 1000.0, "Lake Victoria");
+        assert_eq!(lake_near(0.0, 18.0), NO_LAKE, "no lake in the Congo basin");
+        // Rivers: the simulation finds a large network.
+        assert!(r.river_count() > 500, "{} river reaches", r.river_count());
+    }
+
+    /// Latitude runs from 90° N at the top edge to 90° S at the bottom.
+    #[test]
+    fn latitude_spans_the_planet() {
+        let r = earth();
+        let half = (r.cell_blocks * r.h as f64 / 2.0) as i32;
+        assert!((r.latitude(-half) - 90.0).abs() < 1e-6);
+        assert!(r.latitude(0).abs() < 1e-6);
+        assert!((r.latitude(half) + 90.0).abs() < 1e-6);
+    }
+}

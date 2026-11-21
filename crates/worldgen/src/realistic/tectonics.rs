@@ -308,9 +308,18 @@ pub fn build(seed: u64, planet: Planet, w: usize, h: usize, km: f64) -> Tectonic
         let mut strike = (1f32, 0f32);
         // Ocean floor from its age.
         let ocean = if rdist[i].is_finite() && rsrc[i] != u32::MAX {
-            let half_rate = (-conv_at(rsrc[i] as usize)).max(0.5) * 0.5; // cm/yr = 10 km/Myr
+            // Half the spreading rate, cm/yr (= 10 km/Myr); real ridges
+            // spread at 2–15 cm/yr in total.
+            let half_rate = (-conv_at(rsrc[i] as usize)).max(1.5);
             let age = (rdist[i] as f64 * km) / (half_rate * 10.0);
-            -(2600.0 + 345.0 * age.min(170.0).sqrt()).min(6200.0)
+            // Depth by age, GDH1 plate model (Stein & Stein 1992): the
+            // floor sinks as it cools, fast at first, levelling off near
+            // 5.7 km.
+            if age < 20.0 {
+                -(2600.0 + 365.0 * age.sqrt())
+            } else {
+                -(5651.0 - 2473.0 * libm::exp(-0.0278 * age))
+            }
         } else {
             -5600.0
         };
@@ -595,6 +604,51 @@ fn hotspots(
                     mountain.data[idx] = mountain.data[idx].max((0.5 * bump(d, 0.0, r * 1.3) * oceanic) as f32);
                 }
             }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The relief has the features of a real plate layout: continents and
+    /// oceans in the planned shares, high ranges on the mountain belts,
+    /// abyssal depths, and plates that cover everything.
+    #[test]
+    fn plates_build_continents_ranges_and_ocean_basins() {
+        for (planet, lo, hi) in
+            [(Planet::Continents, 0.25, 0.5), (Planet::Pangea, 0.22, 0.45), (Planet::Islands, 0.03, 0.2)]
+        {
+            let (w, h) = (256, 256);
+            let t = build(3, planet, w, h, 40_000.0 / w as f64);
+            let n = (w * h) as f64;
+            let land = t.elevation.data.iter().filter(|&&e| e >= 0.0).count() as f64 / n;
+            assert!((lo..hi).contains(&land), "{planet:?}: land share {land}");
+            assert!(t.plate.data.iter().all(|&p| p != u16::MAX), "{planet:?}: cell without a plate");
+            let max = t.elevation.data.iter().copied().fold(f32::MIN, f32::max);
+            assert!(max > 3500.0, "{planet:?}: highest point {max} m");
+            // Mountain belts stand high above the rest of the land.
+            let mean = |f: &dyn Fn(f32) -> bool| {
+                let v: Vec<f64> = t
+                    .elevation
+                    .data
+                    .iter()
+                    .zip(&t.mountain.data)
+                    .filter(|&(&e, &m)| e >= 0.0 && f(m))
+                    .map(|(&e, _)| e as f64)
+                    .collect();
+                v.iter().sum::<f64>() / v.len().max(1) as f64
+            };
+            if planet != Planet::Islands {
+                let (ranges, plains) = (mean(&|m| m > 0.5), mean(&|m| m < 0.1));
+                assert!(ranges > plains + 1000.0, "{planet:?}: ranges {ranges} m, plains {plains} m");
+            }
+            // Old ocean floor lies 4–6 km deep.
+            let mut sea: Vec<f32> = t.elevation.data.iter().copied().filter(|&e| e < -1000.0).collect();
+            sea.sort_by(f32::total_cmp);
+            let median = sea[sea.len() / 2];
+            assert!((-6000.0..-3500.0).contains(&median), "{planet:?}: median ocean depth {median}");
         }
     }
 }
