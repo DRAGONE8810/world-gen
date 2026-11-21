@@ -13,11 +13,25 @@ deliberately plain.
 
 ## Status
 
-All 4 steps are in: foundation, terrain (continents, oceans, mountains,
-rivers), 48 biomes with trees, and scale and speed: world height up to
-17,696 blocks, a far view out to 256 chunks (LOD rings, like Distant
-Horizons), binary greedy meshing, GPU-driven drawing and an in-game world
-map. The 60 FPS budget on an RTX 2080 is still to be confirmed on real
+Five steps are in: foundation, terrain (continents, oceans, mountains,
+rivers), 48 biomes with trees, scale and speed (world height up to
+17,696 blocks, a far view out to 256 chunks with LOD rings like Distant
+Horizons, binary greedy meshing, GPU-driven drawing, an in-game world
+map), and a second, **realistic** generator.
+
+There are two generators:
+
+- **Classic**: a Minecraft-style world from local noise, endless and
+  varied (world types Normal, Amplified, Large biomes, Islands, Flat).
+- **Realistic**: a whole Earth-like planet simulated when the world is
+  created: plate tectonics (ranges where plates collide, trenches, island
+  arcs, mid-ocean ridges), climate from latitude, winds and rain shadows,
+  and rivers that erode valleys and drain to the sea. Planets:
+  Continents, Pangea, Earth (the real one, from NOAA relief data) and
+  Islands, at three simulation qualities. In a 40,000 km × 17,696-block
+  world, one block is one real metre.
+
+The 60 FPS budget on an RTX 2080 is still to be confirmed on real
 hardware. See [docs/PLAN.md](docs/PLAN.md) for the
 roadmap and [docs/devlog/](docs/devlog/) for a detailed log of each step,
 each with a short plain-language summary.
@@ -60,13 +74,16 @@ cargo run --release -p wg-map -- --seed 42 --extent 16000 --px 1024 --out map.pn
 cargo run --release -p wg-map -- --seed 42 --layer biome  # also: height, temperature, humidity, …
 cargo run --release -p wg-map -- --seed 42 --bench 32     # generation speed (chunks and LOD tiles)
 cargo run --release -p wg-map -- --seed 42 --size-km 60000 --height 17696 --extent 737000  # a tall world
+cargo run --release -p wg-map -- --seed 42 --realistic earth --size-km 40000 --height 17696 --whole --px 1200
+cargo run --release -p wg-map -- --seed 42 --realistic continents --quality quality --whole  # planets: continents|pangea|earth|islands
+cargo run --release -p worldgen --example planet_stats -- 42 continents   # climate and aridity statistics
 ```
 
 ## Layout
 
 | Crate | Purpose |
 |---|---|
-| `crates/worldgen` | the generator: noise, chunks, settings, terrain, biomes, trees. No graphics. |
+| `crates/worldgen` | the generators: noise, chunks, settings, terrain, biomes, trees, and `realistic/` (tectonics, climate, erosion, Earth data). No graphics. |
 | `crates/wg-map` | map and benchmark tool |
 | `crates/game` | window, menus, world map, Vulkan renderer (GPU-driven), binary greedy mesher, LOD quadtree, chunk and tile streaming |
 

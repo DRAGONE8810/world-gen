@@ -31,8 +31,10 @@
 //! 5. **Relief.** Each cell looks up the nearest boundary of its own plate
 //!    (an exact Euclidean distance field) and adds the profile of that
 //!    boundary type at that distance. The ocean floor deepens with its age
-//!    (Parsons & Sclater: 2.6 km at the ridge + 0.35 km·√Myr), age being
-//!    the distance to the nearest ridge over the spreading rate.
+//!    as it cools, following the GDH1 plate model (Stein & Stein, 1992):
+//!    2.6 km at the ridge + 0.365 km·√Myr for the first 20 Myr, then
+//!    flattening towards 5.65 km. Age is the distance to the nearest ridge
+//!    over the half spreading rate.
 //! 6. **Old mountains** (Appalachians, Urals) from an older plate layout,
 //!    and **hotspot chains** (Hawaii) trailing behind their plate.
 //!

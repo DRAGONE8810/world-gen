@@ -14,6 +14,8 @@ seed when it is needed, so a 60,000 km world costs the same as a 1 km one.
 | 2 | Terrain: continents, oceans, erosion, mountains, rivers, 3D overhangs | **Done**, see [devlog 02](devlog/02-terrain.md) |
 | 3 | Biomes and trees | **Done**, see [devlog 03](devlog/03-biomes.md) |
 | 4 | Scale and speed: tall worlds (cubic chunks), LODs to 256 chunks, faster meshing, GPU-driven drawing, world map | **Done** (4a, 4b, 4c), see [devlog 04](devlog/04-scale.md); RTX 2080 frame-rate check pending on real hardware |
+| 5 | Realistic generator: whole-planet simulation (plate tectonics, climate, rivers, erosion, lakes), planets Continents / Pangea / Earth / Islands, simulation quality, graphics presets | **Done**, see [devlog 05](devlog/05-realistic.md) |
+| 6 | Chunk and LOD speed: see as much of the world as possible at once | Next |
 
 ## Step 1: Foundation ✔
 
@@ -103,3 +105,38 @@ in three PRs: 4a tall worlds, 4b far view and LODs, 4c speed and world map.
 - Performance budget on an RTX 2080: 60 FPS at render distance 16 plus
   the LOD rings. Not measurable in the cloud container (software
   renderer); to be confirmed on the owner's machine.
+
+## Step 5: Realistic generator ✔
+
+Requested by the owner: keep the Minecraft-style generator (now
+**Classic**) and add a second one based on the real Earth.
+
+- ✔ Generator choice in the create-world menu; Realistic planets:
+  **Continents** (random plate layout), **Pangea** (one supercontinent),
+  **Earth** (NOAA ETOPO 2022 relief, real lakes), **Islands**.
+- ✔ Plate tectonics (kinematic, after Cortial et al. 2019): collision
+  ranges and plateaus, Andean margins with trenches, island arcs, rifts,
+  mid-ocean ridges, ocean depth by crustal age (GDH1), old orogens,
+  hotspot chains.
+- ✔ Climate from latitude, ocean currents, wind belts, rain shadows and
+  monsoons; aridity index drives the biomes.
+- ✔ Rivers and fluvial erosion (Priority-Flood + implicit stream power),
+  sediment-filled basins, water-balance lakes; rivers flow downhill with
+  their own water level.
+- ✔ Per-block detail: ridged, strike-aligned noise in ranges, smooth
+  plains, river channels, lake shores; 1 block = 1 m in a 40,000 km ×
+  17,696-block world.
+- ✔ Simulation quality Optimized / Balanced / Quality (0.3 s to 8 s) and
+  graphics presets Optimized / Balanced / Quality in Settings.
+- ✔ Loading screen, latitude in the HUD, whole-planet preview and maps.
+
+Result: 0.6 ms per chunk (6× faster than Classic in tall worlds), 107
+tests. Known limits: hyper-arid deserts too rare, Earth's rain is
+modelled, not measured.
+
+## Step 6: Chunk and LOD speed (next)
+
+Make the far view reach as much of the world as possible: faster chunk
+and LOD tile generation and meshing, caching tiles that come back into
+view, coarser LOD levels out to the whole planet, and measuring the
+RTX 2080 budget.

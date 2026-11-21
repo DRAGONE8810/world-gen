@@ -72,7 +72,7 @@ impl GraphicsPreset {
     pub fn description(self) -> &'static str {
         match self {
             GraphicsPreset::Optimized => "Shorter view for weaker GPUs and laptops.",
-            GraphicsPreset::Balanced => "The default: 60 FPS on an RTX 2080.",
+            GraphicsPreset::Balanced => "The default, aimed at 60 FPS on an RTX 2080.",
             GraphicsPreset::Quality => "Twice the full-detail radius and the longest far view.",
         }
     }

@@ -12,7 +12,9 @@
 //! Each step:
 //!
 //! 1. **Priority-Flood** (Barnes et al., 2014) floods the terrain from the
-//!    sea inwards, lowest first. Every cell learns which neighbour the
+//!    open sea inwards, lowest first. Only the open sea counts as an
+//!    outlet, so a basin below sea level far from it (the Caspian, the
+//!    Dead Sea) is a closed hollow, not ocean. Every cell learns which neighbour the
 //!    water reached it from (its *receiver*, the way downhill) and, if it
 //!    sits in a hollow, the level the hollow fills to (a lake). Because
 //!    hollows are filled, every drop of rain reaches the sea.
@@ -20,7 +22,10 @@
 //!    down to the sea) adds up the rain falling on everything upstream.
 //! 3. **Erosion**, solved implicitly (Braun & Willett, 2013) from the sea
 //!    upwards, so a step can never dig below the river's own outlet.
-//! 4. **Uplift**: heights relax towards the tectonic heights, standing in
+//! 4. **Sediment**: a hollow is partly filled each step, as rivers drop
+//!    their load where the water stands still, so basins become plains
+//!    instead of huge lakes.
+//! 5. **Uplift**: heights relax towards the tectonic heights, standing in
 //!    for the mountains still rising.
 
 use super::grid::NEIGHBOURS8;
