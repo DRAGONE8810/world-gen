@@ -39,7 +39,7 @@ They are spread out evenly, like trees in a real forest, rather than in
 random clumps. A tree on the edge of one chunk still has its full crown
 in the next one, with no cut-off seams.
 
-**How we know it's right:** 65 automatic tests (12 more than step 2). New
+**How we know it's right:** 67 automatic tests (14 more than step 2, 2 of them for the mouse-wheel speed). New
 ones check, over 48 × 48 km and two seeds:
 - every one of the 48 biomes actually appears;
 - ocean biomes are only under water, and land biomes only on land;
