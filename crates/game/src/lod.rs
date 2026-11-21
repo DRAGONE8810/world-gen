@@ -24,6 +24,23 @@
 //! overlaps and no gaps, and neighbouring leaves differ by at most one
 //! level.
 //!
+//! ## Height above the ground
+//!
+//! The distance that decides splitting is the horizontal distance or the
+//! camera's height above the ground, whichever is larger. Seen from 50 km
+//! up, the ground right below is 50 km away too, so it gets the detail of
+//! anything 50 km away: no chunks, no fine tiles. Flying up therefore
+//! *removes* work instead of adding it, and the whole planet seen from
+//! orbit is a few hundred coarse tiles.
+//!
+//! ## The whole world
+//!
+//! Levels go up to [`MAX_LEVEL`] = 22, whose cells are 4,194,304 blocks
+//! wide, so one ring of tiles spans more than the full 60,000 km world. With
+//! the LOD distance set to the world's width every point of the world is
+//! drawn from anywhere, at a cost that grows with the logarithm of the
+//! distance: about [`RING_TILES`]² × 12 tiles per level.
+//!
 //! ## Swapping without holes
 //!
 //! When the camera moves, a tile may need to split into four finer ones
@@ -40,14 +57,57 @@
 //! ("skirts"), hiding cracks against a neighbour tile of another level.
 
 use crate::mesh::{block_color, emit_quad, MeshData};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
+use std::hash::{BuildHasherDefault, Hasher};
 use worldgen::{BlockId, ChunkPos, WorldGenerator, CHUNK_SIZE};
+
+/// FxHash-style hasher for quadtree keys and chunk positions. The default
+/// SipHash guards against keys chosen by an attacker, which can't happen
+/// here, and was most of the cost of the per-frame quadtree bookkeeping.
+#[derive(Default, Clone, Copy)]
+pub struct FastHasher(u64);
+
+impl FastHasher {
+    #[inline]
+    fn add(&mut self, v: u64) {
+        self.0 = (self.0.rotate_left(5) ^ v).wrapping_mul(0x51_7c_c1_b7_27_22_0a_95);
+    }
+}
+
+impl Hasher for FastHasher {
+    fn write(&mut self, bytes: &[u8]) {
+        for &b in bytes {
+            self.add(b as u64);
+        }
+    }
+    fn write_u8(&mut self, v: u8) {
+        self.add(v as u64);
+    }
+    fn write_u32(&mut self, v: u32) {
+        self.add(v as u64);
+    }
+    fn write_i32(&mut self, v: i32) {
+        self.add(v as u32 as u64);
+    }
+    fn write_u64(&mut self, v: u64) {
+        self.add(v);
+    }
+    fn write_usize(&mut self, v: usize) {
+        self.add(v as u64);
+    }
+    fn finish(&self) -> u64 {
+        self.0
+    }
+}
+
+pub type FastSet<T> = HashSet<T, BuildHasherDefault<FastHasher>>;
+pub type FastMap<K, V> = HashMap<K, V, BuildHasherDefault<FastHasher>>;
 
 /// Width of each ring, in tiles of that ring's level.
 pub const RING_TILES: i32 = 8;
-/// Coarsest level: 8,192-chunk tiles with 8,192-block cells, enough for
-/// the LOD distance of the tallest worlds (256 chunks × 46).
-pub const MAX_LEVEL: u8 = 13;
+/// Coarsest level: tiles of 2^22 chunks (67 million blocks, more than the
+/// whole 60,000 km world) with 4,194,304-block cells.
+pub const MAX_LEVEL: u8 = 22;
 /// Cells per tile edge (same as blocks per chunk edge).
 pub const TILE_CELLS: usize = CHUNK_SIZE as usize;
 
@@ -118,6 +178,9 @@ pub struct Layout {
     pub detail: i32,
     /// LOD tiles up to here. At or below `detail` there are no tiles.
     pub lod: i32,
+    /// Camera height above the ground, in chunks (0 on the ground). Nodes
+    /// closer than this are treated as this far away.
+    pub altitude: i32,
 }
 
 impl Layout {
@@ -148,8 +211,13 @@ impl Layout {
         }
     }
 
+    /// Distance that decides the detail: horizontal or height above the
+    /// ground, whichever is larger.
+    fn detail_dist(&self, n: NodeKey, center: ChunkPos) -> i32 {
+        n.dist(center).max(self.altitude)
+    }
     fn splits(&self, n: NodeKey, center: ChunkPos) -> bool {
-        n.level > 0 && n.dist(center) < self.split_dist(n.level)
+        n.level > 0 && self.detail_dist(n, center) < self.split_dist(n.level)
     }
     fn wanted(&self, n: NodeKey, center: ChunkPos) -> bool {
         n.dist(center) <= if n.level == 0 { self.chunk_radius() } else { self.lod }
@@ -180,8 +248,20 @@ impl Layout {
                 out.push(n);
             }
         }
-        out.sort_by_key(|n| (n.dist(center), n.level, n.z, n.x));
-        out
+        // Nearest first, then by level, z, x: packed into one integer
+        // (flipping the sign bit keeps the order of signed values) and
+        // sorted unstably, which is fine as the keys are unique. Several
+        // times faster than sorting by a computed tuple.
+        let flip = |v: i32| (v as u32 ^ 0x8000_0000) as u128;
+        let mut keyed: Vec<(u128, NodeKey)> = out
+            .into_iter()
+            .map(|n| {
+                let k = (n.dist(center) as u128) << 96 | (n.level as u128) << 64 | flip(n.z) << 32 | flip(n.x);
+                (k, n)
+            })
+            .collect();
+        keyed.sort_unstable_by_key(|e| e.0);
+        keyed.into_iter().map(|e| e.1).collect()
     }
 
     /// What to draw: the desired leaves where their meshes are `ready`,
@@ -192,55 +272,62 @@ impl Layout {
         &self,
         center: ChunkPos,
         in_world: &dyn Fn(NodeKey) -> bool,
-        ready: &HashSet<NodeKey>,
+        ready: &FastSet<NodeKey>,
     ) -> Vec<NodeKey> {
         let mut out = Vec::new();
         for root in self.roots(center) {
-            let (keys, _) = self.cover(root, center, in_world, ready);
-            out.extend(keys);
+            self.cover(root, center, in_world, ready, &mut out);
         }
         out
     }
 
-    /// Returns the meshes that draw node `n` and whether they cover it
-    /// completely.
+    /// Appends the meshes that draw node `n` to `out` and returns whether
+    /// they cover it completely.
     fn cover(
         &self,
         n: NodeKey,
         center: ChunkPos,
         in_world: &dyn Fn(NodeKey) -> bool,
-        ready: &HashSet<NodeKey>,
-    ) -> (Vec<NodeKey>, bool) {
+        ready: &FastSet<NodeKey>,
+        out: &mut Vec<NodeKey>,
+    ) -> bool {
         if !self.wanted(n, center) || !in_world(n) {
-            return (Vec::new(), true); // nothing to draw here
+            return true; // nothing to draw here
         }
         if !self.splits(n, center) {
             if ready.contains(&n) {
-                return (vec![n], true);
+                out.push(n);
+                return true;
             }
             // Merging: the four finer meshes may still be there.
             if n.level > 0 {
                 let kids = n.children();
-                let present: Vec<NodeKey> =
-                    kids.iter().copied().filter(|k| in_world(*k) && ready.contains(k)).collect();
-                if present.len() == kids.iter().filter(|k| in_world(**k)).count() && !present.is_empty() {
-                    return (present, true);
+                let (mut inside, mut present) = (0, 0);
+                for k in kids {
+                    if in_world(k) {
+                        inside += 1;
+                        present += ready.contains(&k) as usize;
+                    }
+                }
+                if present == inside && present > 0 {
+                    out.extend(kids.into_iter().filter(|k| in_world(*k)));
+                    return true;
                 }
             }
-            return (Vec::new(), false);
+            return false;
         }
-        let mut keys = Vec::new();
+        let start = out.len();
         let mut complete = true;
         for k in n.children() {
-            let (k_keys, k_complete) = self.cover(k, center, in_world, ready);
-            keys.extend(k_keys);
-            complete &= k_complete;
+            complete &= self.cover(k, center, in_world, ready, out);
         }
         if !complete && ready.contains(&n) {
             // Splitting: keep the coarse mesh until all the finer ones exist.
-            return (vec![n], true);
+            out.truncate(start);
+            out.push(n);
+            return true;
         }
-        (keys, complete)
+        complete
     }
 }
 
@@ -325,7 +412,6 @@ pub fn mesh_tile(gen: &WorldGenerator, key: NodeKey) -> MeshData {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::collections::HashMap;
 
     fn everywhere(_: NodeKey) -> bool {
         true
@@ -348,7 +434,7 @@ mod tests {
     #[test]
     fn leaves_tile_the_view_without_gaps_or_overlaps() {
         for (detail, lod) in [(8, 0), (12, 64), (16, 256), (32, 256), (64, 256), (5, 100)] {
-            let layout = Layout { detail, lod };
+            let layout = Layout { detail, lod, altitude: 0 };
             for center in [ChunkPos::new(0, 0), ChunkPos::new(-37, 1001), ChunkPos::new(123_457, -99_999)] {
                 let leaves = layout.leaves(center, &everywhere);
                 let cov = coverage(&leaves);
@@ -376,7 +462,7 @@ mod tests {
 
     #[test]
     fn neighbouring_leaves_differ_by_at_most_one_level() {
-        let layout = Layout { detail: 12, lod: 256 };
+        let layout = Layout { detail: 12, lod: 256, altitude: 0 };
         let center = ChunkPos::new(3, -7);
         let cov = coverage(&layout.leaves(center, &everywhere));
         for (&(x, z), &l) in &cov {
@@ -392,7 +478,7 @@ mod tests {
     fn detail_halves_as_distance_doubles() {
         // Cells (blocks) per tile stay constant, so the tile count of each
         // ring is about the same: total grows with log(distance).
-        let layout = Layout { detail: 16, lod: 256 };
+        let layout = Layout { detail: 16, lod: 256, altitude: 0 };
         let leaves = layout.leaves(ChunkPos::new(0, 0), &everywhere);
         let tiles = leaves.iter().filter(|k| k.level > 0).count();
         let chunks = leaves.len() - tiles;
@@ -405,17 +491,83 @@ mod tests {
 
         // A 17,696-block world stretches the LOD distance 46 ×: about five
         // more rings, not 46² times the tiles.
-        let tall = Layout { detail: 16, lod: 256 * 46 };
+        let tall = Layout { detail: 16, lod: 256 * 46, altitude: 0 };
         let tall_tiles = tall.leaves(ChunkPos::new(0, 0), &everywhere).len() - chunks;
         eprintln!("tall world: {tall_tiles} tiles, top level {}", tall.top_level());
         assert!(tall_tiles < 3 * tiles, "{tall_tiles} tiles");
     }
 
     #[test]
+    fn altitude_coarsens_the_view_without_gaps() {
+        // Same checks as above, from a camera high above the ground.
+        let center = ChunkPos::new(5, -3);
+        let mut last = usize::MAX;
+        for altitude in [0, 10, 40, 200, 1000] {
+            let layout = Layout { detail: 12, lod: 256, altitude };
+            let leaves = layout.leaves(center, &everywhere);
+            let cov = coverage(&leaves);
+            for z in center.z - 256..=center.z + 256 {
+                for x in center.x - 256..=center.x + 256 {
+                    assert!(cov.contains_key(&(x, z)), "altitude {altitude}: gap at {x},{z}");
+                }
+            }
+            for (&(x, z), &l) in &cov {
+                for (dx, dz) in [(1, 0), (0, 1)] {
+                    if let Some(&m) = cov.get(&(x + dx, z + dz)) {
+                        assert!(l.abs_diff(m) <= 1, "altitude {altitude}: levels {l} and {m} touch at {x},{z}");
+                    }
+                }
+            }
+            // Higher up: never more nodes, and no chunks once above the render distance.
+            assert!(leaves.len() <= last, "altitude {altitude}: {} leaves, was {last}", leaves.len());
+            last = leaves.len();
+            if altitude > layout.detail {
+                assert!(leaves.iter().all(|k| k.level > 0), "altitude {altitude}: chunks drawn");
+            }
+        }
+    }
+
+    /// The whole 60,000 km world (3.75 million chunks across) from the
+    /// ground and from higher and higher up: every chunk of the world is
+    /// covered exactly once, with a few thousand nodes at most.
+    #[test]
+    fn whole_world_fits_in_a_few_thousand_tiles() {
+        let world = 3_749_998; // 59,999,968 blocks
+        let half = world / 2;
+        let clip = |k: NodeKey| -> i64 {
+            let (x0, z0) = k.min_chunk();
+            let n = k.chunks();
+            let w = (x0 + n).min(half) - x0.max(-half);
+            let d = (z0 + n).min(half) - z0.max(-half);
+            w.max(0) as i64 * d.max(0) as i64
+        };
+        let inside = |k: NodeKey| clip(k) > 0;
+        let mut counts = Vec::new();
+        for (center, altitude) in [
+            (ChunkPos::new(0, 0), 0),
+            (ChunkPos::new(half - 1, -half), 0),
+            (ChunkPos::new(0, 0), 1_000),
+            (ChunkPos::new(0, 0), 100_000),
+            (ChunkPos::new(0, 0), 3_000_000),
+        ] {
+            let layout = Layout { detail: 12, lod: world, altitude };
+            assert!(layout.top_level() < MAX_LEVEL);
+            let leaves = layout.leaves(center, &inside);
+            let area: i64 = leaves.iter().map(|k| clip(*k)).sum();
+            assert_eq!(area, world as i64 * world as i64, "{center:?} at {altitude}: holes or overlaps");
+            let tiles = leaves.iter().filter(|k| k.level > 0).count();
+            eprintln!("{center:?}, altitude {altitude} chunks: {} leaves ({tiles} tiles)", leaves.len());
+            counts.push(leaves.len());
+        }
+        assert!(counts[0] < 20_000 && counts[1] < 20_000, "{counts:?}");
+        assert!(counts[2] < counts[0] && counts[3] < counts[2] && counts[4] < 300, "{counts:?}");
+    }
+
+    #[test]
     fn world_border_prunes_nodes() {
         // Only nodes with x ≥ 0 exist in this fake world.
         let inside = |k: NodeKey| k.min_chunk().0 + k.chunks() > 0;
-        let layout = Layout { detail: 8, lod: 64 };
+        let layout = Layout { detail: 8, lod: 64, altitude: 0 };
         let leaves = layout.leaves(ChunkPos::new(0, 0), &inside);
         assert!(leaves.iter().all(|k| inside(*k)));
         assert!(!leaves.is_empty());
@@ -423,10 +575,10 @@ mod tests {
 
     #[test]
     fn draw_set_never_overlaps_and_falls_back_while_streaming() {
-        let layout = Layout { detail: 6, lod: 48 };
+        let layout = Layout { detail: 6, lod: 48, altitude: 0 };
         let a = ChunkPos::new(0, 0);
         let leaves_a = layout.leaves(a, &everywhere);
-        let mut ready: HashSet<NodeKey> = leaves_a.iter().copied().collect();
+        let mut ready: FastSet<NodeKey> = leaves_a.iter().copied().collect();
         // Everything ready: the draw set is exactly the leaves.
         let mut d = layout.draw_set(a, &everywhere, &ready);
         d.sort();

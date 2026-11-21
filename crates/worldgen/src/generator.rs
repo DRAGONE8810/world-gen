@@ -509,24 +509,41 @@ impl WorldGenerator {
         let (gx, gz) = (x.div_euclid(CELL_XZ), z.div_euclid(CELL_XZ));
         let fx = x.rem_euclid(CELL_XZ) as f64 / CELL_XZ as f64;
         let fz = z.rem_euclid(CELL_XZ) as f64 / CELL_XZ as f64;
+        // A column on the 4-block grid line (fx or fz = 0) gives the far
+        // corners zero weight, so they needn't be computed: copying the
+        // near ones gives bit-identical densities (c + 0·(c' − c) = c).
+        // Every LOD cell of 8 blocks or more is sampled on the grid, so
+        // this makes far-view tiles about 3× cheaper.
+        let (need_x, need_z) = (fx != 0.0, fz != 0.0);
         let level = |gy: usize| -> [f64; 4] {
-            [
-                self.corner(gx, gy, gz),
-                self.corner(gx + 1, gy, gz),
-                self.corner(gx, gy, gz + 1),
-                self.corner(gx + 1, gy, gz + 1),
-            ]
+            let c00 = self.corner(gx, gy, gz);
+            let c10 = if need_x { self.corner(gx + 1, gy, gz) } else { c00 };
+            let c01 = if need_z { self.corner(gx, gy, gz + 1) } else { c00 };
+            let c11 = match (need_x, need_z) {
+                (true, true) => self.corner(gx + 1, gy, gz + 1),
+                (true, false) => c10,
+                _ => c01,
+            };
+            [c00, c10, c01, c11]
         };
 
         // Scan down cell by cell; inside a cell, skip straight past spans
         // that are certainly air (see `span_state`).
         let mut surface = band.bottom - 1; // everything below the band is solid
         let mut y = band.top;
+        // The bottom corners of one cell are the top corners of the next
+        // one down: keep them instead of computing them twice.
+        let mut below: Option<(usize, [f64; 4])> = None;
         'scan: while y >= band.bottom {
             let ly = y - self.min_y;
             let gy = (ly / self.cell_y) as usize;
             let cell_lo = (self.min_y + gy as i32 * self.cell_y).max(band.bottom);
-            let (lo, hi) = (level(gy), level(gy + 1));
+            let hi = match below {
+                Some((g, c)) if g == gy + 1 => c,
+                _ => level(gy + 1),
+            };
+            let lo = level(gy);
+            below = Some((gy, lo));
             let c = [lo[0], lo[1], hi[0], hi[1], lo[2], lo[3], hi[2], hi[3]];
             match self.span_state(&shape, &c, fx, fz, gy, cell_lo, y) {
                 Some(false) => {}
