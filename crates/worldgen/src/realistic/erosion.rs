@@ -49,6 +49,37 @@ fn key(v: f64) -> u64 {
     }
 }
 
+/// The open sea: cells below sea level connected to the world ocean (the
+/// border, or the deep ocean floor below 3000 m). Low ground inland (the
+/// Caspian, the Dead Sea) is not sea: it fills like any other hollow.
+pub fn open_sea(height: &[f32], w: usize, h: usize) -> Vec<bool> {
+    let mut sea = vec![false; w * h];
+    let mut stack: Vec<usize> = Vec::new();
+    for (i, &v) in height.iter().enumerate() {
+        let (x, z) = (i % w, i / w);
+        let border = x == 0 || z == 0 || x == w - 1 || z == h - 1;
+        if (border && v < 0.0) || v < -3000.0 {
+            sea[i] = true;
+            stack.push(i);
+        }
+    }
+    while let Some(c) = stack.pop() {
+        let (x, z) = ((c % w) as isize, (c / w) as isize);
+        for &(dx, dz, _) in &NEIGHBOURS8 {
+            let (a, b) = (x + dx, z + dz);
+            if a < 0 || b < 0 || a >= w as isize || b >= h as isize {
+                continue;
+            }
+            let j = a as usize + b as usize * w;
+            if !sea[j] && height[j] < 0.0 {
+                sea[j] = true;
+                stack.push(j);
+            }
+        }
+    }
+    sea
+}
+
 /// Floods from every sea cell (height < 0) and every border cell.
 pub fn priority_flood(height: &[f32], w: usize, h: usize) -> Drainage {
     priority_flood_from(height, w, h, &|i| height[i] < 0.0)
@@ -138,6 +169,8 @@ pub struct ErosionParams {
     pub k: f64,
     /// Share of the gap to the tectonic height recovered per step.
     pub uplift: f64,
+    /// Share of a hollow's depth filled with sediment per step.
+    pub sediment: f64,
 }
 
 /// Erodes `height` (metres) in place. `target` is the tectonic height the
@@ -149,7 +182,8 @@ pub fn erode(height: &mut [f32], target: &[f32], rain: &[f32], w: usize, h: usiz
     let local: Vec<f32> = rain.iter().map(|&r| (r as f64 * area) as f32).collect();
     let mut eroded = vec![0f64; n];
     for _ in 0..p.steps {
-        let d = priority_flood(height, w, h);
+        let sea = open_sea(height, w, h);
+        let d = priority_flood_from(height, w, h, &|i| sea[i]);
         let acc = d.accumulate(&local);
         for (i, e) in eroded.iter_mut().enumerate() {
             *e = height[i] as f64;
@@ -157,13 +191,21 @@ pub fn erode(height: &mut [f32], target: &[f32], rain: &[f32], w: usize, h: usiz
         for &c in &d.order {
             let c = c as usize;
             let r = d.receiver[c] as usize;
-            if r == c || height[c] < 0.0 {
+            if r == c || sea[c] {
                 continue;
             }
             let hr = eroded[r];
             let hc = height[c] as f64;
+            let fc = d.filled[c] as f64;
+            if fc > hc + 0.01 {
+                // In a hollow: the lake protects its floor, and the silt the
+                // rivers bring settles on it, so over time most basins fill
+                // up into plains instead of staying lakes.
+                eroded[c] = hc + p.sediment * (fc - hc);
+                continue;
+            }
             if hc <= hr {
-                continue; // in a hollow: the lake protects the floor
+                continue;
             }
             let (dx, dz) = ((c % w) as f64 - (r % w) as f64, (c / w) as f64 - (r / w) as f64);
             let l = (dx * dx + dz * dz).sqrt() * p.km;
@@ -171,11 +213,12 @@ pub fn erode(height: &mut [f32], target: &[f32], rain: &[f32], w: usize, h: usiz
             eroded[c] = (hc + f * hr) / (1.0 + f);
         }
         for i in 0..n {
-            if height[i] >= 0.0 {
+            if !sea[i] {
                 let e = eroded[i];
                 // Uplift towards the tectonic height, never pushing land
                 // below the sea or the sea floor up.
-                height[i] = (e + p.uplift * (target[i] as f64 - e).max(0.0)).max(0.0) as f32;
+                let floor = if height[i] >= 0.0 { 0.0 } else { f64::MIN };
+                height[i] = (e + p.uplift * (target[i] as f64 - e).max(0.0)).max(floor) as f32;
             }
         }
     }
@@ -236,7 +279,14 @@ mod tests {
         let target = height.clone();
         let rain = vec![1f32; w * h];
         let before: f64 = height.iter().map(|&v| v as f64).sum();
-        erode(&mut height, &target, &rain, w, h, &ErosionParams { steps: 5, km: 10.0, k: 0.02, uplift: 0.1 });
+        erode(
+            &mut height,
+            &target,
+            &rain,
+            w,
+            h,
+            &ErosionParams { steps: 5, km: 10.0, k: 0.02, uplift: 0.1, sediment: 0.25 },
+        );
         let after: f64 = height.iter().map(|&v| v as f64).sum();
         assert!(after < before);
         assert!(height.iter().zip(&target).all(|(&a, &t)| a <= t + 1e-3));

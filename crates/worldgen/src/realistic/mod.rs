@@ -172,7 +172,7 @@ impl RealisticWorld {
                 .collect();
             let mean = (land.iter().sum::<f64>() / land.len().max(1) as f64).max(1.0);
             let rain: Vec<f32> = c.precipitation.data.iter().map(|&p| (p as f64 / mean) as f32).collect();
-            let params = erosion::ErosionParams { steps, km, k: 0.9 * km.sqrt() / 50.0, uplift: 0.25 };
+            let params = erosion::ErosionParams { steps, km, k: 0.9 * km.sqrt() / 50.0, uplift: 0.25, sediment: 0.25 };
             erosion::erode(&mut elevation.data, &target.data, &rain, w, h, &params);
         }
 
@@ -180,7 +180,8 @@ impl RealisticWorld {
         let clim = climate::simulate(&elevation, km, seed, if earth { 0.0 } else { 6.0 });
         // Only the open sea drains the land: basins below sea level inland
         // (the Caspian) fill up like any other hollow.
-        let sea = open_sea(&elevation);
+        let sea =
+            Grid { w, h, data: erosion::open_sea(&elevation.data, w, h).iter().map(|&b| b as u8 as f32).collect() };
         let drainage = erosion::priority_flood_from(&elevation.data, w, h, &|i| sea.data[i] > 0.5);
         let area_m2 = km * km * 1e6;
         let runoff: Vec<f32> = clim
@@ -199,16 +200,7 @@ impl RealisticWorld {
         let lake = if earth {
             earth::lakes(&elevation, &drainage.filled, &sea.data)
         } else {
-            let mut lake = Grid::new(w, h, NO_LAKE);
-            for i in 0..w * h {
-                let depth = drainage.filled[i] as f64 - elevation.data[i] as f64;
-                // Hollows fill only where it rains more than evaporates; in a
-                // dry basin the lake dries out (salt flats, Death Valley).
-                if sea.data[i] < 0.5 && depth > 25.0 && clim.aridity.data[i] > 0.5 {
-                    lake.data[i] = drainage.filled[i];
-                }
-            }
-            lake
+            water_balance_lakes(&elevation, &drainage, &sea, &discharge, &clim, area_m2)
         };
 
         let mut world = Self {
@@ -675,42 +667,78 @@ impl RealisticWorld {
     }
 }
 
-/// Sea cells connected to the world ocean (the border), as 0/1. Hollows
-/// below sea level inland (Caspian, Dead Sea) are not sea.
-fn open_sea(elevation: &Grid<f32>) -> Grid<f32> {
+/// Lakes of a procedural planet. Each hollow of the flooded terrain (cells
+/// filled to the same rim) holds a lake whose size balances the water
+/// flowing in against evaporation from its surface (open water evaporates
+/// at the potential rate, less the rain on it): in a wet climate it fills
+/// to the rim and spills, in a dry one it shrinks to a salt lake in the
+/// deepest part, or dries out (the Caspian, the Dead Sea, Death Valley).
+fn water_balance_lakes(
+    elevation: &Grid<f32>,
+    drainage: &erosion::Drainage,
+    sea: &Grid<f32>,
+    discharge: &[f32],
+    clim: &climate::Climate,
+    area_m2: f64,
+) -> Grid<f32> {
     let (w, h) = (elevation.w, elevation.h);
-    let mut sea = Grid::new(w, h, 0f32);
-    let mut stack: Vec<usize> = Vec::new();
-    for i in 0..w * h {
-        let (x, z) = (i % w, i / w);
-        if (x == 0 || z == 0 || x == w - 1 || z == h - 1) && elevation.data[i] < 0.0 {
-            stack.push(i);
-            sea.data[i] = 1.0;
+    let filled = &drainage.filled;
+    let mut lake = Grid::new(w, h, NO_LAKE);
+    let hollow = |k: usize| sea.data[k] < 0.5 && filled[k] as f64 - elevation.data[k] as f64 > 2.0;
+    let mut seen = vec![false; w * h];
+    for start in 0..w * h {
+        if seen[start] || !hollow(start) {
+            continue;
         }
-    }
-    // Large seas never touch the border on the Earth grid edges only via
-    // polar ice; also seed from the deepest ocean cells.
-    for i in 0..w * h {
-        if elevation.data[i] < -3000.0 && sea.data[i] == 0.0 {
-            sea.data[i] = 1.0;
-            stack.push(i);
-        }
-    }
-    while let Some(c) = stack.pop() {
-        let (x, z) = ((c % w) as isize, (c / w) as isize);
-        for &(dx, dz, _) in &grid::NEIGHBOURS8 {
-            let (a, b) = (x + dx, z + dz);
-            if a < 0 || b < 0 || a >= w as isize || b >= h as isize {
-                continue;
+        // The hollow's cells.
+        let rim = filled[start];
+        let mut cells = vec![start];
+        seen[start] = true;
+        let mut k = 0;
+        while k < cells.len() {
+            let c = cells[k];
+            k += 1;
+            let (x, z) = ((c % w) as isize, (c / w) as isize);
+            for &(dx, dz, _) in &grid::NEIGHBOURS8 {
+                let (a, b) = (x + dx, z + dz);
+                if a < 0 || b < 0 || a >= w as isize || b >= h as isize {
+                    continue;
+                }
+                let j = a as usize + b as usize * w;
+                if !seen[j] && hollow(j) && (filled[j] - rim).abs() < 1.0 {
+                    seen[j] = true;
+                    cells.push(j);
+                }
             }
-            let j = a as usize + b as usize * w;
-            if sea.data[j] == 0.0 && elevation.data[j] < 0.0 {
-                sea.data[j] = 1.0;
-                stack.push(j);
+        }
+        // Everything that drains into it passes its lowest outflow cell,
+        // which carries the largest discharge (m³/s).
+        let inflow = cells.iter().map(|&c| discharge[c] as f64).fold(0.0, f64::max);
+        // Fill from the deepest cell up while the inflow covers the
+        // evaporation of the growing surface.
+        cells.sort_by(|&a, &b| elevation.data[a].total_cmp(&elevation.data[b]).then(a.cmp(&b)));
+        let mut evaporation = 0.0;
+        let mut level = rim as f64;
+        let mut count = 0;
+        for &c in &cells {
+            let (p, t) = (clim.precipitation.data[c] as f64, clim.temperature.data[c] as f64);
+            let net = (climate::potential_evaporation(t) - p).max(0.0) / 1000.0 * area_m2 / 3.156e7;
+            if evaporation + net > inflow {
+                level = elevation.data[c] as f64;
+                break;
             }
+            evaporation += net;
+            count += 1;
+        }
+        // Too small to see on this grid, or too shallow to matter.
+        if count < 2 || level - (elevation.data[cells[0]] as f64) < 10.0 {
+            continue;
+        }
+        for &c in &cells[..count] {
+            lake.data[c] = level as f32;
         }
     }
-    sea
+    lake
 }
 
 /// For the real Earth: how mountainous each cell is (local relief) and
