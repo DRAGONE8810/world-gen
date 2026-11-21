@@ -35,8 +35,9 @@ use crate::block::{blocks, BlockId};
 use crate::chunk::{Chunk, ChunkPos, CHUNK_SIZE};
 use crate::noise::{OctaveConfig, OctaveNoise};
 use crate::palette::{section_index, PalettedSection, SECTION_SIZE, SECTION_VOLUME};
+use crate::realistic::RealisticWorld;
 use crate::rng::{derive_seed, hash_position, hash_position_f64, Xoroshiro128PlusPlus};
-use crate::settings::{WorldSettings, WorldType, SEA_LEVEL};
+use crate::settings::{Generator, WorldSettings, WorldType, SEA_LEVEL};
 use crate::terrain::{Shape, TerrainShaper};
 use crate::trees::{self, Tree, TREE_CELL, TREE_REACH};
 
@@ -66,7 +67,8 @@ pub struct ColumnSample {
     pub surface_y: i32,
     /// Block placed at `surface_y`.
     pub top_block: BlockId,
-    /// Whether water covers this column (`surface_y < SEA_LEVEL`).
+    /// Whether water covers this column (`surface_y < shape.water`: sea,
+    /// lake or river).
     pub underwater: bool,
     /// Inside the world border?
     pub inside: bool,
@@ -99,10 +101,21 @@ impl ColumnSample {
             river: 0.0,
             island: 0.0,
             vscale: 1.0,
+            water: SEA_LEVEL,
         },
         biome: Biome::Plains,
         ice: false,
     };
+
+    /// Y of the top of the column, water included: the water surface
+    /// over seas, lakes and rivers, the ground elsewhere.
+    pub fn water_top(&self) -> i32 {
+        if self.underwater {
+            self.shape.water
+        } else {
+            self.surface_y
+        }
+    }
 
     /// Colour of the column seen from above, ignoring water depth: the top
     /// block, with grass tinted by biome and frozen water shown as ice.
@@ -117,9 +130,27 @@ impl ColumnSample {
     }
 }
 
+/// Where column shapes come from. (One per generator, so the size
+/// difference between the variants doesn't matter.)
+#[allow(clippy::large_enum_variant)]
+enum Shaper {
+    Classic(TerrainShaper),
+    Realistic(Box<RealisticWorld>),
+}
+
+impl Shaper {
+    #[inline]
+    fn shape(&self, x: i32, z: i32) -> Shape {
+        match self {
+            Shaper::Classic(s) => s.shape(x, z),
+            Shaper::Realistic(r) => r.shape(x, z),
+        }
+    }
+}
+
 pub struct WorldGenerator {
     settings: WorldSettings,
-    shaper: TerrainShaper,
+    shaper: Shaper,
     density_noise: OctaveNoise,
     bedrock_seed: u64,
     surface_seed: u64,
@@ -150,7 +181,11 @@ struct Band {
 }
 
 impl WorldGenerator {
+    /// Creates the generator. Realistic worlds simulate their planet here,
+    /// which takes from a fraction of a second to several seconds
+    /// depending on `settings.quality`; classic worlds are instant.
     pub fn new(settings: WorldSettings) -> Self {
+        let settings = settings.normalized();
         let seed = settings.seed;
         let vscale = settings.height.terrain_scale();
         let scale = if settings.world_type == WorldType::LargeBiomes { 4.0 } else { 1.0 } * vscale;
@@ -160,8 +195,12 @@ impl WorldGenerator {
         }
         let cell_y = CELL_Y * k;
         let (min_y, max_y) = (settings.height.min_y(), settings.height.max_y());
+        let shaper = match settings.generator {
+            Generator::Classic => Shaper::Classic(TerrainShaper::new(seed, settings.world_type, vscale)),
+            Generator::Realistic => Shaper::Realistic(Box::new(RealisticWorld::new(&settings))),
+        };
         Self {
-            shaper: TerrainShaper::new(seed, settings.world_type, vscale),
+            shaper,
             // Features 64 blocks down to 8 blocks: blob-sized overhangs and
             // ledges rather than single-block speckle.
             density_noise: OctaveNoise::new(
@@ -198,7 +237,15 @@ impl WorldGenerator {
     }
 
     fn is_flat(&self) -> bool {
-        self.settings.world_type == WorldType::Flat
+        self.settings.generator == Generator::Classic && self.settings.world_type == WorldType::Flat
+    }
+
+    /// The simulated planet of a realistic world.
+    pub fn realistic(&self) -> Option<&RealisticWorld> {
+        match &self.shaper {
+            Shaper::Realistic(r) => Some(r),
+            Shaper::Classic(_) => None,
+        }
     }
 
     /// Shape with height clamped so the noise band stays inside the world.
@@ -327,9 +374,9 @@ impl WorldGenerator {
             return (GRASS, DIRT);
         }
         let patch = self.patch_at(x, z);
-        if y < SEA_LEVEL - 1 {
+        if y < shape.water - 1 {
             // Sea, lake and river beds.
-            let depth = SEA_LEVEL - y;
+            let depth = shape.water - y;
             if biome == B::MangroveSwamp {
                 return (MUD, MUD);
             }
@@ -346,7 +393,7 @@ impl WorldGenerator {
             return (top, top);
         }
         let coast = shape.climate.continentalness < -0.03;
-        if y <= SEA_LEVEL + 1 && (coast || shape.river > 0.2) {
+        if y <= shape.water + 1 && (coast || shape.river > 0.2) {
             // Shoreline and river banks.
             return match biome {
                 B::SnowyBeach => (SNOW, SAND),
@@ -500,7 +547,7 @@ impl WorldGenerator {
             y = cell_lo - 1;
         }
         let biome = biome::select(&shape, surface);
-        let underwater = surface < SEA_LEVEL;
+        let underwater = surface < shape.water;
         ColumnSample {
             surface_y: surface,
             top_block: self.surface_for(x, surface, z, &shape, biome).0,
@@ -526,6 +573,9 @@ impl WorldGenerator {
         let mut bands = [Band { bottom: 0, top: 0 }; 256];
         let mut inside = [false; 256];
         let (mut lo_y, mut hi_y) = (i32::MAX, i32::MIN);
+        // Highest water surface in the chunk (rivers and lakes can be above
+        // the sea).
+        let mut water_top = SEA_LEVEL;
         for lz in 0..16 {
             for lx in 0..16 {
                 let i = lx + lz * 16;
@@ -536,6 +586,7 @@ impl WorldGenerator {
                 }
                 shapes[i] = self.column_shape(x, z);
                 bands[i] = Self::band(&shapes[i]);
+                water_top = water_top.max(shapes[i].water);
                 lo_y = lo_y.min(bands[i].bottom);
                 hi_y = hi_y.max(bands[i].top);
             }
@@ -554,7 +605,7 @@ impl WorldGenerator {
             (0, 0)
         } else {
             let deepest = lo_y - SUBSURFACE;
-            let top = (hi_y.max(SEA_LEVEL) + if self.settings.features { trees::TREE_HEADROOM } else { 0 }).min(max_y);
+            let top = (hi_y.max(water_top) + if self.settings.features { trees::TREE_HEADROOM } else { 0 }).min(max_y);
             let s_lo = if all_inside && deepest >= min_y { section_of(deepest) } else { 0 };
             (s_lo, section_of(top).max(s_lo))
         };
@@ -641,7 +692,7 @@ impl WorldGenerator {
                 // Current noise cell, its corners and whether the band part
                 // of it is all solid, all air or mixed (see `span_state`).
                 let mut cell: Option<(usize, [f64; 8], Option<bool>)> = None;
-                for y in (stop_y..=band.top.max(SEA_LEVEL)).rev() {
+                for y in (stop_y..=band.top.max(shape.water)).rev() {
                     let solid = if y > band.top {
                         false
                     } else if y < band.bottom {
@@ -671,7 +722,7 @@ impl WorldGenerator {
                     };
 
                     if !solid {
-                        if y <= SEA_LEVEL {
+                        if y <= shape.water {
                             put(lx, y, lz, blocks::WATER);
                             highest = highest.max(y);
                         }
@@ -716,8 +767,9 @@ impl WorldGenerator {
                 }
                 let biome = col_biome.unwrap_or_default();
                 biomes[i] = biome;
-                if surface[i] < SEA_LEVEL && self.frozen_surface(x, z, biome) {
-                    put(lx, SEA_LEVEL, lz, blocks::ICE);
+                let water = shapes[i].water;
+                if surface[i] < water && self.frozen_surface(x, z, biome) {
+                    put(lx, water, lz, blocks::ICE);
                 }
                 heightmap[i] = highest as i16;
             }
@@ -826,14 +878,25 @@ impl WorldGenerator {
     /// along an outward spiral. Falls back to (0, 0) if the world is all sea.
     pub fn find_spawn(&self) -> (i32, i32, i32) {
         // Continents are `scale` times wider in tall worlds; search as far.
-        let max_radius = (self.settings.size.half_width() - 8).clamp(0, (6000.0 * self.vscale) as i32);
-        let step = (16.0 * self.vscale) as i32;
+        let half = self.settings.size.half_width().min(self.settings.size.half_depth());
+        let mut max_radius = (half - 8).clamp(0, (6000.0 * self.vscale) as i32);
+        let mut step = (16.0 * self.vscale) as i32;
+        let (cx, cz) = match self.realistic() {
+            Some(r) => {
+                // Start on the land the planet simulation picked, and
+                // search about one grid cell around it.
+                max_radius = (r.cell_blocks() * 2.0) as i32;
+                step = ((r.cell_blocks() / 24.0) as i32).clamp(4, 4096);
+                r.spawn_hint()
+            }
+            None => (0, 0),
+        };
         let mut r = 0;
         while r <= max_radius {
             let n = if r == 0 { 1 } else { (r * 8) / step };
             for i in 0..n {
                 let a = i as f64 / n as f64 * std::f64::consts::TAU;
-                let (x, z) = ((a.cos() * r as f64) as i32, (a.sin() * r as f64) as i32);
+                let (x, z) = (cx + (a.cos() * r as f64) as i32, cz + (a.sin() * r as f64) as i32);
                 let c = self.sample_column(x, z);
                 if c.inside && !c.underwater && c.shape.normalized_y(c.surface_y as f64) < 140.0 && c.shape.river < 0.1
                 {
@@ -842,8 +905,8 @@ impl WorldGenerator {
             }
             r += step;
         }
-        let c = self.sample_column(0, 0);
-        (0, c.surface_y.max(SEA_LEVEL) + 1, 0)
+        let c = self.sample_column(cx, cz);
+        (cx, c.surface_y.max(SEA_LEVEL) + 1, cz)
     }
 }
 
@@ -853,7 +916,7 @@ const _: () = assert!(CHUNK_SIZE % CELL_XZ == 0);
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::settings::{WorldHeight, WorldSize, MAX_Y, MIN_Y};
+    use crate::settings::{Generator, Planet, SimQuality, WorldHeight, WorldSize, MAX_Y, MIN_Y};
 
     fn generator(seed: u64, world_type: WorldType) -> WorldGenerator {
         WorldGenerator::new(WorldSettings { seed, world_type, size: WorldSize::from_km(64.0), ..Default::default() })
@@ -910,40 +973,168 @@ mod tests {
                 size: WorldSize::from_km(64.0),
                 features,
                 height,
+                ..Default::default()
             });
-            let (min_y, max_y) = (g.min_y(), g.max_y());
             for pos in [ChunkPos::new(-3, 12), ChunkPos::new(40, -7), ChunkPos::new(-90, -60), ChunkPos::new(150, 151)]
             {
-                let c = g.generate_chunk(pos);
-                for lz in 0..16 {
-                    for lx in 0..16 {
-                        let s = g.sample_column(pos.min_block_x() + lx as i32, pos.min_block_z() + lz as i32);
-                        let ctx = format!("{t:?} features={features} height={} {pos:?} {lx},{lz}", height.blocks());
-                        assert_eq!(c.get(lx, s.surface_y, lz), s.top_block, "{ctx}");
-                        assert_eq!(c.biome_at(lx, lz), s.biome, "{ctx}");
-                        assert_eq!(c.get(lx, SEA_LEVEL, lz) == blocks::ICE, s.ice, "{ctx}");
-                        for y in s.surface_y + 1..=max_y {
-                            let b = c.get(lx, y, lz);
-                            let ok = b == blocks::AIR
-                                || b == blocks::WATER
-                                || b == blocks::ICE
-                                || (features && b.is_tree_part());
-                            assert!(ok, "{ctx}: {} above surface at y={y}", b.info().name);
-                        }
-                        assert_eq!(c.get(lx, min_y, lz), blocks::BEDROCK, "{ctx}");
-                        // Deep underground is stone (whether stored or implied).
-                        if t != WorldType::Flat {
-                            assert_eq!(c.get(lx, min_y + 8, lz), blocks::STONE, "{ctx}");
-                        }
-                        let water_top = s.surface_y.max(if s.underwater { SEA_LEVEL } else { min_y });
-                        if features {
-                            assert!(c.height_at(lx, lz) >= water_top, "{ctx}");
-                        } else {
-                            assert_eq!(c.height_at(lx, lz), water_top, "{ctx}");
-                        }
+                let ctx = format!("{t:?} features={features} height={}", height.blocks());
+                assert_chunk_matches_samples(&g, pos, &ctx);
+            }
+        }
+    }
+
+    /// Checks one chunk against `sample_column` for each of its columns.
+    fn assert_chunk_matches_samples(g: &WorldGenerator, pos: ChunkPos, ctx: &str) {
+        let (min_y, max_y) = (g.min_y(), g.max_y());
+        let features = g.settings().features;
+        let c = g.generate_chunk(pos);
+        for lz in 0..16 {
+            for lx in 0..16 {
+                let s = g.sample_column(pos.min_block_x() + lx as i32, pos.min_block_z() + lz as i32);
+                let ctx = format!("{ctx} {pos:?} {lx},{lz}");
+                assert_eq!(c.get(lx, s.surface_y, lz), s.top_block, "{ctx}");
+                assert_eq!(c.biome_at(lx, lz), s.biome, "{ctx}");
+                if s.underwater {
+                    assert_eq!(c.get(lx, s.shape.water, lz) == blocks::ICE, s.ice, "{ctx}");
+                } else {
+                    assert!(!s.ice, "{ctx}");
+                }
+                for y in s.surface_y + 1..=max_y {
+                    let b = c.get(lx, y, lz);
+                    let ok =
+                        b == blocks::AIR || b == blocks::WATER || b == blocks::ICE || (features && b.is_tree_part());
+                    assert!(ok, "{ctx}: {} above surface at y={y}", b.info().name);
+                    // Water exactly fills the column up to its water level.
+                    if !s.underwater {
+                        assert!(b != blocks::WATER && b != blocks::ICE, "{ctx}: water on dry land at y={y}");
+                    } else if y < s.shape.water {
+                        assert_eq!(b, blocks::WATER, "{ctx}: y={y} below water level {}", s.shape.water);
+                    } else if y == s.shape.water {
+                        assert!(b == blocks::WATER || b == blocks::ICE, "{ctx}: no water at the water level");
                     }
                 }
+                assert_eq!(c.get(lx, min_y, lz), blocks::BEDROCK, "{ctx}");
+                // Deep underground is stone (whether stored or implied).
+                if g.settings().world_type != WorldType::Flat || g.realistic().is_some() {
+                    assert_eq!(c.get(lx, min_y + 8, lz), blocks::STONE, "{ctx}");
+                }
+                let water_top = s.surface_y.max(if s.underwater { s.shape.water } else { min_y });
+                if features {
+                    assert!(c.height_at(lx, lz) >= water_top, "{ctx}");
+                } else {
+                    assert_eq!(c.height_at(lx, lz), water_top, "{ctx}");
+                }
             }
+        }
+    }
+
+    fn realistic(planet: Planet, km: f64, height: u32) -> WorldGenerator {
+        WorldGenerator::new(WorldSettings {
+            seed: 12,
+            generator: Generator::Realistic,
+            planet,
+            quality: SimQuality::Fast,
+            size: WorldSize::from_km(km),
+            height: WorldHeight::from_blocks(height),
+            ..Default::default()
+        })
+    }
+
+    /// Finds columns of a realistic world on a coarse grid: (river above
+    /// sea level, lake, high mountain, sea coast).
+    fn realistic_landmarks(g: &WorldGenerator) -> Vec<(&'static str, i32, i32)> {
+        let half = g.settings().size.half_width().min(g.settings().size.half_depth()) - 64;
+        let n = 400;
+        let mut found: Vec<(&'static str, i32, i32)> = Vec::new();
+        let mut want = |name: &'static str, x: i32, z: i32| {
+            if !found.iter().any(|f| f.0 == name) {
+                found.push((name, x, z));
+            }
+        };
+        for j in 0..n {
+            for i in 0..n {
+                let x = -half + (2 * half as i64 * i / n) as i32;
+                let z = -half + (2 * half as i64 * j / n) as i32;
+                let s = g.sample_column(x, z);
+                if s.shape.river >= 1.0 && s.shape.water > SEA_LEVEL + 20 {
+                    want("river", x, z);
+                }
+                if s.underwater && s.shape.water > SEA_LEVEL + 20 && s.shape.river < 1.0 {
+                    want("lake", x, z);
+                }
+                if s.shape.normalized_y(s.surface_y as f64) > 200.0 {
+                    want("mountain", x, z);
+                }
+                if s.underwater && s.shape.water == SEA_LEVEL && s.surface_y > SEA_LEVEL - 4 {
+                    want("coast", x, z);
+                }
+            }
+        }
+        found
+    }
+
+    /// Realistic worlds: rivers and lakes above the sea, mountains and
+    /// coasts all generate exactly as `sample_column` describes them.
+    #[test]
+    fn realistic_column_sample_matches_generated_chunk() {
+        for (planet, km, height) in [(Planet::Continents, 4000.0, 2048), (Planet::Earth, 8000.0, 4096)] {
+            let g = realistic(planet, km, height);
+            let marks = realistic_landmarks(&g);
+            let names: Vec<_> = marks.iter().map(|m| m.0).collect();
+            for want in ["river", "mountain", "coast"] {
+                assert!(names.contains(&want), "{planet:?}: no {want} found ({names:?})");
+            }
+            let (sx, _, sz) = g.find_spawn();
+            for (name, x, z) in marks.into_iter().chain([("spawn", sx, sz)]) {
+                // The landmark and its neighbour, in case it sits on an edge.
+                for (dx, dz) in [(0, 0), (16, 16)] {
+                    let pos = ChunkPos::from_block(x + dx, z + dz);
+                    assert_chunk_matches_samples(&g, pos, &format!("{planet:?} {name}"));
+                }
+            }
+        }
+    }
+
+    /// Same settings, same planet; another seed, another planet.
+    #[test]
+    fn realistic_worlds_are_deterministic() {
+        let a = realistic(Planet::Islands, 2000.0, 1024);
+        let b = realistic(Planet::Islands, 2000.0, 1024);
+        let pos = ChunkPos::from_block(a.find_spawn().0, a.find_spawn().2);
+        assert!(chunks_equal(&a.generate_chunk(pos), &b.generate_chunk(pos)));
+        let probe = |g: &WorldGenerator| -> Vec<i32> {
+            (0..64).map(|k| g.sample_column(k * 15_000 - 480_000, k * 7_000 - 220_000).surface_y).collect()
+        };
+        assert_eq!(probe(&a), probe(&b));
+        let c = WorldGenerator::new(WorldSettings { seed: 13, ..a.settings().clone() });
+        assert_ne!(probe(&a), probe(&c));
+    }
+
+    /// Each planet has its intended share of land, and spawn is on land.
+    #[test]
+    fn realistic_planets_have_their_land_share() {
+        for (planet, lo, hi) in [
+            (Planet::Continents, 0.25, 0.45),
+            (Planet::Pangea, 0.22, 0.42),
+            (Planet::Islands, 0.04, 0.2),
+            (Planet::Earth, 0.25, 0.35),
+        ] {
+            let g = realistic(planet, 10_000.0, 2048);
+            let (hw, hd) = (g.settings().size.half_width(), g.settings().size.half_depth());
+            let n = 120;
+            let mut land = 0;
+            for j in 0..n {
+                for i in 0..n {
+                    let x = -hw + (2 * hw as i64 * i / n + hw as i64 / n) as i32;
+                    let z = -hd + (2 * hd as i64 * j / n + hd as i64 / n) as i32;
+                    land += !g.sample_column(x, z).underwater as i32;
+                }
+            }
+            let share = land as f64 / (n * n) as f64;
+            assert!((lo..hi).contains(&share), "{planet:?}: land share {share}");
+            let (x, y, z) = g.find_spawn();
+            let s = g.sample_column(x, z);
+            assert!(!s.underwater && y > SEA_LEVEL, "{planet:?}: spawn at {x},{y},{z} is in water");
         }
     }
 

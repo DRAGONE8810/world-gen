@@ -209,7 +209,9 @@ pub fn select(shape: &Shape, surface_y: i32) -> Biome {
     // `alt` is the true height above the sea, used for things that keep
     // their real size in every world (beaches, shallow water). `alt_n` is
     // the height a default world would have here, for mountain rules.
-    let alt = surface_y - SEA_LEVEL;
+    // Under water means under this column's water: the sea, or a river or
+    // lake above sea level in realistic worlds.
+    let alt = surface_y - shape.water;
     let alt_n = shape.normalized_y(surface_y as f64) - SEA_LEVEL as f64;
     let t = effective_temperature(shape, surface_y);
     let tb = TempBand::of(t);
@@ -418,6 +420,7 @@ mod tests {
             river: 0.0,
             island: 0.0,
             vscale: 1.0,
+            water: SEA_LEVEL,
         }
     }
 

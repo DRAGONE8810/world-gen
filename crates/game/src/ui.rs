@@ -3,10 +3,11 @@
 
 use crate::config::GameSettings;
 use egui::{Align2, Color32, RichText, Vec2};
+use std::sync::mpsc;
 use worldgen::settings::{
     seed_from_text, WorldHeight, MAX_WORLD_HEIGHT, MAX_WORLD_WIDTH, MIN_WORLD_HEIGHT, MIN_WORLD_WIDTH,
 };
-use worldgen::{WorldGenerator, WorldSettings, WorldSize, WorldType, SEA_LEVEL};
+use worldgen::{Generator, Planet, SimQuality, WorldGenerator, WorldSettings, WorldSize, WorldType, SEA_LEVEL};
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Screen {
@@ -20,6 +21,8 @@ pub enum Screen {
     Paused,
     /// The world map, opened from the game with M.
     Map,
+    /// A realistic planet is being simulated before the world starts.
+    Loading,
 }
 
 pub enum Action {
@@ -38,7 +41,13 @@ pub struct WorldForm {
     pub height: u32,
     pub world_type: WorldType,
     pub features: bool,
+    pub generator: Generator,
+    pub planet: Planet,
+    pub quality: SimQuality,
     preview: Option<(WorldSettings, egui::TextureHandle)>,
+    /// Preview being drawn on a worker thread (a realistic planet takes
+    /// seconds to simulate, and the menu must stay responsive).
+    preview_job: Option<(WorldSettings, mpsc::Receiver<egui::ColorImage>)>,
 }
 
 impl WorldForm {
@@ -49,7 +58,11 @@ impl WorldForm {
             height: s.height.blocks(),
             world_type: s.world_type,
             features: s.features,
+            generator: s.generator,
+            planet: s.planet,
+            quality: s.quality,
             preview: None,
+            preview_job: None,
         }
     }
 
@@ -60,7 +73,11 @@ impl WorldForm {
             height: WorldHeight::from_blocks(self.height),
             world_type: self.world_type,
             features: self.features,
+            generator: self.generator,
+            planet: self.planet,
+            quality: self.quality,
         }
+        .normalized()
     }
 }
 
@@ -133,9 +150,10 @@ pub fn create_world(ui: &mut egui::Ui, form: &mut WorldForm, actions: &mut Vec<A
                         .suffix(" km")
                         .max_decimals(0),
                     );
-                    let w = WorldSize::from_km(form.size_km).width_blocks() as f64;
+                    let size = form.to_settings(0).size;
+                    let (w, d) = (size.width_blocks() as f64, size.depth_blocks() as f64);
                     ui.label(
-                        RichText::new(format!("{:.0} × {:.0} blocks · {:.0} chunks across", w, w, (w / 16.0).ceil()))
+                        RichText::new(format!("{:.0} × {:.0} blocks · {:.0} chunks across", w, d, (w / 16.0).ceil()))
                             .weak(),
                     );
                 });
@@ -158,7 +176,7 @@ pub fn create_world(ui: &mut egui::Ui, form: &mut WorldForm, actions: &mut Vec<A
                     let h = WorldHeight::from_blocks(form.height);
                     ui.label(
                         RichText::new(format!(
-                            "{}y {} to {} · sea at {} · terrain ×{:.2}",
+                            "{}y {} to {} · sea at {}{}",
                             if h.blocks() != form.height {
                                 format!("rounded to {} · ", group_thousands(h.blocks()))
                             } else {
@@ -167,21 +185,66 @@ pub fn create_world(ui: &mut egui::Ui, form: &mut WorldForm, actions: &mut Vec<A
                             h.min_y(),
                             h.max_y(),
                             SEA_LEVEL,
-                            h.terrain_scale()
+                            if form.generator == Generator::Classic {
+                                format!(" · terrain ×{:.2}", h.terrain_scale())
+                            } else {
+                                String::new()
+                            }
                         ))
                         .weak(),
                     );
                 });
                 ui.end_row();
 
-                ui.label("World type");
+                ui.label("Generator");
                 ui.vertical(|ui| {
-                    for t in WorldType::ALL {
-                        ui.radio_value(&mut form.world_type, t, t.label()).on_hover_text(t.description());
+                    let before = form.generator;
+                    for g in Generator::ALL {
+                        ui.radio_value(&mut form.generator, g, g.label()).on_hover_text(g.description());
                     }
-                    ui.label(RichText::new(form.world_type.description()).weak());
+                    ui.label(RichText::new(form.generator.description()).weak());
+                    if before != form.generator && form.generator == Generator::Realistic {
+                        // A planet reads best at its real size, with the
+                        // tallest world for Everest-sized mountains.
+                        form.size_km = form.size_km.max(40_000.0);
+                        form.height = form.height.max(MAX_WORLD_HEIGHT);
+                    }
                 });
                 ui.end_row();
+
+                match form.generator {
+                    Generator::Classic => {
+                        ui.label("World type");
+                        ui.vertical(|ui| {
+                            for t in WorldType::ALL {
+                                ui.radio_value(&mut form.world_type, t, t.label()).on_hover_text(t.description());
+                            }
+                            ui.label(RichText::new(form.world_type.description()).weak());
+                        });
+                        ui.end_row();
+                    }
+                    Generator::Realistic => {
+                        ui.label("Planet");
+                        ui.vertical(|ui| {
+                            for p in Planet::ALL {
+                                ui.radio_value(&mut form.planet, p, p.label()).on_hover_text(p.description());
+                            }
+                            ui.label(RichText::new(form.planet.description()).weak());
+                        });
+                        ui.end_row();
+
+                        ui.label("Simulation");
+                        ui.vertical(|ui| {
+                            ui.horizontal(|ui| {
+                                for q in SimQuality::ALL {
+                                    ui.selectable_value(&mut form.quality, q, q.label()).on_hover_text(q.description());
+                                }
+                            });
+                            ui.label(RichText::new(form.quality.description()).weak());
+                        });
+                        ui.end_row();
+                    }
+                }
 
                 ui.label("Trees");
                 ui.checkbox(&mut form.features, "Generate trees, cacti and giant mushrooms");
@@ -192,18 +255,38 @@ pub fn create_world(ui: &mut egui::Ui, form: &mut WorldForm, actions: &mut Vec<A
             ui.label(RichText::new("Preview").strong());
             let seed = seed_from_text(&form.seed_text).unwrap_or(0);
             let wanted = form.to_settings(seed);
-            let needs_update = form.preview.as_ref().is_none_or(|(s, _)| *s != wanted);
-            if needs_update {
-                let image = preview_image(&wanted, 160);
-                let tex = ui.ctx().load_texture("world_preview", image, egui::TextureOptions::NEAREST);
-                form.preview = Some((wanted.clone(), tex));
+            // Collect a finished preview; start a new one when the settings
+            // changed (an outdated job is simply dropped).
+            if let Some((s, rx)) = &form.preview_job {
+                match rx.try_recv() {
+                    Ok(image) => {
+                        let tex = ui.ctx().load_texture("world_preview", image, egui::TextureOptions::NEAREST);
+                        form.preview = Some((s.clone(), tex));
+                        form.preview_job = None;
+                    }
+                    Err(mpsc::TryRecvError::Empty) => ui.ctx().request_repaint(),
+                    Err(mpsc::TryRecvError::Disconnected) => form.preview_job = None,
+                }
+            }
+            let shown = form.preview.as_ref().is_some_and(|(s, _)| *s == wanted);
+            let running = form.preview_job.as_ref().is_some_and(|(s, _)| *s == wanted);
+            if !shown && !running {
+                let (tx, rx) = mpsc::channel();
+                let job = wanted.clone();
+                let ctx = ui.ctx().clone();
+                std::thread::spawn(move || {
+                    let _ = tx.send(preview_image(&job, 200));
+                    ctx.request_repaint();
+                });
+                form.preview_job = Some((wanted.clone(), rx));
             }
             if let Some((s, tex)) = &form.preview {
                 let side = ui.available_width().min(360.0);
-                ui.image((tex.id(), Vec2::splat(side)));
+                let [w, h] = tex.size();
+                ui.image((tex.id(), Vec2::new(side, side * h as f32 / w as f32)));
                 let extent = preview_extent(s);
                 ui.label(
-                    RichText::new(if extent as u32 >= s.size.width_blocks() {
+                    RichText::new(if extent as u32 >= s.size.max_extent() {
                         "Whole world, top-down. Water is blue.".to_string()
                     } else {
                         format!("Central {} of the world, top-down.", format_km(extent / 1000.0))
@@ -213,6 +296,16 @@ pub fn create_world(ui: &mut egui::Ui, form: &mut WorldForm, actions: &mut Vec<A
                 if form.seed_text.trim().is_empty() {
                     ui.label(RichText::new("(Previewing seed 0. An empty seed picks a random one.)").weak().small());
                 }
+            }
+            if !shown {
+                ui.horizontal(|ui| {
+                    ui.spinner();
+                    ui.label(if wanted.generator == Generator::Realistic {
+                        "Simulating the planet…"
+                    } else {
+                        "Drawing…"
+                    });
+                });
             }
         });
 
@@ -230,25 +323,35 @@ pub fn create_world(ui: &mut egui::Ui, form: &mut WorldForm, actions: &mut Vec<A
     });
 }
 
-/// Area shown by the preview. Tall worlds stretch the terrain sideways by
-/// the same factor as upwards, so the preview zooms out with them.
+/// Width of the area shown by the preview. Tall worlds stretch the terrain
+/// sideways by the same factor as upwards, so the preview zooms out with
+/// them; a realistic planet is shown whole.
 fn preview_extent(s: &WorldSettings) -> f64 {
+    if s.generator == Generator::Realistic {
+        return s.size.max_extent() as f64;
+    }
     (s.size.width_blocks() as f64).min(16_000.0 * s.height.terrain_scale())
 }
 
-/// Top-down colour map straight from the generator.
+/// Top-down colour map straight from the generator, `px` wide (half as
+/// tall for a 2:1 world shown whole).
 fn preview_image(s: &WorldSettings, px: usize) -> egui::ColorImage {
     let gen = WorldGenerator::new(s.clone());
     let extent = preview_extent(s);
+    let pz = if extent >= s.size.max_extent() as f64 {
+        (px as f64 * s.size.depth_blocks() as f64 / s.size.width_blocks() as f64).round().max(1.0) as usize
+    } else {
+        px
+    };
     let step = extent / px as f64;
     let vscale = s.height.terrain_scale();
     use rayon::prelude::*;
-    let samples: Vec<_> = (0..px * px)
+    let samples: Vec<_> = (0..px * pz)
         .into_par_iter()
         .map(|i| {
             let (ix, iz) = (i % px, i / px);
             let x = (-extent / 2.0 + (ix as f64 + 0.5) * step).floor() as i32;
-            let z = (-extent / 2.0 + (iz as f64 + 0.5) * step).floor() as i32;
+            let z = (-(pz as f64) * step / 2.0 + (iz as f64 + 0.5) * step).floor() as i32;
             gen.sample_column(x, z)
         })
         .collect();
@@ -260,7 +363,7 @@ fn preview_image(s: &WorldSettings, px: usize) -> egui::ColorImage {
             } else if c.ice {
                 worldgen::blocks::ICE.info().color
             } else if c.underwater {
-                let d = ((SEA_LEVEL - c.surface_y) as f64 / (50.0 * vscale)).clamp(0.0, 1.0) as f32;
+                let d = ((c.shape.water - c.surface_y) as f64 / (50.0 * vscale)).clamp(0.0, 1.0) as f32;
                 [(40.0 - d * 20.0) as u8, (90.0 - d * 40.0) as u8, (200.0 - d * 60.0) as u8]
             } else {
                 c.top_color()
@@ -268,7 +371,35 @@ fn preview_image(s: &WorldSettings, px: usize) -> egui::ColorImage {
             pixels.push(Color32::from_rgb(rgb[0], rgb[1], rgb[2]));
         }
     }
-    egui::ColorImage::new([px, px], pixels)
+    egui::ColorImage::new([px, pz], pixels)
+}
+
+/// "Simulating the planet" while a realistic world is created.
+pub fn loading(ui: &mut egui::Ui, s: &WorldSettings, seconds: f32, actions: &mut Vec<Action>) {
+    egui::CentralPanel::default().show(ui, |ui| {
+        centered_column(ui, |ui| {
+            ui.label(RichText::new("Creating the planet").size(32.0).strong());
+            ui.add_space(16.0);
+            ui.label(
+                RichText::new(format!(
+                    "{} · {} · {} simulation",
+                    s.planet.label(),
+                    format_km(s.size.width_km()),
+                    s.quality.label()
+                ))
+                .weak(),
+            );
+            ui.add_space(24.0);
+            ui.spinner();
+            ui.add_space(8.0);
+            ui.label(format!("Moving plates, raising mountains, eroding valleys… {seconds:.0} s"));
+            ui.add_space(32.0);
+            if big_button(ui, "Cancel").clicked() {
+                actions.push(Action::Goto(Screen::CreateWorld));
+            }
+        });
+    });
+    ui.ctx().request_repaint();
 }
 
 fn random_seed() -> u64 {
@@ -310,6 +441,25 @@ pub fn settings(ui: &mut egui::Ui, s: &mut GameSettings) -> bool {
             ui.label(RichText::new("Settings").size(32.0).strong());
             ui.add_space(20.0);
             egui::Grid::new("settings").num_columns(2).spacing([16.0, 12.0]).show(ui, |ui| {
+                ui.label("Graphics");
+                ui.vertical(|ui| {
+                    let current = crate::config::GraphicsPreset::of(s);
+                    ui.horizontal(|ui| {
+                        for p in crate::config::GraphicsPreset::ALL {
+                            if ui.selectable_label(current == Some(p), p.label()).on_hover_text(p.description()).clicked() {
+                                p.apply(s);
+                            }
+                        }
+                    });
+                    ui.label(
+                        RichText::new(match current {
+                            Some(p) => p.description(),
+                            None => "Custom view distances.",
+                        })
+                        .weak(),
+                    );
+                });
+                ui.end_row();
                 ui.label("Render distance");
                 ui.vertical(|ui| {
                     ui.add(
@@ -398,6 +548,8 @@ pub struct HudInfo<'a> {
     pub pos: glam::DVec3,
     pub world: &'a WorldSettings,
     pub column: worldgen::ColumnSample,
+    /// Latitude of the camera on a realistic planet.
+    pub latitude: Option<f64>,
     pub stats: crate::world::Stats,
     pub drawn_chunks: usize,
     pub drawn_triangles: u64,
@@ -421,7 +573,14 @@ pub fn hud(ui: &mut egui::Ui, h: &HudInfo) {
                     ui.label(mono(format!("XYZ  {:.1} / {:.1} / {:.1}", h.pos.x, h.pos.y, h.pos.z)));
                     ui.label(mono(format!("Speed {} blocks/s  (wheel: ×2 / ÷2, Ctrl ×5)", format_speed(h.fly_speed))));
                     let (cx, cz) = ((h.pos.x.floor() as i64) >> 4, (h.pos.z.floor() as i64) >> 4);
-                    ui.label(mono(format!("Chunk {cx} {cz}")));
+                    match h.latitude {
+                        Some(lat) => ui.label(mono(format!(
+                            "Chunk {cx} {cz}   latitude {:.1}°{}",
+                            lat.abs(),
+                            if lat >= 0.0 { "N" } else { "S" }
+                        ))),
+                        None => ui.label(mono(format!("Chunk {cx} {cz}"))),
+                    };
                     ui.label(mono(format!(
                         "Ground {}  top {}{}",
                         h.column.surface_y,
@@ -451,7 +610,10 @@ pub fn hud(ui: &mut egui::Ui, h: &HudInfo) {
                     ui.label(mono(format!(
                         "Seed {}  {}  {} wide  {} tall",
                         h.world.seed as i64,
-                        h.world.world_type.label(),
+                        match h.world.generator {
+                            Generator::Classic => h.world.world_type.label().to_string(),
+                            Generator::Realistic => format!("{} ({})", h.world.planet.label(), h.world.quality.label()),
+                        },
                         format_km(h.world.size.width_km()),
                         group_thousands(h.world.height.blocks())
                     )));

@@ -38,6 +38,55 @@ impl Default for GameSettings {
     }
 }
 
+/// One-click view settings in the Settings menu. Balanced is the default
+/// and holds 60 FPS on an RTX 2080; Optimized suits weaker GPUs and laptops;
+/// Quality draws four times the area of full-detail chunks and the full LOD
+/// range.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum GraphicsPreset {
+    Optimized,
+    Balanced,
+    Quality,
+}
+
+impl GraphicsPreset {
+    pub const ALL: [GraphicsPreset; 3] = [GraphicsPreset::Optimized, GraphicsPreset::Balanced, GraphicsPreset::Quality];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            GraphicsPreset::Optimized => "Optimized",
+            GraphicsPreset::Balanced => "Balanced",
+            GraphicsPreset::Quality => "Quality",
+        }
+    }
+
+    /// (render distance, LOD distance) in chunks.
+    pub fn distances(self) -> (u32, u32) {
+        match self {
+            GraphicsPreset::Optimized => (8, 64),
+            GraphicsPreset::Balanced => (12, 128),
+            GraphicsPreset::Quality => (24, MAX_LOD_DISTANCE),
+        }
+    }
+
+    pub fn description(self) -> &'static str {
+        match self {
+            GraphicsPreset::Optimized => "Shorter view for weaker GPUs and laptops.",
+            GraphicsPreset::Balanced => "The default, aimed at 60 FPS on an RTX 2080.",
+            GraphicsPreset::Quality => "Twice the full-detail radius and the longest far view.",
+        }
+    }
+
+    /// The preset these settings match, if any.
+    pub fn of(s: &GameSettings) -> Option<GraphicsPreset> {
+        Self::ALL.into_iter().find(|p| p.distances() == (s.render_distance, s.lod_distance))
+    }
+
+    pub fn apply(self, s: &mut GameSettings) {
+        (s.render_distance, s.lod_distance) = self.distances();
+    }
+}
+
 /// Full-detail radius range, in chunks.
 pub const MAX_RENDER_DISTANCE: u32 = 64;
 /// LOD radius range: 256 chunks = 512 × 512 = 262,144 chunks of area.
@@ -95,6 +144,17 @@ impl GameSettings {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn default_settings_are_the_balanced_preset() {
+        let mut s = GameSettings::default();
+        assert_eq!(GraphicsPreset::of(&s), Some(GraphicsPreset::Balanced));
+        for p in GraphicsPreset::ALL {
+            p.apply(&mut s);
+            assert_eq!(GraphicsPreset::of(&s), Some(p));
+            assert!(s.render_distance <= MAX_RENDER_DISTANCE && s.lod_distance <= MAX_LOD_DISTANCE);
+        }
+    }
 
     #[test]
     fn wheel_doubles_and_halves_within_limits() {
