@@ -2,7 +2,8 @@
 
 Goal: a Minecraft-like world generator, accurate first, fast second, pretty
 third. Rust + Vulkan, Windows and Linux (macOS a plus), smooth on an RTX 2080.
-World size from 1 km to the full 60,000 km Minecraft world.
+World size from 1 km to the full 60,000 km Minecraft world; world height
+up to ~17,700 blocks (twice Mount Everest) from step 4.
 
 The core idea: the world is never stored. Every block is computed from the
 seed when it is needed, so a 60,000 km world costs the same as a 1 km one.
@@ -11,8 +12,8 @@ seed when it is needed, so a 60,000 km world costs the same as a 1 km one.
 |------|------|--------|
 | 1 | Foundation: project layout, world settings, chunk storage, generator skeleton, game menu, Vulkan renderer, map tool | **Done**, see [devlog 01](devlog/01-foundation.md) |
 | 2 | Terrain: continents, oceans, erosion, mountains, rivers, 3D overhangs | **Done**, see [devlog 02](devlog/02-terrain.md) |
-| 3 | Biomes and trees | Next |
-| 4 | Scale and speed: LODs, faster meshing, GPU-driven drawing, world map | Planned |
+| 3 | Biomes and trees | **Done**, see [devlog 03](devlog/03-biomes.md) |
+| 4 | Scale and speed: tall worlds (cubic chunks), LODs to 256 chunks, faster meshing, GPU-driven drawing, world map | Next |
 
 ## Step 1: Foundation ✔
 
@@ -49,29 +50,43 @@ Islands), oceans down to y ≈ 13, mountains to y ≈ 270–300, rivers to the
 sea, overhangs in rugged areas. Known limitation: rivers sit at sea level
 (no downhill flow from plateaus).
 
-## Step 3: Biomes and trees
+## Step 3: Biomes and trees ✔
 
-- Biome chosen by nearest point in a 6D parameter space (temperature,
-  humidity, continentalness, erosion, weirdness, depth). Biome boundaries are
-  smooth, and the same seed always gives the same biome map.
-- Minecraft-style biomes (plains, forest, birch forest, dark forest, taiga,
-  snowy plains, desert, savanna, jungle, swamp, badlands, mushroom fields,
-  stony peaks, meadow, ocean variants, …) plus real-world biomes from the
-  Whittaker climate diagram (steppe, tundra, mangrove, salt flats, fjords,
-  karst, volcanic, temperate rainforest, cloud forest, …).
-- Per-biome surface rules (grass, sand, snow, terracotta layers, …).
-- Simple blocky trees per biome, placed with deterministic, evenly spaced
-  sampling (jittered grid / Poisson-disk style) and generated across chunk
-  borders without seams.
-- Biome map output in `wg-map` and a biome name in the debug overlay.
+- Temperature and humidity climate maps; temperature cools with altitude.
+- 48 biomes from a decision tree on the climate parameters and surface
+  height: 9 oceans, rivers, lakes, coasts, peaks and slopes, and a
+  Whittaker temperature × rainfall grid for the lowlands. Includes the
+  Minecraft family plus real-world tundra, steppe, chaparral, salt flats,
+  fjords, karst, temperate rainforest, cloud forest and volcanic islands.
+- Per-biome surface rules (snow, podzol, red sand + terracotta strata,
+  mud, salt, basalt, limestone, …) and sea ice.
+- Trees on a jittered grid, seamless across chunks: oak, birch, spruce,
+  giant spruce, jungle, acacia, dark oak, mangrove, cactus, giant
+  mushrooms, bushes.
+- Biome map in `wg-map`, biome name in the HUD, grass tinted by biome.
+
+Result: all 48 biomes occur within 24 km of seed 42; 0.90 ms per chunk.
 
 ## Step 4: Scale and speed
 
+Scope extended after owner feedback (tall worlds, very far view).
+
+- **Configurable world height**, chosen in the create-world menu like the
+  world size: 384 (today), 1,000, 5,000, 10,000, up to ~17,700 blocks
+  (2 × Everest's 8,849 m). Terrain height and the altitude rules of
+  biomes (lapse rate, snow line, peaks) scale with it.
+- **Cubic chunks:** 16³ sections generated, stored and streamed on their
+  own in 3D (a 17,700-block column is 1,100 sections; only those near the
+  camera or the surface are loaded).
+- **Two view distances:** full detail up to 64 chunks of radius, and an
+  **LOD distance** up to 256 chunks of radius (512 × 512 = 262,144 chunks),
+  in the style of Voxy and Distant Horizons.
 - **LODs:** rings of coarser chunks (2×, 4×, 8×, … block size) out to the
-  horizon, generated from the same column sampler, in the style of the
-  Distant Horizons mod.
+  LOD distance, generated straight from the column sampler (heights, top
+  blocks, trees as coarse blobs), cached and rebuilt as the camera moves.
 - **Binary greedy meshing** (bitmask face culling) and packed 8-byte vertices.
 - **GPU-driven drawing:** one big vertex/index pool, indirect draws.
-- Chunk cache and unloading tuned for 32+ chunk render distance.
+- Chunk cache and unloading tuned for the larger distances.
 - In-game world map (top-down, zoomable to the whole world).
-- Performance budget verified against an RTX 2080: 60 FPS at render distance 16.
+- Performance budget verified against an RTX 2080: 60 FPS at render
+  distance 16 plus the LOD rings.

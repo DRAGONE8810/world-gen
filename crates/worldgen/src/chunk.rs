@@ -5,6 +5,7 @@
 //! 16×16×16. Each section is palette-compressed independently, so the
 //! all-air sky and all-stone underground cost almost nothing.
 
+use crate::biome::Biome;
 use crate::block::{blocks, BlockId};
 use crate::palette::{PalettedSection, SECTION_SIZE};
 use crate::settings::{MAX_Y, MIN_Y, WORLD_HEIGHT};
@@ -54,6 +55,9 @@ pub struct Chunk {
     /// Y of the highest non-air block per column (`x + z*16`), or `MIN_Y - 1`
     /// for an empty column. Used for spawning, lighting and maps.
     pub heightmap: [i16; 256],
+    /// Biome of each column (`x + z*16`). One per column, like Minecraft
+    /// before 1.18: biomes here are 2D, chosen at the surface.
+    pub biomes: [Biome; 256],
 }
 
 impl Chunk {
@@ -62,6 +66,7 @@ impl Chunk {
             pos,
             sections: vec![PalettedSection::filled(blocks::AIR); SECTIONS_PER_CHUNK],
             heightmap: [(MIN_Y - 1) as i16; 256],
+            biomes: [Biome::default(); 256],
         }
     }
 
@@ -97,6 +102,11 @@ impl Chunk {
     #[inline]
     pub fn height_at(&self, x: usize, z: usize) -> i32 {
         self.heightmap[x + z * 16] as i32
+    }
+
+    #[inline]
+    pub fn biome_at(&self, x: usize, z: usize) -> Biome {
+        self.biomes[x + z * 16]
     }
 
     pub fn is_empty(&self) -> bool {

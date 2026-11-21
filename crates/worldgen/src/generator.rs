@@ -14,9 +14,14 @@
 //!    `d(x, y, z) = (H − y) + A · N(x, y, z) > 0`, where `N` is 3D fractal
 //!    noise. With `A ≈ 1` this is just a heightmap; with large `A` (mountains)
 //!    the 3D term carves cliffs, overhangs and arches.
-//! 3. **Surface rules**: each solid block that has air or water above it
-//!    becomes grass/sand/gravel/snow…, the next few blocks become filler
-//!    (dirt, sand), the rest stone. Water fills air at or below sea level.
+//! 3. **Biome** ([`crate::biome`]): chosen from the climate and the
+//!    surface height found in step 2.
+//! 4. **Surface rules**: each solid block that has air or water above it
+//!    becomes the biome's top block (grass, sand, snow, podzol, red sand…),
+//!    the next few blocks become filler (dirt, sand, terracotta bands), the
+//!    rest stone. Water fills air at or below sea level, and freezes over
+//!    in frozen biomes.
+//! 5. **Trees** ([`crate::trees`]), if the world has features enabled.
 //!
 //! `N` is expensive (3D, several octaves), so like most voxel engines we
 //! sample it on a coarse grid of 4×8×4-block cells and interpolate
@@ -25,13 +30,15 @@
 //! is certainly solid, so noise is only evaluated in a thin band around
 //! the surface.
 
+use crate::biome::{self, Biome};
 use crate::block::{blocks, BlockId};
 use crate::chunk::{Chunk, ChunkPos, CHUNK_SIZE, SECTIONS_PER_CHUNK};
 use crate::noise::{OctaveConfig, OctaveNoise};
 use crate::palette::{section_index, PalettedSection, SECTION_SIZE, SECTION_VOLUME};
-use crate::rng::{derive_seed, hash_position, hash_position_f64};
+use crate::rng::{derive_seed, hash_position, hash_position_f64, Xoroshiro128PlusPlus};
 use crate::settings::{WorldSettings, WorldType, MAX_Y, MIN_Y, SEA_LEVEL, WORLD_HEIGHT};
 use crate::terrain::{Shape, TerrainShaper};
+use crate::trees::{self, Tree, TREE_CELL, TREE_REACH};
 
 /// Horizontal size of a density-noise cell, in blocks.
 const CELL_XZ: i32 = 4;
@@ -43,6 +50,9 @@ const GRID_Y: usize = (WORLD_HEIGHT / CELL_Y) as usize + 1;
 const NOISE_GAIN: f64 = 2.5;
 /// Upper bound of `|N|` after gain (fBm is bounded by ~1.04 · gain).
 const NOISE_BOUND: f64 = 2.7;
+
+/// Vertical period of the badlands terracotta stripes.
+const BAND_PERIOD: usize = 32;
 
 /// What the generator knows about a single (x, z) column without building
 /// the chunk. Shared by chunk generation, the map tool, the menu preview and
@@ -59,6 +69,9 @@ pub struct ColumnSample {
     pub inside: bool,
     /// Climate, base height and roughness (default for Flat worlds).
     pub shape: Shape,
+    pub biome: Biome,
+    /// The water surface above this column is frozen (ice at sea level).
+    pub ice: bool,
 }
 
 impl ColumnSample {
@@ -68,12 +81,34 @@ impl ColumnSample {
         underwater: false,
         inside: false,
         shape: Shape {
-            climate: crate::terrain::Climate { continentalness: 0.0, erosion: 0.0, weirdness: 0.0, peaks_valleys: 0.0 },
+            climate: crate::terrain::Climate {
+                continentalness: 0.0,
+                erosion: 0.0,
+                weirdness: 0.0,
+                peaks_valleys: 0.0,
+                temperature: 0.0,
+                humidity: 0.0,
+            },
             height: 0.0,
             roughness: 0.0,
             river: 0.0,
+            island: 0.0,
         },
+        biome: Biome::Plains,
+        ice: false,
     };
+
+    /// Colour of the column seen from above, ignoring water depth: the top
+    /// block, with grass tinted by biome and frozen water shown as ice.
+    pub fn top_color(&self) -> [u8; 3] {
+        if self.ice {
+            blocks::ICE.info().color
+        } else if self.top_block == blocks::GRASS {
+            self.biome.grass_color()
+        } else {
+            self.top_block.info().color
+        }
+    }
 }
 
 pub struct WorldGenerator {
@@ -82,6 +117,12 @@ pub struct WorldGenerator {
     density_noise: OctaveNoise,
     bedrock_seed: u64,
     surface_seed: u64,
+    tree_seed: u64,
+    /// Smooth 2D noise (~16-block blobs) for patchy ground: podzol in taiga,
+    /// coarse dirt in savanna, gravel on stony shores, holes in sea ice.
+    patch: OctaveNoise,
+    /// Badlands terracotta colour stripes, one entry per y (mod 32).
+    bands: [BlockId; BAND_PERIOD],
     /// Horizontal stretch: 4 for "Large biomes", else 1.
     scale: f64,
 }
@@ -109,6 +150,9 @@ impl WorldGenerator {
             ),
             bedrock_seed: derive_seed(seed, "surface/bedrock"),
             surface_seed: derive_seed(seed, "surface/depth"),
+            tree_seed: derive_seed(seed, "features/trees"),
+            patch: OctaveNoise::new(derive_seed(seed, "surface/patch"), &OctaveConfig::new(-4, &[1.0, 1.0])),
+            bands: Self::make_bands(derive_seed(seed, "surface/badlands_bands")),
             scale,
             settings,
         }
@@ -158,43 +202,160 @@ impl WorldGenerator {
         (shape.height - y as f64) + shape.roughness * n > 0.0
     }
 
-    /// Top block for a solid block exposed to air/water at height `y`.
-    fn top_block(&self, x: i32, y: i32, z: i32, shape: &Shape) -> BlockId {
-        if self.is_flat() {
-            return blocks::GRASS;
+    /// Badlands stripes: mostly plain terracotta with coloured bands 1–3
+    /// blocks thick, shuffled per seed.
+    fn make_bands(seed: u64) -> [BlockId; BAND_PERIOD] {
+        let mut rng = Xoroshiro128PlusPlus::from_seed(seed);
+        let colours = [
+            blocks::ORANGE_TERRACOTTA,
+            blocks::YELLOW_TERRACOTTA,
+            blocks::RED_TERRACOTTA,
+            blocks::WHITE_TERRACOTTA,
+            blocks::BROWN_TERRACOTTA,
+        ];
+        let mut bands = [blocks::TERRACOTTA; BAND_PERIOD];
+        let mut y = rng.next_bounded(3) as usize;
+        while y < BAND_PERIOD {
+            let colour = colours[rng.next_bounded(colours.len() as u32) as usize];
+            let thick = 1 + rng.next_bounded(3) as usize;
+            for b in bands.iter_mut().skip(y).take(thick) {
+                *b = colour;
+            }
+            y += thick + 1 + rng.next_bounded(4) as usize;
         }
+        bands
+    }
+
+    /// Patch noise in [-1, 1], ~16-block blobs.
+    #[inline]
+    fn patch_at(&self, x: i32, z: i32) -> f64 {
+        (self.patch.sample_2d(x as f64, z as f64) * 2.1).clamp(-1.0, 1.0)
+    }
+
+    /// Terracotta stripe at height y. The stripes wobble a few blocks up and
+    /// down over ~64 blocks, so they follow the land like real strata.
+    fn stripe(&self, x: i32, y: i32, z: i32) -> BlockId {
+        let wobble = (self.patch.sample_2d(x as f64 * 0.25, z as f64 * 0.25) * 6.0).round() as i32;
+        self.bands[(y + wobble).rem_euclid(BAND_PERIOD as i32) as usize]
+    }
+
+    /// Top and filler blocks for a solid block exposed to air/water at
+    /// height `y`, in a column of the given biome.
+    fn surface_for(&self, x: i32, y: i32, z: i32, shape: &Shape, biome: Biome) -> (BlockId, BlockId) {
+        use blocks::*;
+        use Biome as B;
+        if self.is_flat() {
+            return (GRASS, DIRT);
+        }
+        let patch = self.patch_at(x, z);
         if y < SEA_LEVEL - 1 {
-            // Sea and river beds: sand in the shallows, gravel/clay deeper.
+            // Sea, lake and river beds.
             let depth = SEA_LEVEL - y;
-            return if depth < 7 || shape.river > 0.3 {
-                blocks::SAND
+            if biome == B::MangroveSwamp {
+                return (MUD, MUD);
+            }
+            if shape.island > 0.0 && shape.climate.humidity <= 0.0 && depth < 20 {
+                return (BASALT, BASALT); // black volcanic sand around volcanic islands
+            }
+            let top = if depth < 7 || shape.river > 0.3 || biome == B::WarmOcean {
+                SAND
             } else if hash_position(self.surface_seed, x, 0, z).is_multiple_of(8) {
-                blocks::CLAY
+                CLAY
             } else {
-                blocks::GRAVEL
+                GRAVEL
             };
+            return (top, top);
         }
         let coast = shape.climate.continentalness < -0.03;
         if y <= SEA_LEVEL + 1 && (coast || shape.river > 0.2) {
-            return blocks::SAND;
+            // Shoreline and river banks.
+            return match biome {
+                B::SnowyBeach => (SNOW, SAND),
+                B::StonyShore | B::Fjord if patch > 0.0 => (GRAVEL, GRAVEL),
+                B::StonyShore | B::Fjord => (STONE, STONE),
+                B::MangroveSwamp | B::Swamp => (MUD, MUD),
+                B::SaltFlats => (SALT, SAND),
+                B::Volcanic => (BASALT, BASALT),
+                B::MushroomFields => (MYCELIUM, DIRT),
+                _ => (SAND, SAND),
+            };
         }
         // Jitter the snow and tree lines by a few blocks per column.
         let jitter = (hash_position(self.surface_seed, x, 2, z) % 9) as i32 - 4;
-        if y >= 195 + jitter {
-            return blocks::SNOW;
+        if y >= 200 + jitter {
+            return (SNOW, STONE);
         }
-        if y >= 160 + jitter || shape.roughness > 9.0 && y > 120 + jitter {
-            return blocks::STONE; // bare rock above the tree line / on crags
+        let (top, filler) = match biome {
+            B::FrozenPeaks if patch > 0.25 => (PACKED_ICE, PACKED_ICE),
+            B::FrozenPeaks | B::JaggedPeaks | B::SnowySlopes => (SNOW, STONE),
+            B::Grove | B::SnowyPlains | B::SnowyTaiga | B::SnowyBeach => (SNOW, DIRT),
+            B::StonyPeaks if patch > 0.4 => (GRAVEL, GRAVEL),
+            B::StonyPeaks => (STONE, STONE),
+            B::Tundra if patch > 0.2 => (COARSE_DIRT, DIRT),
+            B::Taiga | B::TemperateRainforest if patch > 0.35 => (PODZOL, DIRT),
+            B::OldGrowthTaiga if patch > 0.45 => (COARSE_DIRT, DIRT),
+            B::OldGrowthTaiga => (PODZOL, DIRT),
+            B::Desert | B::Beach => (SAND, SAND),
+            B::SaltFlats => (SALT, SAND),
+            B::Badlands if patch > -0.2 => (RED_SAND, TERRACOTTA),
+            B::Badlands => (self.stripe(x, y, z), TERRACOTTA),
+            B::Savanna | B::Chaparral | B::Steppe if patch > 0.45 => (COARSE_DIRT, DIRT),
+            B::WindsweptHills if patch > 0.3 => (STONE, STONE),
+            B::WindsweptHills if patch < -0.5 => (GRAVEL, GRAVEL),
+            B::StonyShore | B::Fjord if patch > 0.0 => (GRAVEL, GRAVEL),
+            B::StonyShore | B::Fjord => (STONE, STONE),
+            B::MushroomFields => (MYCELIUM, DIRT),
+            B::Volcanic => (BASALT, BASALT),
+            B::Karst if patch > 0.25 => (LIMESTONE, LIMESTONE),
+            B::Karst => (GRASS, DIRT),
+            B::Swamp if patch < -0.35 => (MUD, MUD),
+            B::MangroveSwamp => (MUD, MUD),
+            _ => (GRASS, DIRT),
+        };
+        // Above the tree line, and on crags, soil gives way to bare rock.
+        let soil = matches!(top, GRASS | PODZOL | COARSE_DIRT | MYCELIUM | MUD);
+        if soil && (y >= 160 + jitter || shape.roughness > 9.0 && y > 120 + jitter) {
+            return (STONE, STONE);
         }
-        blocks::GRASS
+        (top, filler)
     }
 
-    fn filler_for(top: BlockId) -> BlockId {
-        match top {
-            blocks::GRASS => blocks::DIRT,
-            blocks::SNOW => blocks::STONE,
-            other => other,
+    /// Block `depth` blocks below an exposed surface whose top/filler are
+    /// known (depth ≥ 1).
+    #[inline]
+    #[allow(clippy::too_many_arguments)]
+    fn below_surface(
+        &self,
+        x: i32,
+        y: i32,
+        z: i32,
+        depth: i32,
+        filler_depth: i32,
+        top: BlockId,
+        filler: BlockId,
+        biome: Biome,
+    ) -> BlockId {
+        match biome {
+            // Badlands: 40 blocks of striped terracotta, so cliffs and
+            // canyon walls show the colour bands.
+            Biome::Badlands if depth < 40 && !self.is_flat() => return self.stripe(x, y, z),
+            Biome::Karst if depth >= filler_depth => return blocks::LIMESTONE,
+            Biome::Volcanic if depth < 12 => return blocks::BASALT,
+            _ => {}
         }
+        if depth < filler_depth {
+            filler
+        } else if depth == filler_depth && top == blocks::SAND {
+            blocks::SANDSTONE // sand is held up by sandstone
+        } else {
+            blocks::STONE
+        }
+    }
+
+    /// Whether the sea-level water above this column is frozen. Sea ice
+    /// has a few holes (leads) where the patch noise is low.
+    fn frozen_surface(&self, x: i32, z: i32, biome: Biome) -> bool {
+        biome.freezes() && self.patch_at(x, z) > -0.55
     }
 
     pub fn sample_column(&self, x: i32, z: i32) -> ColumnSample {
@@ -209,6 +370,8 @@ impl WorldGenerator {
                 underwater: false,
                 inside: true,
                 shape: ColumnSample::OUTSIDE.shape,
+                biome: Biome::Plains,
+                ice: false,
             };
         }
         let shape = self.column_shape(x, z);
@@ -245,12 +408,16 @@ impl WorldGenerator {
                 break;
             }
         }
+        let biome = biome::select(&shape, surface);
+        let underwater = surface < SEA_LEVEL;
         ColumnSample {
             surface_y: surface,
-            top_block: self.top_block(x, surface, z, &shape),
-            underwater: surface < SEA_LEVEL,
+            top_block: self.surface_for(x, surface, z, &shape, biome).0,
+            underwater,
             inside: true,
             shape,
+            biome,
+            ice: underwater && self.frozen_surface(x, z, biome),
         }
     }
 
@@ -299,6 +466,10 @@ impl WorldGenerator {
             }
         }
 
+        // Highest solid block and its top block per column, for trees.
+        let mut surface = [MIN_Y - 1; 256];
+        let mut tops = [blocks::AIR; 256];
+
         // Fill a dense [section][16^3] buffer first: sequential writes into
         // plain arrays are much faster than palette writes block by block.
         let mut dense = vec![[blocks::AIR; SECTION_VOLUME]; SECTIONS_PER_CHUNK];
@@ -321,6 +492,8 @@ impl WorldGenerator {
                     put(lx, MIN_Y + 2, lz, blocks::DIRT);
                     put(lx, MIN_Y + 3, lz, blocks::GRASS);
                     chunk.heightmap[i] = (MIN_Y + 3) as i16;
+                    surface[i] = MIN_Y + 3;
+                    tops[i] = blocks::GRASS;
                     continue;
                 }
 
@@ -339,6 +512,9 @@ impl WorldGenerator {
                 let mut depth = i32::MAX;
                 let (mut top, mut filler) = (blocks::STONE, blocks::STONE);
                 let mut solid_above = false;
+                // The biome is decided at the first (highest) surface and
+                // shared by any lower surfaces under overhangs.
+                let mut col_biome: Option<Biome> = None;
                 for y in (MIN_Y..=band.top.max(SEA_LEVEL)).rev() {
                     let solid = if y > band.top {
                         false
@@ -369,11 +545,17 @@ impl WorldGenerator {
                         solid_above = false;
                         continue;
                     }
+                    let biome = *col_biome.get_or_insert_with(|| {
+                        surface[i] = y;
+                        biome::select(shape, y)
+                    });
                     if !solid_above {
                         // A newly exposed surface (the top, or under an overhang).
                         depth = 0;
-                        top = self.top_block(x, y, z, shape);
-                        filler = Self::filler_for(top);
+                        (top, filler) = self.surface_for(x, y, z, shape, biome);
+                        if surface[i] == y {
+                            tops[i] = top;
+                        }
                     }
                     solid_above = true;
                     highest = highest.max(y);
@@ -382,17 +564,45 @@ impl WorldGenerator {
                         blocks::BEDROCK
                     } else if depth == 0 {
                         top
-                    } else if depth < filler_depth {
-                        filler
-                    } else if depth == filler_depth && top == blocks::SAND {
-                        blocks::SANDSTONE // sand is held up by sandstone
                     } else {
-                        blocks::STONE
+                        self.below_surface(x, y, z, depth, filler_depth, top, filler, biome)
                     };
                     put(lx, y, lz, b);
                     depth = depth.saturating_add(1);
                 }
+                let biome = col_biome.unwrap_or_default();
+                chunk.biomes[i] = biome;
+                if surface[i] < SEA_LEVEL && self.frozen_surface(x, z, biome) {
+                    put(lx, SEA_LEVEL, lz, blocks::ICE);
+                }
                 chunk.heightmap[i] = highest as i16;
+            }
+        }
+
+        if self.settings.features {
+            let local = |lx: usize, lz: usize| (surface[lx + lz * 16], tops[lx + lz * 16], chunk.biomes[lx + lz * 16]);
+            for tree in self.trees_for_chunk(pos, Some(&local)) {
+                trees::build(&tree, &mut |wx, wy, wz, b, is_log| {
+                    let (lx, lz) = (wx - bx0, wz - bz0);
+                    if !(0..16).contains(&lx) || !(0..16).contains(&lz) || !(MIN_Y..=MAX_Y).contains(&wy) {
+                        return;
+                    }
+                    if !self.settings.size.contains_column(wx, wz) {
+                        return;
+                    }
+                    let (lx, lz) = (lx as usize, lz as usize);
+                    let ly = (wy - MIN_Y) as usize;
+                    let cell = &mut dense[ly / SECTION_SIZE][section_index(lx, ly % SECTION_SIZE, lz)];
+                    // Logs grow through air, water and leaves; leaves only
+                    // fill air. See `trees` for why this makes overlaps
+                    // independent of chunk order.
+                    let free = cell.is_air() || (is_log && (*cell == blocks::WATER || cell.is_leaves()));
+                    if free {
+                        *cell = b;
+                        let h = &mut chunk.heightmap[lx + lz * 16];
+                        *h = (*h).max(wy as i16);
+                    }
+                });
             }
         }
 
@@ -400,6 +610,46 @@ impl WorldGenerator {
             *section = PalettedSection::from_dense(blocks);
         }
         chunk
+    }
+
+    /// All trees that put at least one block into chunk `pos`, in global
+    /// cell order. `local` returns (surface y, top block, biome) for the
+    /// chunk's own columns when they are already known; everything else
+    /// comes from [`Self::sample_column`], which matches chunk generation
+    /// exactly.
+    #[allow(clippy::type_complexity)]
+    pub fn trees_for_chunk(
+        &self,
+        pos: ChunkPos,
+        local: Option<&dyn Fn(usize, usize) -> (i32, BlockId, Biome)>,
+    ) -> Vec<Tree> {
+        let mut out = Vec::new();
+        if !self.settings.features || !self.chunk_touches_world(pos) {
+            return out;
+        }
+        let (bx0, bz0) = (pos.min_block_x(), pos.min_block_z());
+        let (x_lo, x_hi) = (bx0 - TREE_REACH, bx0 + 15 + TREE_REACH);
+        let (z_lo, z_hi) = (bz0 - TREE_REACH, bz0 + 15 + TREE_REACH);
+        for cz in z_lo.div_euclid(TREE_CELL)..=z_hi.div_euclid(TREE_CELL) {
+            for cx in x_lo.div_euclid(TREE_CELL)..=x_hi.div_euclid(TREE_CELL) {
+                let (x, z, hash) = trees::cell_candidate(self.tree_seed, cx, cz);
+                if x < x_lo || x > x_hi || z < z_lo || z > z_hi || !self.settings.size.contains_column(x, z) {
+                    continue;
+                }
+                let (lx, lz) = (x - bx0, z - bz0);
+                let (surface_y, top, biome) = match local {
+                    Some(f) if (0..16).contains(&lx) && (0..16).contains(&lz) => f(lx as usize, lz as usize),
+                    _ => {
+                        let s = self.sample_column(x, z);
+                        (s.surface_y, s.top_block, s.biome)
+                    }
+                };
+                if let Some(t) = trees::resolve(x, z, hash, biome, surface_y, top) {
+                    out.push(t);
+                }
+            }
+        }
+        out
     }
 
     /// Bedrock floor: always at MIN_Y, then a ragged layer that thins out
@@ -477,27 +727,50 @@ mod tests {
         assert!(!chunks_equal(&a, &b));
     }
 
-    /// The map tool, menu preview and HUD rely on `sample_column`; it must
-    /// describe the generated chunk exactly, including in rugged mountains
-    /// where 3D noise creates overhangs.
+    /// The map tool, menu preview, HUD and tree placement rely on
+    /// `sample_column`; it must describe the generated chunk exactly,
+    /// including in rugged mountains where 3D noise creates overhangs.
+    /// Without features nothing may stand above the surface but water and
+    /// sea ice; with features, also tree parts.
     #[test]
     fn column_sample_matches_generated_chunk() {
-        for t in [WorldType::Normal, WorldType::Amplified, WorldType::Islands, WorldType::LargeBiomes, WorldType::Flat]
-        {
-            let g = generator(77, t);
-            for pos in [ChunkPos::new(-3, 12), ChunkPos::new(40, -7), ChunkPos::new(-90, -60), ChunkPos::new(150, 151)]
+        for features in [false, true] {
+            for t in
+                [WorldType::Normal, WorldType::Amplified, WorldType::Islands, WorldType::LargeBiomes, WorldType::Flat]
             {
-                let c = g.generate_chunk(pos);
-                for lz in 0..16 {
-                    for lx in 0..16 {
-                        let s = g.sample_column(pos.min_block_x() + lx as i32, pos.min_block_z() + lz as i32);
-                        assert_eq!(c.get(lx, s.surface_y, lz), s.top_block, "{t:?} {pos:?} {lx},{lz}");
-                        for y in s.surface_y + 1..=MAX_Y {
-                            let b = c.get(lx, y, lz);
-                            assert!(b == blocks::AIR || b == blocks::WATER, "{t:?} solid above surface at y={y}");
+                let g = WorldGenerator::new(WorldSettings {
+                    seed: 77,
+                    world_type: t,
+                    size: WorldSize::from_km(64.0),
+                    features,
+                });
+                for pos in
+                    [ChunkPos::new(-3, 12), ChunkPos::new(40, -7), ChunkPos::new(-90, -60), ChunkPos::new(150, 151)]
+                {
+                    let c = g.generate_chunk(pos);
+                    for lz in 0..16 {
+                        for lx in 0..16 {
+                            let s = g.sample_column(pos.min_block_x() + lx as i32, pos.min_block_z() + lz as i32);
+                            let ctx = format!("{t:?} features={features} {pos:?} {lx},{lz}");
+                            assert_eq!(c.get(lx, s.surface_y, lz), s.top_block, "{ctx}");
+                            assert_eq!(c.biome_at(lx, lz), s.biome, "{ctx}");
+                            assert_eq!(c.get(lx, SEA_LEVEL, lz) == blocks::ICE, s.ice, "{ctx}");
+                            for y in s.surface_y + 1..=MAX_Y {
+                                let b = c.get(lx, y, lz);
+                                let ok = b == blocks::AIR
+                                    || b == blocks::WATER
+                                    || b == blocks::ICE
+                                    || (features && b.is_tree_part());
+                                assert!(ok, "{ctx}: {} above surface at y={y}", b.info().name);
+                            }
+                            assert_eq!(c.get(lx, MIN_Y, lz), blocks::BEDROCK);
+                            let water_top = s.surface_y.max(if s.underwater { SEA_LEVEL } else { MIN_Y });
+                            if features {
+                                assert!(c.height_at(lx, lz) >= water_top, "{ctx}");
+                            } else {
+                                assert_eq!(c.height_at(lx, lz), water_top, "{ctx}");
+                            }
                         }
-                        assert_eq!(c.get(lx, MIN_Y, lz), blocks::BEDROCK);
-                        assert_eq!(c.height_at(lx, lz), s.surface_y.max(if s.underwater { SEA_LEVEL } else { MIN_Y }));
                     }
                 }
             }
@@ -632,5 +905,142 @@ mod tests {
         }
         assert!(rough_cols > 5, "test found too few rugged areas ({rough_cols})");
         assert!(rough_overhangs > 0, "no overhangs in {rough_cols} rugged chunks");
+    }
+
+    /// Biomes must agree with the land under them, and every biome must
+    /// actually occur somewhere. Sampled over 48 × 48 km on two seeds.
+    #[test]
+    fn biomes_fit_their_terrain_and_all_occur() {
+        let mut seen = vec![false; Biome::ALL.len()];
+        for seed in [42, 7] {
+            let g = generator(seed, WorldType::Normal);
+            for iz in 0..240 {
+                for ix in 0..240 {
+                    let s = g.sample_column(ix * 200 - 24_000, iz * 200 - 24_000);
+                    let b = s.biome;
+                    seen[b as usize] = true;
+                    let ctx = format!(
+                        "seed {seed} at {},{}: {} y={}",
+                        ix * 200 - 24_000,
+                        iz * 200 - 24_000,
+                        b.name(),
+                        s.surface_y
+                    );
+                    // Water biomes exactly where the ground is under water
+                    // (mangroves may stand in either).
+                    if b != Biome::MangroveSwamp {
+                        assert_eq!(b.is_water(), s.underwater, "{ctx}");
+                    }
+                    if matches!(b, Biome::FrozenPeaks | Biome::JaggedPeaks | Biome::StonyPeaks) {
+                        assert!(s.surface_y > SEA_LEVEL + 85, "{ctx}");
+                    }
+                    if matches!(b, Biome::Beach | Biome::SnowyBeach) {
+                        assert!(s.surface_y <= SEA_LEVEL + 3, "{ctx}");
+                    }
+                    let t = biome::effective_temperature(&s.shape, s.surface_y);
+                    if matches!(b, Biome::Desert | Biome::Badlands | Biome::Jungle | Biome::Savanna) {
+                        assert!(t > 0.18, "hot biome in the cold: {ctx} t={t}");
+                    }
+                    if matches!(b, Biome::SnowyPlains | Biome::Tundra | Biome::SnowyTaiga | Biome::FrozenOcean) {
+                        assert!(t < -0.45, "frozen biome in the warm: {ctx} t={t}");
+                    }
+                    if matches!(b, Biome::River | Biome::FrozenRiver) {
+                        assert!(s.shape.river > 0.3, "{ctx}");
+                    }
+                    if matches!(b, Biome::Volcanic | Biome::MushroomFields) {
+                        assert!(s.shape.island > 0.0, "{ctx}");
+                    }
+                    if s.ice {
+                        assert!(b.freezes() && s.underwater, "{ctx}");
+                    }
+                }
+            }
+        }
+        let missing: Vec<_> = Biome::ALL.iter().filter(|b| !seen[**b as usize]).map(|b| b.name()).collect();
+        assert!(missing.is_empty(), "biomes never generated: {missing:?}");
+    }
+
+    /// Trees are generated per chunk, but a canopy may reach into the next
+    /// chunk. Every block of every tree must appear in whichever chunk holds
+    /// it, unless that spot was already taken by terrain or another tree.
+    /// An AIR block where a tree should be means a seam.
+    #[test]
+    fn trees_are_seamless_across_chunk_borders() {
+        let g = generator(42, WorldType::Normal);
+        // A forested area found from the biome map of seed 42.
+        let mut chunks = std::collections::HashMap::new();
+        let mut found = 0;
+        for (ox, oz) in [(0, 0), (-150, 200), (300, -120), (-40, -260)] {
+            for cz in oz..oz + 4 {
+                for cx in ox..ox + 4 {
+                    chunks.insert(ChunkPos::new(cx, cz), g.generate_chunk(ChunkPos::new(cx, cz)));
+                }
+            }
+        }
+        let mut crossing = 0;
+        for &pos in chunks.keys() {
+            for t in g.trees_for_chunk(pos, None) {
+                if ChunkPos::from_block(t.x, t.z) != pos {
+                    continue; // check each tree once, from its home chunk
+                }
+                found += 1;
+                let mut crosses = false;
+                trees::build(&t, &mut |x, y, z, _b, _| {
+                    let p = ChunkPos::from_block(x, z);
+                    let Some(c) = chunks.get(&p) else { return };
+                    crosses |= p != pos;
+                    let got = c.get((x - p.min_block_x()) as usize, y, (z - p.min_block_z()) as usize);
+                    assert!(!got.is_air(), "tree {t:?}: missing block at {x},{y},{z} in chunk {p:?}");
+                });
+                crossing += crosses as i32;
+            }
+        }
+        assert!(found > 50, "only {found} trees in the test area");
+        assert!(crossing > 5, "only {crossing} trees cross a chunk border");
+    }
+
+    #[test]
+    fn forests_have_trees_and_deserts_have_few() {
+        let g = generator(42, WorldType::Normal);
+        let (mut forest, mut forest_trees, mut desert, mut desert_trees) = (0, 0, 0, 0);
+        for cz in -60..60 {
+            for cx in -60..60 {
+                let pos = ChunkPos::new(cx * 3, cz * 3);
+                let s = g.sample_column(pos.min_block_x() + 8, pos.min_block_z() + 8);
+                let n = g
+                    .trees_for_chunk(pos, None)
+                    .iter()
+                    .filter(|t| ChunkPos::from_block(t.x, t.z) == pos && !matches!(t.kind, trees::TreeKind::Bush))
+                    .count();
+                match s.biome {
+                    Biome::Forest | Biome::BirchForest | Biome::DarkForest | Biome::Taiga | Biome::Jungle => {
+                        forest += 1;
+                        forest_trees += n;
+                    }
+                    Biome::Desert => {
+                        desert += 1;
+                        desert_trees += n;
+                    }
+                    _ => {}
+                }
+            }
+        }
+        // 256 columns per chunk / 25 per cell ≈ 10 candidates per chunk.
+        let (f, d) = (forest_trees as f64 / forest as f64, desert_trees as f64 / desert.max(1) as f64);
+        assert!(forest > 20 && f > 3.0, "forest chunks {forest}, trees/chunk {f}");
+        assert!(d < 1.0, "desert trees/chunk {d}");
+    }
+
+    #[test]
+    fn no_trees_without_features() {
+        let g = WorldGenerator::new(WorldSettings { seed: 42, features: false, ..Default::default() });
+        for cz in -5..5 {
+            for cx in -5..5 {
+                let c = g.generate_chunk(ChunkPos::new(cx, cz));
+                for s in &c.sections {
+                    assert!(s.palette().iter().all(|b| !b.is_tree_part()));
+                }
+            }
+        }
     }
 }

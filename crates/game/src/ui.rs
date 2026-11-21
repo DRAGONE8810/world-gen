@@ -142,8 +142,8 @@ pub fn create_world(ui: &mut egui::Ui, form: &mut WorldForm, actions: &mut Vec<A
                 });
                 ui.end_row();
 
-                ui.label("Trees & features");
-                ui.checkbox(&mut form.features, "Generate (from step 3)");
+                ui.label("Trees");
+                ui.checkbox(&mut form.features, "Generate trees, cacti and giant mushrooms");
                 ui.end_row();
             });
 
@@ -213,11 +213,13 @@ fn preview_image(s: &WorldSettings, px: usize) -> egui::ColorImage {
         for c in samples {
             let rgb = if !c.inside {
                 [10, 10, 14]
+            } else if c.ice {
+                worldgen::blocks::ICE.info().color
             } else if c.underwater {
                 let d = ((SEA_LEVEL - c.surface_y) as f32 / 50.0).clamp(0.0, 1.0);
                 [(40.0 - d * 20.0) as u8, (90.0 - d * 40.0) as u8, (200.0 - d * 60.0) as u8]
             } else {
-                c.top_block.info().color
+                c.top_color()
             };
             pixels.push(Color32::from_rgb(rgb[0], rgb[1], rgb[2]));
         }
@@ -338,6 +340,17 @@ pub fn hud(ui: &mut egui::Ui, h: &HudInfo) {
                         if h.column.underwater { "  (under water)" } else { "" }
                     )));
                     let cl = h.column.shape.climate;
+                    ui.label(mono(format!(
+                        "Biome {}{}  (T {:+.2} at this height, H {:+.2})",
+                        h.column.biome.display_name(),
+                        if h.column.biome.origin() == worldgen::biome::Origin::RealWorld {
+                            " (real world)"
+                        } else {
+                            ""
+                        },
+                        worldgen::biome::effective_temperature(&h.column.shape, h.column.surface_y),
+                        cl.humidity
+                    )));
                     ui.label(mono(format!(
                         "Climate  C {:+.2}  E {:+.2}  PV {:+.2}  rough {:.1}  river {:.2}",
                         cl.continentalness,

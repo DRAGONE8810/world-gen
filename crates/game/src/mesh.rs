@@ -17,7 +17,7 @@ use bytemuck::{Pod, Zeroable};
 use worldgen::block::Opacity;
 use worldgen::chunk::SECTIONS_PER_CHUNK;
 use worldgen::palette::{SECTION_SIZE, SECTION_VOLUME};
-use worldgen::{blocks, BlockId, Chunk, MIN_Y};
+use worldgen::{blocks, Biome, BlockId, Chunk, MIN_Y};
 
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Pod, Zeroable, PartialEq)]
@@ -131,7 +131,7 @@ pub fn mesh_chunk(chunk: &Chunk, nb: &Neighbours) -> MeshData {
             }
         }
 
-        greedy_section(&padded, y0, &mut out);
+        greedy_section(&padded, &chunk.biomes, y0, &mut out);
     }
 
     if out.vertices.is_empty() {
@@ -154,9 +154,34 @@ fn is_buried(chunk: &Chunk, nb: &Neighbours, s: usize) -> bool {
         && opaque(nb.pos_z, s)
 }
 
+/// Blocks whose colour depends on the biome (like Minecraft's grass and
+/// foliage tint): grass takes the biome's grass colour, oak leaves a darker
+/// shade of it.
+#[inline]
+fn tinted(b: BlockId) -> bool {
+    b == blocks::GRASS || b == blocks::OAK_LEAVES
+}
+
+/// Face colour of block `b` in `biome`, before face shading.
+pub fn block_color(b: BlockId, biome: Biome) -> [u8; 3] {
+    match b {
+        blocks::GRASS => biome.grass_color(),
+        blocks::OAK_LEAVES => biome.grass_color().map(|c| (c as f32 * 0.72) as u8),
+        _ => b.info().color,
+    }
+}
+
+// The mask packs block id and biome into 8 bits each.
+const _: () = assert!(Biome::ALL.len() < 255);
+
 /// Greedy-meshes one padded section into `out`.
-fn greedy_section(padded: &[BlockId], y0: i32, out: &mut MeshData) {
-    let mut mask = [0u16; 256]; // block id + 1, or 0 for "no face"
+///
+/// The merge key is the block id, plus the biome for tinted blocks, so two
+/// grass faces only merge when they have the same colour.
+fn greedy_section(padded: &[BlockId], biomes: &[Biome; 256], y0: i32, out: &mut MeshData) {
+    // 0 = no face; otherwise (block id + 1) | (biome + 1) << 8 for tinted
+    // blocks. Block ids and biomes both fit in 8 bits.
+    let mut mask = [0u16; 256];
     for d in 0..3 {
         // u and v are the two axes spanning the face plane, chosen cyclically
         // so that u × v points along +d (this fixes triangle winding).
@@ -181,7 +206,14 @@ fn greedy_section(padded: &[BlockId], y0: i32, out: &mut MeshData) {
                             q[d] -= 1
                         }
                         let n = padded[pidx(q[0], q[1], q[2])];
-                        let m = if face_visible(b, n) { b.0 + 1 } else { 0 };
+                        let m = if !face_visible(b, n) {
+                            0
+                        } else if tinted(b) {
+                            let biome = biomes[(p[0] - 1) + (p[2] - 1) * 16];
+                            (b.0 + 1) | ((biome as u16 + 1) << 8)
+                        } else {
+                            b.0 + 1
+                        };
                         mask[i + j * 16] = m;
                         any |= m != 0;
                     }
@@ -221,7 +253,12 @@ fn greedy_section(padded: &[BlockId], y0: i32, out: &mut MeshData) {
                         base[u] = i as f32;
                         base[v] = j as f32;
                         base[1] += y0 as f32;
-                        emit_quad(out, base, u, v, w as f32, h as f32, positive, BlockId(m - 1), face);
+                        let block = BlockId((m & 0xFF) - 1);
+                        let biome = match m >> 8 {
+                            0 => Biome::default(),
+                            k => Biome::ALL[k as usize - 1],
+                        };
+                        emit_quad(out, base, u, v, w as f32, h as f32, positive, block_color(block, biome), face);
                         i += w;
                     }
                 }
@@ -239,7 +276,7 @@ fn emit_quad(
     w: f32,
     h: f32,
     positive: bool,
-    block: BlockId,
+    c: [u8; 3],
     face: usize,
 ) {
     let mut du = [0f32; 3];
@@ -249,7 +286,6 @@ fn emit_quad(
     let add = |a: [f32; 3], b: [f32; 3]| [a[0] + b[0], a[1] + b[1], a[2] + b[2]];
     let corners = [base, add(base, du), add(add(base, du), dv), add(base, dv)];
     let shade = FACE_SHADE[face];
-    let c = block.info().color;
     let color = [(c[0] as f32 * shade) as u8, (c[1] as f32 * shade) as u8, (c[2] as f32 * shade) as u8, 255];
     let start = out.vertices.len() as u32;
     // Counter-clockwise when seen from the side the face points to.
@@ -342,6 +378,32 @@ mod tests {
         let m = mesh_chunk(&c, &Neighbours { neg_x: Some(&nx), pos_x: Some(&px), neg_z: Some(&nz), pos_z: Some(&pz) });
         // 98,304 blocks; a naive mesher would emit hundreds of thousands of
         // faces. Terrain should need only a few hundred quads.
-        assert!(m.quad_count() > 10 && m.quad_count() < 3000, "{} quads", m.quad_count());
+        assert!(m.quad_count() > 10 && m.quad_count() < 6000, "{} quads", m.quad_count());
+    }
+
+    #[test]
+    fn block_ids_fit_the_mask() {
+        assert!(BlockId::count() < 255);
+    }
+
+    #[test]
+    fn grass_merges_only_within_one_biome() {
+        let mut c = Chunk::empty(ChunkPos::new(0, 0));
+        for z in 0..16 {
+            for x in 0..16 {
+                c.set(x, 64, z, blocks::GRASS);
+                c.biomes[x + z * 16] = if x < 8 { Biome::Plains } else { Biome::Jungle };
+            }
+        }
+        let m = mesh_chunk(&c, &NONE);
+        // Top and bottom split into two quads each, the ±x sides are one
+        // biome each, the ±z sides split in two.
+        assert_eq!(m.quad_count(), 2 + 2 + 1 + 1 + 2 + 2);
+        // Top faces are unshaded, so they carry the exact biome grass colours.
+        let colors: std::collections::HashSet<_> = m.vertices.iter().map(|v| v.color).collect();
+        for b in [Biome::Plains, Biome::Jungle] {
+            let [r, g, bl] = b.grass_color();
+            assert!(colors.contains(&[r, g, bl, 255]), "{b:?}");
+        }
     }
 }

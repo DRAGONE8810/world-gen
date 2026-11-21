@@ -9,6 +9,10 @@ fn main() {
         ("eros", -11, &[1.0, 1.0, 1.0, 1.0, 1.0]),
         ("weird", -9, &[1.0, 1.0, 1.0, 1.0]),
         ("river", -11, &[1.0, 1.0, 1.0, 1.0]),
+        ("temperature", -13, &[1.0, 1.0, 1.0, 1.0]),
+        ("humidity", -12, &[1.0, 1.0, 1.0, 1.0]),
+        ("island", -9, &[1.0, 1.0]),
+        ("patch", -4, &[1.0, 1.0]),
     ];
     for (name, fo, amps) in cfgs {
         let n = DoubleNoise::new(7, &OctaveConfig::new(*fo, amps));

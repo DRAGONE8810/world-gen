@@ -4,6 +4,8 @@
 //! Everything here can run headless (tests, the `wg-map` tool, servers).
 //!
 //! Module map:
+//! * [`biome`] – picks the biome of a column from its climate
+//! * [`trees`] – jittered-grid tree placement and tree shapes
 //! * [`rng`] – seeded random numbers and positional hashing
 //! * [`noise`] – Perlin noise and fractal (octave) noise
 //! * [`block`] – block ids and their properties
@@ -14,6 +16,7 @@
 //! * [`terrain`] – climate parameters → height, roughness, rivers
 //! * [`generator`] – turns settings + chunk position into blocks
 
+pub mod biome;
 pub mod block;
 pub mod chunk;
 pub mod generator;
@@ -23,7 +26,9 @@ pub mod rng;
 pub mod settings;
 pub mod spline;
 pub mod terrain;
+pub mod trees;
 
+pub use biome::Biome;
 pub use block::{blocks, BlockId};
 pub use chunk::{Chunk, ChunkPos, CHUNK_SIZE};
 pub use generator::{ColumnSample, WorldGenerator};
