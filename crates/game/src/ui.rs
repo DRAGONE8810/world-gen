@@ -471,10 +471,19 @@ pub fn settings(ui: &mut egui::Ui, s: &mut GameSettings) -> bool {
                 ui.end_row();
                 ui.label("LOD distance");
                 ui.vertical(|ui| {
-                    ui.add(egui::Slider::new(&mut s.lod_distance, 0..=crate::config::MAX_LOD_DISTANCE).suffix(" chunks"));
+                    ui.add_enabled(
+                        !s.whole_world,
+                        egui::Slider::new(&mut s.lod_distance, 0..=crate::config::MAX_LOD_DISTANCE).suffix(" chunks"),
+                    );
+                    ui.checkbox(&mut s.whole_world, "Whole world");
                     let side = 2 * s.lod_distance.max(s.render_distance) as u64;
                     ui.label(
-                        RichText::new(if s.lod_distance > s.render_distance {
+                        RichText::new(if s.whole_world {
+                            "Simplified terrain out to the world border in every direction: fly up to see the whole \
+                             world at once. Detail halves each time the distance doubles, so this costs a few \
+                             thousand tiles, not millions of chunks."
+                                .to_string()
+                        } else if s.lod_distance > s.render_distance {
                             format!(
                                 "Simplified terrain out to {} blocks ({} × {} = {} chunks of area). Tall worlds see further, by their terrain scale.",
                                 group_thousands(s.lod_distance * 16),

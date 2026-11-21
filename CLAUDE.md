@@ -120,6 +120,12 @@ render distance etc.
   so any generator change that breaks that test must be mirrored there.
   The game's quadtree (`lod.rs`) must keep its leaves gap- and overlap-free
   and `draw_set` must never draw a mesh that isn't uploaded (tested).
+  Levels go to `MAX_LEVEL` = 22 so the whole 60,000 km world fits
+  (`GameSettings.whole_world`); detail is chosen by `max(horizontal
+  distance, camera height above ground)` (`Layout.altitude`), so flying
+  up removes work. Meshes leaving the view stay on the GPU in an LRU
+  cache (`world::CACHE_BYTES`) and are reused. Use `lod::FastSet` /
+  `FastMap` for sets keyed by `NodeKey`/`ChunkPos` (per-frame code).
   Depth is reverse-Z with an infinite far plane.
 - **Two generators:** `Generator::Classic` (`terrain::TerrainShaper`) and
   `Generator::Realistic` (`realistic::RealisticWorld`), behind the

@@ -215,12 +215,18 @@ impl App {
             let (hx, hz) = (s.settings.size.half_width() as f64, s.settings.size.half_depth() as f64);
             s.camera.pos.x = s.camera.pos.x.clamp(-hx + 0.5, hx - 0.5);
             s.camera.pos.z = s.camera.pos.z.clamp(-hz + 0.5, hz - 0.5);
+            // Up to "orbit": high enough to see the whole world at once.
             let (lo, hi) = (s.settings.height.min_y() as f64, s.settings.height.max_y() as f64);
-            s.camera.pos.y = s.camera.pos.y.clamp(lo, hi + 200.0);
+            let ceiling = (hi + 200.0).max(s.settings.size.width_blocks() as f64);
+            s.camera.pos.y = s.camera.pos.y.clamp(lo, ceiling);
         }
 
-        let center = ChunkPos::from_block(s.camera.pos.x.floor() as i32, s.camera.pos.z.floor() as i32);
-        let events = s.chunks.update(center, self.settings.layout(s.settings.height.terrain_scale()));
+        let (bx, bz) = (s.camera.pos.x.floor() as i32, s.camera.pos.z.floor() as i32);
+        let center = ChunkPos::from_block(bx, bz);
+        let ground = s.chunks.generator().sample_column(bx, bz).water_top() as f64;
+        let altitude = quantize_altitude(((s.camera.pos.y - ground) / 16.0).floor() as i64);
+        let layout = self.settings.layout(s.settings.height.terrain_scale(), world_chunks(&s.settings), altitude);
+        let events = s.chunks.update(center, layout);
         if let Some(r) = &mut self.renderer {
             for e in events {
                 match e {
@@ -328,7 +334,9 @@ impl App {
             let in_world = matches!(self.screen, Screen::Playing | Screen::Paused)
                 || self.screen == (Screen::Settings { from_pause: true });
             let cam = self.session.as_ref().filter(|_| in_world).map(|s| {
-                (&s.camera, self.settings.view_distance_blocks(s.settings.height.terrain_scale()), s.chunks.draw_list())
+                let fog =
+                    self.settings.view_distance_blocks(s.settings.height.terrain_scale(), world_chunks(&s.settings));
+                (&s.camera, fog, s.chunks.draw_list())
             });
             let stats = r.draw(
                 (size.width, size.height),
@@ -547,4 +555,22 @@ fn main() {
         eprintln!("{msg}");
         std::process::exit(1);
     }
+}
+
+/// The world's longer side, in chunks.
+fn world_chunks(w: &WorldSettings) -> i32 {
+    (w.size.width_blocks().max(w.size.depth_blocks()) / 16) as i32
+}
+
+/// Height above the ground in chunks, rounded down to its 4 leading bits
+/// (exact up to 15, then steps of 1/16 or less), so climbing or falling
+/// changes the LOD layout every few percent of the height, not every 16
+/// blocks.
+fn quantize_altitude(chunks: i64) -> i32 {
+    let a = chunks.clamp(0, i32::MAX as i64) as u32;
+    if a < 16 {
+        return a as i32;
+    }
+    let shift = (32 - a.leading_zeros()) - 4;
+    ((a >> shift) << shift) as i32
 }

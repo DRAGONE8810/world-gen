@@ -13,6 +13,9 @@ pub struct GameSettings {
     /// Radius, in chunks, of the LOD rings drawn beyond the render
     /// distance (0 or ≤ render distance: off).
     pub lod_distance: u32,
+    /// Draw the whole world: the LOD rings reach every point of it from
+    /// anywhere (overrides `lod_distance`).
+    pub whole_world: bool,
     pub fov_deg: f32,
     pub mouse_sensitivity: f32,
     /// Blocks per second. The mouse wheel doubles or halves it in game.
@@ -28,6 +31,7 @@ impl Default for GameSettings {
         Self {
             render_distance: 12,
             lod_distance: 128,
+            whole_world: false,
             fov_deg: 70.0,
             mouse_sensitivity: 1.0,
             fly_speed: 20.0,
@@ -60,12 +64,12 @@ impl GraphicsPreset {
         }
     }
 
-    /// (render distance, LOD distance) in chunks.
-    pub fn distances(self) -> (u32, u32) {
+    /// (render distance, LOD distance in chunks, whole world).
+    pub fn distances(self) -> (u32, u32, bool) {
         match self {
-            GraphicsPreset::Optimized => (8, 64),
-            GraphicsPreset::Balanced => (12, 128),
-            GraphicsPreset::Quality => (24, MAX_LOD_DISTANCE),
+            GraphicsPreset::Optimized => (8, 64, false),
+            GraphicsPreset::Balanced => (12, 128, false),
+            GraphicsPreset::Quality => (24, MAX_LOD_DISTANCE, true),
         }
     }
 
@@ -73,17 +77,17 @@ impl GraphicsPreset {
         match self {
             GraphicsPreset::Optimized => "Shorter view for weaker GPUs and laptops.",
             GraphicsPreset::Balanced => "The default, aimed at 60 FPS on an RTX 2080.",
-            GraphicsPreset::Quality => "Twice the full-detail radius and the longest far view.",
+            GraphicsPreset::Quality => "Twice the full-detail radius, and the far view reaches the whole world.",
         }
     }
 
     /// The preset these settings match, if any.
     pub fn of(s: &GameSettings) -> Option<GraphicsPreset> {
-        Self::ALL.into_iter().find(|p| p.distances() == (s.render_distance, s.lod_distance))
+        Self::ALL.into_iter().find(|p| p.distances() == (s.render_distance, s.lod_distance, s.whole_world))
     }
 
     pub fn apply(self, s: &mut GameSettings) {
-        (s.render_distance, s.lod_distance) = self.distances();
+        (s.render_distance, s.lod_distance, s.whole_world) = self.distances();
     }
 }
 
@@ -113,22 +117,29 @@ impl GameSettings {
         s
     }
 
-    /// The two view distances for the streamer in a world whose terrain is
-    /// magnified `terrain_scale` times (tall worlds). The LOD distance grows
-    /// with the terrain, so a 17,696-block world shows the same mountains
-    /// as a normal one, 46 × further away. That costs only a few more rings
-    /// (one per doubling of the distance), not 46² times the tiles.
-    pub fn layout(&self, terrain_scale: f64) -> Layout {
-        let lod = (self.lod_distance as f64 * terrain_scale.max(1.0)).round() as i32;
-        Layout {
-            detail: self.render_distance as i32,
-            lod: if self.lod_distance > self.render_distance { lod } else { 0 },
-        }
+    /// The view distances for the streamer in a world whose terrain is
+    /// magnified `terrain_scale` times (tall worlds) and is `world_chunks`
+    /// chunks across (its longer side), with the camera `altitude` chunks
+    /// above the ground. The LOD distance grows with the terrain, so a
+    /// 17,696-block world shows the same mountains as a normal one, 46 ×
+    /// further away. That costs only a few more rings (one per doubling of
+    /// the distance), not 46² times the tiles; so does the whole world.
+    pub fn layout(&self, terrain_scale: f64, world_chunks: i32, altitude: i32) -> Layout {
+        let detail = self.render_distance as i32;
+        let lod = if self.whole_world {
+            // From a corner, the opposite corner is one world width away.
+            world_chunks.max(detail + 1)
+        } else if self.lod_distance > self.render_distance {
+            (self.lod_distance as f64 * terrain_scale.max(1.0)).round() as i32
+        } else {
+            0
+        };
+        Layout { detail, lod, altitude: altitude.max(0) }
     }
 
     /// How far the view reaches, in blocks (where the fog ends).
-    pub fn view_distance_blocks(&self, terrain_scale: f64) -> f32 {
-        (self.layout(terrain_scale).lod.max(self.render_distance as i32) * 16) as f32
+    pub fn view_distance_blocks(&self, terrain_scale: f64, world_chunks: i32) -> f32 {
+        (self.layout(terrain_scale, world_chunks, 0).lod.max(self.render_distance as i32) as f32) * 16.0
     }
 
     pub fn save(&self) {
@@ -154,6 +165,21 @@ mod tests {
             assert_eq!(GraphicsPreset::of(&s), Some(p));
             assert!(s.render_distance <= MAX_RENDER_DISTANCE && s.lod_distance <= MAX_LOD_DISTANCE);
         }
+    }
+
+    #[test]
+    fn whole_world_reaches_across_the_world() {
+        let mut s = GameSettings::default();
+        assert_eq!(s.layout(1.0, 3_749_998, 0).lod, 128);
+        assert_eq!(s.layout(46.0, 3_749_998, 0).lod, 128 * 46);
+        s.whole_world = true;
+        let l = s.layout(1.0, 3_749_998, 7);
+        assert_eq!((l.lod, l.altitude), (3_749_998, 7));
+        // A 1 km world still gets LOD rings past the render distance.
+        assert!(s.layout(1.0, 63, 0).lod_enabled());
+        // Old settings files without the field load with it off.
+        let old: GameSettings = ron::from_str("(render_distance: 16, lod_distance: 64)").unwrap();
+        assert!(!old.whole_world);
     }
 
     #[test]

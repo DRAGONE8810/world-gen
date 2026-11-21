@@ -20,11 +20,27 @@
 //! never stalls. Meshes that are no longer wanted stay until the meshes
 //! replacing them are ready ([`Layout::draw_set`]), so moving never opens
 //! holes in the distance.
+//!
+//! ## Mesh cache
+//!
+//! A mesh that leaves the view is not deleted from the GPU straight away:
+//! it stays resident, undrawn, in a least-recently-used cache of
+//! [`CACHE_BYTES`]. Flying back, turning around a corner of the quadtree,
+//! or climbing and descending (which merges and splits whole rings) then
+//! reuses it instantly instead of generating it again. Only when the cache
+//! is full are the oldest meshes freed.
 
-use crate::lod::{mesh_tile, Layout, NodeKey};
+use crate::lod::{mesh_tile, FastMap, FastSet, Layout, NodeKey};
 use crate::mesh::{mesh_chunk, MeshData, Neighbours};
 use crate::render::MAX_UPLOADS_PER_FRAME;
-use std::collections::{HashMap, HashSet, VecDeque};
+
+/// GPU memory kept for meshes that are no longer drawn, in case they come
+/// back into view.
+pub const CACHE_BYTES: usize = 256 << 20;
+/// Mesh bytes handed to the renderer per frame (plus at most
+/// [`MAX_UPLOADS_PER_FRAME`] meshes), to keep frame times steady.
+pub const MAX_UPLOAD_BYTES_PER_FRAME: usize = 16 << 20;
+use std::collections::{BTreeMap, VecDeque};
 use std::sync::mpsc::{channel, Receiver, Sender};
 use std::sync::Arc;
 use worldgen::{Chunk, ChunkPos, WorldGenerator};
@@ -46,16 +62,24 @@ pub struct ChunkManager {
     tx: Sender<JobResult>,
     rx: Receiver<JobResult>,
     /// Block data of chunks near the camera (needed to mesh them).
-    chunks: HashMap<ChunkPos, Arc<Chunk>>,
-    generating: HashSet<ChunkPos>,
-    meshing: HashSet<NodeKey>,
+    chunks: FastMap<ChunkPos, Arc<Chunk>>,
+    generating: FastSet<ChunkPos>,
+    meshing: FastSet<NodeKey>,
     /// Meshes built but not handed to the renderer yet.
     finished: VecDeque<(NodeKey, MeshData)>,
     /// Meshes handed to the renderer (including empty ones it never sees).
-    ready: HashSet<NodeKey>,
+    ready: FastSet<NodeKey>,
+    /// GPU bytes of every mesh the renderer holds (ready or cached).
+    sizes: FastMap<NodeKey, usize>,
+    /// Meshes still on the GPU but not wanted: key → last-use tick, and
+    /// tick → key for least-recently-used eviction.
+    cached: FastMap<NodeKey, u64>,
+    lru: BTreeMap<u64, NodeKey>,
+    cached_bytes: usize,
+    tick: u64,
     /// The quadtree leaves for the current view, nearest first.
     leaves: Vec<NodeKey>,
-    leaf_set: HashSet<NodeKey>,
+    leaf_set: FastSet<NodeKey>,
     view: Option<(ChunkPos, Layout)>,
     /// Leaves before this index are all ready (scan shortcut).
     scan_from: usize,
@@ -82,6 +106,12 @@ pub struct Stats {
     pub pending: usize,
     /// Of which real chunks.
     pub pending_chunks: usize,
+    /// GPU memory of the meshes drawn or ready to draw.
+    pub mesh_bytes: usize,
+    /// GPU memory of cached meshes (out of view, kept for reuse).
+    pub cached_bytes: usize,
+    /// Meshes taken from the cache instead of being rebuilt.
+    pub cache_hits: u64,
 }
 
 impl ChunkManager {
@@ -98,18 +128,25 @@ impl ChunkManager {
             pool,
             tx,
             rx,
-            chunks: HashMap::new(),
-            generating: HashSet::new(),
-            meshing: HashSet::new(),
+            chunks: FastMap::default(),
+            generating: FastSet::default(),
+            meshing: FastSet::default(),
             finished: VecDeque::new(),
-            ready: HashSet::new(),
+            ready: FastSet::default(),
+            sizes: FastMap::default(),
+            cached: FastMap::default(),
+            lru: BTreeMap::new(),
+            cached_bytes: 0,
+            tick: 0,
             leaves: Vec::new(),
-            leaf_set: HashSet::new(),
+            leaf_set: FastSet::default(),
             view: None,
             scan_from: 0,
             draw: Vec::new(),
             draw_dirty: true,
-            max_in_flight: threads * 3,
+            // Enough queued work that no worker idles between two frames,
+            // even for tiles that take only a millisecond.
+            max_in_flight: threads * 8,
             started: std::time::Instant::now(),
             first_view_logged: false,
             stats: Stats::default(),
@@ -140,6 +177,34 @@ impl ChunkManager {
         let (x0, z0) = k.origin_block();
         let (x0, z0, n) = (x0 as i64, z0 as i64, k.size_blocks() as i64);
         x0 < hx && x0 + n > -hx && z0 < hz && z0 + n > -hz
+    }
+
+    /// Moves a mesh that is no longer wanted into the cache (an empty mesh
+    /// is just forgotten), then frees the least recently used cached
+    /// meshes until the cache fits its budget.
+    fn cache(&mut self, k: NodeKey, events: &mut Vec<MeshEvent>) {
+        let Some(&size) = self.sizes.get(&k) else { return };
+        self.tick += 1;
+        self.cached.insert(k, self.tick);
+        self.lru.insert(self.tick, k);
+        self.cached_bytes += size;
+        while self.cached_bytes > CACHE_BYTES {
+            let Some((_, old)) = self.lru.pop_first() else { break };
+            self.cached.remove(&old);
+            self.cached_bytes -= self.sizes.remove(&old).unwrap_or(0);
+            events.push(MeshEvent::Remove(old));
+        }
+    }
+
+    /// Takes `k` back from the cache: its mesh is still on the GPU, so it
+    /// is ready at once.
+    fn uncache(&mut self, k: NodeKey) -> bool {
+        let Some(tick) = self.cached.remove(&k) else { return false };
+        self.lru.remove(&tick);
+        self.cached_bytes -= self.sizes[&k];
+        self.ready.insert(k);
+        self.stats.cache_hits += 1;
+        true
     }
 
     /// Advances streaming. `center` is the camera's chunk.
@@ -178,32 +243,41 @@ impl ChunkManager {
         }
         // Hand at most what the renderer uploads in one frame, so "ready"
         // really means "on the GPU" and swaps never show a hole.
-        let mut uploads = 0;
-        while uploads < MAX_UPLOADS_PER_FRAME {
+        let (mut uploads, mut bytes) = (0, 0);
+        while uploads < MAX_UPLOADS_PER_FRAME && bytes < MAX_UPLOAD_BYTES_PER_FRAME {
             let Some((key, mesh)) = self.finished.pop_front() else { break };
             self.meshing.remove(&key);
-            if !self.leaf_set.contains(&key) || !self.ready.insert(key) {
+            if !self.leaf_set.contains(&key) || self.ready.contains(&key) {
                 continue;
             }
+            self.ready.insert(key);
             if !mesh.vertices.is_empty() {
+                let size = std::mem::size_of_val(mesh.vertices.as_slice());
+                self.sizes.insert(key, size);
+                bytes += size;
                 events.push(MeshEvent::Upload(key, mesh));
                 uploads += 1;
             }
             self.draw_dirty = true;
         }
 
-        // 3. Decide what to draw, and drop meshes nothing needs any more.
+        // 3. Decide what to draw. Meshes nothing needs any more go to the
+        // cache; the oldest cached ones are freed when it is full.
         if self.draw_dirty {
             self.draw = layout.draw_set(center, &in_world, &self.ready);
-            let drawn: HashSet<NodeKey> = self.draw.iter().copied().collect();
+            let drawn: FastSet<NodeKey> = self.draw.iter().copied().collect();
             let leaf_set = &self.leaf_set;
+            let mut dropped = Vec::new();
             self.ready.retain(|k| {
                 let keep = leaf_set.contains(k) || drawn.contains(k);
                 if !keep {
-                    events.push(MeshEvent::Remove(*k));
+                    dropped.push(*k);
                 }
                 keep
             });
+            for k in dropped {
+                self.cache(k, &mut events);
+            }
             self.draw_dirty = false;
         }
 
@@ -226,6 +300,11 @@ impl ChunkManager {
         for i in self.scan_from..self.leaves.len() {
             let key = self.leaves[i];
             if self.ready.contains(&key) {
+                continue;
+            }
+            // Back from the cache: ready at once, no job needed.
+            if self.uncache(key) {
+                self.draw_dirty = true;
                 continue;
             }
             pending += 1;
@@ -290,6 +369,8 @@ impl ChunkManager {
         self.stats.jobs_in_flight = self.in_flight();
         self.stats.pending = pending;
         self.stats.pending_chunks = pending_chunks;
+        self.stats.cached_bytes = self.cached_bytes;
+        self.stats.mesh_bytes = self.sizes.values().sum::<usize>() - self.cached_bytes;
         if pending == 0 && !self.first_view_logged {
             self.first_view_logged = true;
             log::info!(
@@ -307,6 +388,7 @@ impl ChunkManager {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::HashSet;
     use worldgen::{WorldSettings, WorldSize};
 
     #[test]
@@ -316,7 +398,7 @@ mod tests {
         let mut uploaded = HashSet::new();
         let center = ChunkPos::new(0, 0);
         for _ in 0..5000 {
-            for e in m.update(center, Layout { detail: 3, lod: 0 }) {
+            for e in m.update(center, Layout { detail: 3, lod: 0, altitude: 0 }) {
                 if let MeshEvent::Upload(p, _) = e {
                     assert!(uploaded.insert(p), "{p:?} meshed twice");
                 }
@@ -338,7 +420,7 @@ mod tests {
         let center = ChunkPos::new(31, 0);
         let mut uploaded = HashSet::new();
         for _ in 0..5000 {
-            for e in m.update(center, Layout { detail: 2, lod: 0 }) {
+            for e in m.update(center, Layout { detail: 2, lod: 0, altitude: 0 }) {
                 if let MeshEvent::Upload(p, _) = e {
                     uploaded.insert(p);
                 }
@@ -355,7 +437,7 @@ mod tests {
     /// Runs the streamer until everything for `layout` around `center` is
     /// ready; returns the keys uploaded.
     fn settle(m: &mut ChunkManager, center: ChunkPos, layout: Layout, live: &mut HashSet<NodeKey>) {
-        for _ in 0..20_000 {
+        for _ in 0..300_000 {
             for e in m.update(center, layout) {
                 match e {
                     MeshEvent::Upload(k, _) => assert!(live.insert(k), "{k:?} uploaded twice"),
@@ -374,13 +456,13 @@ mod tests {
     fn lod_rings_stream_swap_and_evict() {
         let gen = WorldGenerator::new(WorldSettings { seed: 42, size: WorldSize::full(), ..Default::default() });
         let mut m = ChunkManager::new(gen);
-        let layout = Layout { detail: 2, lod: 40 };
+        let layout = Layout { detail: 2, lod: 40, altitude: 0 };
         let mut live = HashSet::new();
         let a = ChunkPos::new(0, 0);
         settle(&mut m, a, layout, &mut live);
         assert!(live.iter().any(|k| k.level == 0) && live.iter().any(|k| k.level >= 2));
         // Everything drawn is on the GPU (or empty), and nothing overlaps.
-        let drawn: HashSet<NodeKey> = m.draw_list().iter().copied().collect();
+        let drawn: std::collections::HashSet<NodeKey> = m.draw_list().iter().copied().collect();
         assert_eq!(drawn.len(), m.draw_list().len());
         assert!(drawn.iter().all(|k| m.ready.contains(k)));
 
@@ -410,10 +492,114 @@ mod tests {
             }
             std::thread::sleep(std::time::Duration::from_millis(1));
         }
-        // Settled: the GPU holds exactly the new leaves (old ones evicted).
+        // Settled: the GPU holds the new leaves, plus old meshes in the
+        // cache, and nothing else.
         let leaves: HashSet<NodeKey> =
             layout.leaves(b, &|k| ChunkManager::in_world(m.generator(), k)).into_iter().collect();
-        assert!(live.iter().all(|k| leaves.contains(k)), "stale meshes left on the GPU");
+        assert!(live.iter().all(|k| leaves.contains(k) || m.cached.contains_key(k)), "stale meshes left on the GPU");
         assert!(m.ready.iter().all(|k| leaves.contains(k)));
+        assert!(!m.cached.is_empty() && m.cached.keys().all(|k| !m.ready.contains(k)));
+        assert_eq!(m.cached_bytes, m.cached.keys().map(|k| m.sizes[k]).sum::<usize>());
+
+        // Going back reuses cached meshes: far fewer uploads than the first time.
+        let before = m.stats.cache_hits;
+        let mut uploads = 0;
+        for _ in 0..20_000 {
+            for e in m.update(a, layout) {
+                match e {
+                    MeshEvent::Upload(k, _) => {
+                        uploads += 1;
+                        assert!(live.insert(k));
+                    }
+                    MeshEvent::Remove(k) => assert!(live.remove(&k)),
+                }
+            }
+            if m.stats.pending == 0 && m.stats.jobs_in_flight == 0 {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        let hits = m.stats.cache_hits - before;
+        assert!(hits as usize > uploads, "{hits} cache hits, {uploads} uploads");
+    }
+
+    #[test]
+    fn cache_frees_the_oldest_meshes_beyond_its_budget() {
+        let gen = WorldGenerator::new(WorldSettings { seed: 42, size: WorldSize::full(), ..Default::default() });
+        let mut m = ChunkManager::new(gen);
+        let mut events = Vec::new();
+        let key = |x| NodeKey { level: 3, x, z: 0 };
+        // Pretend three 100 MiB meshes were drawn, then left the view.
+        for x in 0..3 {
+            m.sizes.insert(key(x), 100 << 20);
+            m.cache(key(x), &mut events);
+        }
+        // 300 MiB > the 256 MiB budget: the oldest one went.
+        assert!(matches!(events.as_slice(), [MeshEvent::Remove(k)] if *k == key(0)));
+        assert_eq!(m.cached_bytes, 200 << 20);
+        assert!(m.uncache(key(1)) && m.ready.contains(&key(1)));
+        assert!(!m.uncache(key(0)));
+        assert_eq!(m.cached_bytes, 100 << 20);
+    }
+
+    /// Whole-world view of a 60,000 km world: how long it takes to build
+    /// and how much GPU memory it needs. `cargo test --release -p game
+    /// whole_world_view -- --ignored --nocapture`.
+    #[test]
+    #[ignore]
+    fn whole_world_view() {
+        for (label, settings) in [
+            ("classic", WorldSettings { seed: 42, size: WorldSize::full(), ..Default::default() }),
+            (
+                "realistic earth",
+                WorldSettings {
+                    seed: 42,
+                    size: WorldSize::full(),
+                    generator: worldgen::settings::Generator::Realistic,
+                    planet: worldgen::settings::Planet::Earth,
+                    ..Default::default()
+                }
+                .normalized(),
+            ),
+        ] {
+            let gen = WorldGenerator::new(settings);
+            let world = (gen.settings().size.width_blocks() / 16) as i32;
+            let (x, _, z) = gen.find_spawn();
+            let mut m = ChunkManager::new(gen);
+            let center = ChunkPos::from_block(x, z);
+            let mut live = HashSet::new();
+            for altitude in [0, 1_000, 100_000, 0] {
+                let layout = Layout { detail: 12, lod: world, altitude };
+                let t = std::time::Instant::now();
+                let mut busy = std::time::Duration::ZERO;
+                let mut calls = 0;
+                for _ in 0..300_000 {
+                    let u = std::time::Instant::now();
+                    let events = m.update(center, layout);
+                    busy += u.elapsed();
+                    calls += 1;
+                    for e in events {
+                        match e {
+                            MeshEvent::Upload(k, _) => assert!(live.insert(k)),
+                            MeshEvent::Remove(k) => assert!(live.remove(&k)),
+                        }
+                    }
+                    if m.stats.pending == 0 && m.stats.jobs_in_flight == 0 {
+                        break;
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(1));
+                }
+                eprintln!("  {calls} updates, {:.2} ms each on average", busy.as_secs_f64() * 1000.0 / calls as f64);
+                let tiles = m.ready.iter().filter(|k| k.level > 0).count();
+                eprintln!(
+                    "{label}, altitude {altitude} chunks: {:.1} s, {} chunks + {tiles} tiles, {:.0} MiB drawn, {:.0} MiB cached, {} cache hits",
+                    t.elapsed().as_secs_f64(),
+                    m.stats.meshed_chunks,
+                    m.stats.mesh_bytes as f64 / 1048576.0,
+                    m.stats.cached_bytes as f64 / 1048576.0,
+                    m.stats.cache_hits
+                );
+            }
+        }
     }
 }

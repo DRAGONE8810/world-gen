@@ -40,7 +40,7 @@ const FRAMES_IN_FLIGHT: usize = 2;
 /// Upper bound on chunk uploads per frame, to keep frame times steady.
 /// Mesh uploads recorded per frame. The streamer never hands over more,
 /// so everything it calls ready is on the GPU by the next draw.
-pub const MAX_UPLOADS_PER_FRAME: usize = 48;
+pub const MAX_UPLOADS_PER_FRAME: usize = 128;
 
 static VERT_SPV: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/terrain.vert.spv"));
 static FRAG_SPV: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/terrain.frag.spv"));
