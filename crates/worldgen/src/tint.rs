@@ -70,7 +70,8 @@ impl Tint {
         if let Some(i) = SPECIAL.iter().position(|&b| b == biome) {
             return Tint((CLIMATE + i) as u8);
         }
-        let t = effective_temperature(shape, surface_y);
+        // Measured at the foot of a regional pillar, like the biome.
+        let t = effective_temperature(shape, surface_y - shape.pillar as i32);
         let h = shape.climate.humidity;
         let step = |v: f64, (lo, hi): (f64, f64), n: usize| {
             (((v - lo) / (hi - lo)).clamp(0.0, 1.0) * (n - 1) as f64).round() as usize
@@ -125,6 +126,14 @@ pub fn canopy(biome: Biome, tint: Tint) -> (f64, [u8; 3]) {
             T::Cactus => (0.04, blocks::CACTUS.info().color),
             T::RedMushroom => (0.6, blocks::RED_MUSHROOM_BLOCK.info().color),
             T::BrownMushroom => (0.6, blocks::BROWN_MUSHROOM_BLOCK.info().color),
+            // Autumn maples: red, two in four orange, yellow.
+            T::Maple => (0.95, [204, 114, 40]),
+            T::AutumnBirch => (0.7, blocks::YELLOW_LEAVES.info().color),
+            T::Cherry => (0.95, blocks::CHERRY_LEAVES.info().color),
+            T::Palm => (0.45, blocks::PALM_LEAVES.info().color),
+            T::Baobab => (0.8, blocks::ACACIA_LEAVES.info().color),
+            T::Redwood => (0.7, blocks::SPRUCE_LEAVES.info().color),
+            T::Bamboo => (0.95, blocks::BAMBOO_LEAVES.info().color),
         };
         let w = w as f64;
         cover += w * crown;

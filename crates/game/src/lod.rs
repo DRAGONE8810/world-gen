@@ -383,7 +383,13 @@ pub fn mesh_tile(gen: &WorldGenerator, key: NodeKey) -> MeshData {
                 continue;
             }
             let color = block_color(c.block, c.tint);
+            let side = block_color(c.side, c.tint);
             let top = (c.top_y + 1) as f32;
+            // A wall more than two cells tall is a cliff (a pillar, a
+            // gorge, a mountain face): its top cell's height shows the
+            // top block, the rest the rock under it.
+            let cliff = 2.0 * s as f32;
+            let band = s as f32;
             // (di, dj, face, edge of tile?)
             for (di, dj, face) in [(1i32, 0i32, 0usize), (-1, 0, 1), (0, 1, 4), (0, -1, 5)] {
                 let (ni, nj) = ((i as i32 + 1 + di) as usize, (j as i32 + 1 + dj) as usize);
@@ -395,13 +401,26 @@ pub fn mesh_tile(gen: &WorldGenerator, key: NodeKey) -> MeshData {
                     continue;
                 }
                 let (x0, z0) = (i as f32, j as f32);
-                match face {
-                    // ±x faces: u = y, v = z.
-                    0 => emit_quad(&mut out, [x0 + 1.0, bottom, z0], 1, 2, top - bottom, 1.0, true, color, 0),
-                    1 => emit_quad(&mut out, [x0, bottom, z0], 1, 2, top - bottom, 1.0, false, color, 1),
-                    // ±z faces: u = x, v = y.
-                    4 => emit_quad(&mut out, [x0, bottom, z0 + 1.0], 0, 1, 1.0, top - bottom, true, color, 4),
-                    _ => emit_quad(&mut out, [x0, bottom, z0], 0, 1, 1.0, top - bottom, false, color, 5),
+                // Canopy above the ground keeps its colour; a ground cliff
+                // is rock below a top band.
+                let ground = ((c.ground_y + 1) as f32).clamp(bottom, top);
+                let parts = if ground - bottom > cliff && side != color {
+                    [(ground.max(bottom), top, color), (ground - band, ground, color), (bottom, ground - band, side)]
+                } else {
+                    [(bottom, top, color), (0.0, 0.0, color), (0.0, 0.0, color)]
+                };
+                for (lo, hi, col) in parts {
+                    if hi <= lo {
+                        continue;
+                    }
+                    match face {
+                        // ±x faces: u = y, v = z.
+                        0 => emit_quad(&mut out, [x0 + 1.0, lo, z0], 1, 2, hi - lo, 1.0, true, col, 0),
+                        1 => emit_quad(&mut out, [x0, lo, z0], 1, 2, hi - lo, 1.0, false, col, 1),
+                        // ±z faces: u = x, v = y.
+                        4 => emit_quad(&mut out, [x0, lo, z0 + 1.0], 0, 1, 1.0, hi - lo, true, col, 4),
+                        _ => emit_quad(&mut out, [x0, lo, z0], 0, 1, 1.0, hi - lo, false, col, 5),
+                    }
                 }
             }
         }
