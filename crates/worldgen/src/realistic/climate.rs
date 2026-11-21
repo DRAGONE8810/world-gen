@@ -305,6 +305,29 @@ pub fn biome_humidity(aridity: f64) -> f64 {
     C.with(|c| c.eval(l.clamp(-3.0, 1.0)))
 }
 
+/// Inverse of a rising function by bisection on `[lo, hi]`.
+fn invert(f: impl Fn(f64) -> f64, y: f64, mut lo: f64, mut hi: f64) -> f64 {
+    for _ in 0..50 {
+        let mid = 0.5 * (lo + hi);
+        if f(mid) < y {
+            lo = mid;
+        } else {
+            hi = mid;
+        }
+    }
+    0.5 * (lo + hi)
+}
+
+/// The biome code's temperature → °C (inverse of [`biome_temperature`]).
+pub fn temperature_from_biome(t: f64) -> f64 {
+    invert(biome_temperature, t, -40.0, 40.0)
+}
+
+/// The biome code's humidity → aridity index (inverse of [`biome_humidity`]).
+pub fn aridity_from_biome(h: f64) -> f64 {
+    libm::pow(10.0, invert(|l| biome_humidity(libm::pow(10.0, l)), h, -3.0, 1.0))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -352,5 +375,11 @@ mod tests {
         assert!(biome_temperature(-10.0) < -0.45 && biome_temperature(10.0) > -0.15);
         assert!(biome_humidity(0.1) < -0.33 && biome_humidity(2.0) > 0.33);
         assert!((biome_humidity(0.5) - -0.1).abs() < 0.01);
+        for t in [-30.0, -5.0, 3.0, 12.0, 19.0, 27.0] {
+            assert!((temperature_from_biome(biome_temperature(t)) - t).abs() < 0.01);
+        }
+        for a in [0.05, 0.3, 0.7, 1.2, 4.0] {
+            assert!((aridity_from_biome(biome_humidity(a)) / a - 1.0).abs() < 0.01);
+        }
     }
 }

@@ -97,6 +97,25 @@ blocks! {
     45 BROWN_MUSHROOM_BLOCK "brown_mushroom_block" [149, 111, 81] Opaque,
     // Step 7: coral sand of tropical beaches.
     46 WHITE_SAND         "white_sand"          [240, 233, 208]  Opaque,
+    // Step 8: trees of the new biomes.
+    47 CHERRY_LOG         "cherry_log"          [82, 50, 52]     Opaque,
+    48 CHERRY_LEAVES      "cherry_leaves"       [238, 168, 198]  Translucent,
+    49 RED_LEAVES         "red_maple_leaves"    [186, 52, 36]    Translucent,
+    50 ORANGE_LEAVES      "orange_maple_leaves" [218, 118, 34]   Translucent,
+    51 YELLOW_LEAVES      "yellow_leaves"       [226, 186, 52]   Translucent,
+    52 PALM_LEAVES        "palm_leaves"         [92, 162, 46]    Translucent,
+    53 BAOBAB_LOG         "baobab_log"          [152, 128, 108]  Opaque,
+    54 REDWOOD_LOG        "redwood_log"         [126, 56, 36]    Opaque,
+    55 BAMBOO             "bamboo"              [112, 166, 56]   Opaque,
+    56 BAMBOO_LEAVES      "bamboo_leaves"       [104, 178, 62]   Translucent,
+    // Step 8: grass in flower (a flat colour, no plant models).
+    57 POPPIES            "poppies"             [204, 46, 40]    Opaque,
+    58 DANDELIONS         "dandelions"          [234, 204, 52]   Opaque,
+    59 CORNFLOWERS        "cornflowers"         [82, 112, 218]   Opaque,
+    60 DAISIES            "daisies"             [236, 236, 226]  Opaque,
+    61 LAVENDER           "lavender"            [152, 112, 202]  Opaque,
+    62 PINK_PETALS        "pink_petals"         [240, 166, 196]  Opaque,
+    63 HEATHER            "heather"             [150, 88, 138]   Opaque,
 }
 
 impl BlockId {
@@ -120,6 +139,15 @@ impl BlockId {
     pub fn is_tree_part(self) -> bool {
         (blocks::OAK_LOG.0..=blocks::OAK_LEAVES.0).contains(&self.0)
             || (blocks::BIRCH_LOG.0..=blocks::BROWN_MUSHROOM_BLOCK.0).contains(&self.0)
+            || (blocks::CHERRY_LOG.0..=blocks::BAMBOO_LEAVES.0).contains(&self.0)
+    }
+    /// Grass in flower: a grass block covered by one colour of flowers.
+    pub fn is_flowers(self) -> bool {
+        (blocks::POPPIES.0..=blocks::HEATHER.0).contains(&self.0)
+    }
+    /// Grass, flowering or not: ground that plants grow on.
+    pub fn is_grassy(self) -> bool {
+        self == blocks::GRASS || self.is_flowers()
     }
     /// Leaves of any species (trees may grow their logs through these).
     pub fn is_leaves(self) -> bool {
@@ -132,6 +160,12 @@ impl BlockId {
                 | blocks::ACACIA_LEAVES
                 | blocks::DARK_OAK_LEAVES
                 | blocks::MANGROVE_LEAVES
+                | blocks::CHERRY_LEAVES
+                | blocks::RED_LEAVES
+                | blocks::ORANGE_LEAVES
+                | blocks::YELLOW_LEAVES
+                | blocks::PALM_LEAVES
+                | blocks::BAMBOO_LEAVES
         )
     }
     pub fn by_name(name: &str) -> Option<BlockId> {

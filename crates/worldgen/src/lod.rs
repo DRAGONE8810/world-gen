@@ -18,13 +18,21 @@
 //!   wins). With `s = 1` the result is exactly the top block of every column
 //!   of the real chunk; a test checks that.
 //! - **Large cells**: a cell holds many tree-grid cells, so it looks at the
-//!   one tree candidate in the middle. The share of cells that show canopy
-//!   then matches the forest's density, which is what you see from far
-//!   away, at a fraction of the cost.
+//!   one tree candidate in the middle.
+//!
+//! Either way a cell shows canopy only with the probability that the canopy
+//! covers it: a small cell counts the columns its trees cover, a large cell
+//! uses the crown area of its tree over the area of a tree-grid cell, and
+//! a hash of the cell decides. Otherwise one leaf anywhere in an 8-block
+//! cell would paint all of it green, and a forest would look much darker
+//! (and its edge would jump) where the LOD switches between cell sizes.
+//! The share of canopy cells then matches what the real blocks show at
+//! every cell size.
 
 use crate::biome::Biome;
 use crate::block::{blocks, BlockId};
 use crate::generator::{ColumnSample, WorldGenerator};
+use crate::rng::hash_position;
 use crate::tint::Tint;
 use crate::trees::{self, TREE_CELL, TREE_REACH};
 
@@ -41,6 +49,9 @@ pub struct LodColumn {
     pub top_y: i32,
     /// Block at `top_y`, for its colour.
     pub block: BlockId,
+    /// What the cell's ground shows in a cliff below its top: the rock
+    /// under the surface (the water itself over water).
+    pub side: BlockId,
     /// Biome of the ground.
     pub biome: Biome,
     /// Grass and leaf colour of the ground.
@@ -58,7 +69,8 @@ impl LodColumn {
         } else {
             (s.surface_y, s.top_block)
         };
-        Self { inside: s.inside, top_y, block, biome: s.biome, tint: s.tint, ground_y: s.surface_y }
+        let side = if s.underwater { block } else { s.side_block };
+        Self { inside: s.inside, top_y, block, side, biome: s.biome, tint: s.tint, ground_y: s.surface_y }
     }
 
     /// Applies one tree block the way chunk generation does: above the top
@@ -105,13 +117,21 @@ impl WorldGenerator {
                 if !self.settings().size.contains_column(tx, tz) {
                     continue;
                 }
-                if let Some(t) = trees::resolve(tx, tz, hash, s.biome, s.surface_y, s.top_block, self.max_y()) {
-                    let c = &mut out[i];
-                    trees::build(&t, &mut |_, y, _, b, is_log| {
+                if let Some(t) = self.resolve_tree(tx, tz, hash, s.surface_y, s.top_block, &s.shape) {
+                    let mut c = out[i];
+                    // Crown footprint: columns within TREE_REACH of the trunk.
+                    let mut footprint = [0u64; 2];
+                    trees::build(&t, &mut |wx, y, wz, b, is_log| {
+                        let bit = (wx - tx + TREE_REACH) + (wz - tz + TREE_REACH) * (2 * TREE_REACH + 1);
+                        footprint[bit as usize / 64] |= 1 << (bit % 64);
                         if y <= self.max_y() {
                             c.add_tree_block(y, b, is_log);
                         }
                     });
+                    let area = (footprint[0].count_ones() + footprint[1].count_ones()) as f64;
+                    if area / (TREE_CELL * TREE_CELL) as f64 > self.cover_roll(x, z, cell) {
+                        out[i] = c;
+                    }
                 }
             }
         }
@@ -123,6 +143,8 @@ impl WorldGenerator {
     /// chunk generation so equal-height overlaps resolve the same way.
     fn rasterise_trees(&self, x0: i32, z0: i32, cell: i32, n: usize, samples: &[ColumnSample], out: &mut [LodColumn]) {
         let span = cell * n as i32;
+        // Columns of each cell covered by a tree (cell² ≤ 64 bits).
+        let mut cover = vec![0u64; if cell > 1 { n * n } else { 0 }];
         let (x_lo, x_hi) = (x0 - TREE_REACH, x0 + span - 1 + TREE_REACH);
         let (z_lo, z_hi) = (z0 - TREE_REACH, z0 + span - 1 + TREE_REACH);
         let size = self.settings().size;
@@ -143,7 +165,7 @@ impl WorldGenerator {
                     fresh = self.sample_column(x, z);
                     &fresh
                 };
-                let Some(t) = trees::resolve(x, z, hash, s.biome, s.surface_y, s.top_block, self.max_y()) else {
+                let Some(t) = self.resolve_tree(x, z, hash, s.surface_y, s.top_block, &s.shape) else {
                     continue;
                 };
                 trees::build(&t, &mut |wx, wy, wz, b, is_log| {
@@ -152,11 +174,33 @@ impl WorldGenerator {
                     }
                     let (ix, iz) = ((wx - x0).div_euclid(cell), (wz - z0).div_euclid(cell));
                     if (0..n as i32).contains(&ix) && (0..n as i32).contains(&iz) {
-                        out[ix as usize + iz as usize * n].add_tree_block(wy, b, is_log);
+                        let i = ix as usize + iz as usize * n;
+                        out[i].add_tree_block(wy, b, is_log);
+                        if cell > 1 {
+                            let (bx, bz) = (wx - x0 - ix * cell, wz - z0 - iz * cell);
+                            cover[i] |= 1 << (bx + bz * cell);
+                        }
                     }
                 });
             }
         }
+        // A cell shows its trees with the share of its columns they cover.
+        // (1-block cells are covered entirely or not at all: exact.)
+        let area = (cell * cell) as f64;
+        for (i, mask) in cover.iter().enumerate() {
+            let (ix, iz) = ((i % n) as i32, (i / n) as i32);
+            let (x, z) = (x0 + ix * cell, z0 + iz * cell);
+            if *mask != 0 && mask.count_ones() as f64 / area <= self.cover_roll(x, z, cell) {
+                out[i] = LodColumn::from_sample(&samples[i]);
+            }
+        }
+    }
+
+    /// Uniform 0..1 per LOD cell (by its position and size) that decides
+    /// whether the cell shows the canopy covering part of it.
+    fn cover_roll(&self, x: i32, z: i32, cell: i32) -> f64 {
+        (hash_position(self.tree_seed() ^ 0x10D_C0FE, x.div_euclid(cell), cell, z.div_euclid(cell)) >> 11) as f64
+            / (1u64 << 53) as f64
     }
 }
 
@@ -287,8 +331,13 @@ mod tests {
         for (x, z) in [(96, -672), (-1984, -2208)] {
             let exact = canopy_share(&g.lod_grid(x - 48, z - 48, 1, 96));
             let coarse = canopy_share(&g.lod_grid(x - 256, z - 256, 16, 32));
-            eprintln!("({x}, {z}): exact {exact:.3}, 16-block cells {coarse:.3}");
+            // Small cells rasterise real trees but must not paint a whole
+            // cell green for one leaf (the forest would darken where the
+            // LOD switches cell size).
+            let small = canopy_share(&g.lod_grid(x - 48, z - 48, 8, 12));
+            eprintln!("({x}, {z}): exact {exact:.3}, 8-block cells {small:.3}, 16-block cells {coarse:.3}");
             assert!((exact - coarse).abs() < 0.2, "({x}, {z}): exact {exact:.3} vs coarse {coarse:.3}");
+            assert!((exact - small).abs() < 0.1, "({x}, {z}): exact {exact:.3} vs 8-block cells {small:.3}");
         }
     }
 

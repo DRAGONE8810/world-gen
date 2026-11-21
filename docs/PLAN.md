@@ -17,6 +17,7 @@ seed when it is needed, so a 60,000 km world costs the same as a 1 km one.
 | 5 | Realistic generator: whole-planet simulation (plate tectonics, climate, rivers, erosion, lakes), planets Continents / Pangea / Earth / Islands, simulation quality, graphics presets | **Done**, see [devlog 05](devlog/05-realistic.md) |
 | 6 | Whole-world far view: LOD to the world border and orbit, detail by height above ground, GPU mesh cache, faster tiles and bookkeeping | **Done**, see [devlog 06](devlog/06-far-view.md); RTX 2080 frame-rate check pending |
 | 7 | Coasts, continents and colours: no sea walls, LOD to 256k chunks, planned continents, beach types and sub-biomes, climate-blended grass, satellite map with clouds, random seed | **Done**, see [devlog 07](devlog/07-coasts-and-colours.md) |
+| 8 | Biome transitions and variety: dithered transition zones (ground and tree species), climate-chart biome classification, 15 new biomes incl. mangroves, autumn, cherry and flower biomes, rare regional landscapes (pillar forests, baobabs, redwoods, bamboo, …), consistent far-view canopy, sharp tiled world map | **Done** (in review), see [devlog 08](devlog/08-biome-transitions.md) |
 
 ## Step 1: Foundation ✔
 
@@ -168,5 +169,25 @@ Pending: frame rate on an RTX 2080; a screen-space error metric.
   borders fade instead of jumping; +0.3 % quads.
 - ✔ World map like a satellite photo: canopy colours, soft borders, hill
   shading, shelf colours, optional clouds with opacity.
+
+## Step 8: Biome transitions and variety ✔
+
+- ✔ Transition zones between all biomes: the climate is dithered before
+  the biome is chosen, so both sides interleave with a probability that
+  changes linearly across the zone (87–92 % of borders interleave).
+- ✔ Tree species dither on their own: oaks and spruces mix in proportion
+  to the distance to each side.
+- ✔ Biomes by temperature × rainfall target points (Whittaker chart,
+  after Devote's *Planet Architect*), polar ice sheets, páramo and cloud
+  forest by altitude.
+- ✔ 15 new biomes (71 in all): mangroves, autumn forest, mixed forest,
+  flower plains, thorn scrub, dry tropical forest, páramo, ice sheet, and
+  regional cherry groves, pillar forests, baobab savannas, redwoods,
+  bamboo, outback, lavender; salt pans as a region too. New trees and
+  flower carpets.
+- ✔ Far-view canopy follows tree coverage at every LOD cell size (no
+  straight colour seams).
+- ✔ World map in tiles per zoom level, no blur; clouds fade when zoomed
+  in; hover shows °C and mm/yr.
 
 Next: clouds in the world; RTX 2080 frame-rate check.

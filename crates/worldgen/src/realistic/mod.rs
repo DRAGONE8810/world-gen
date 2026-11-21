@@ -391,6 +391,19 @@ impl RealisticWorld {
     pub fn latitude(&self, z: i32) -> f64 {
         90.0 - (z as f64 - self.z0) / (self.cell_blocks * self.h as f64) * 180.0
     }
+    /// Mean annual temperature (°C, at the column's height) and rainfall
+    /// (mm a year) of a column, in real units for the HUD and the map:
+    /// the inverse of the scales the biome rules use.
+    pub fn climate_at(&self, shape: &Shape, surface_y: i32) -> (f64, f64) {
+        let t = climate::temperature_from_biome(crate::biome::effective_temperature(shape, surface_y));
+        let aridity = climate::aridity_from_biome(shape.climate.humidity);
+        (t, aridity * climate::potential_evaporation(t))
+    }
+    /// "18 °C · 850 mm/yr": the column's climate in real units.
+    pub fn describe_climate(&self, shape: &Shape, surface_y: i32) -> String {
+        let (t, p) = self.climate_at(shape, surface_y);
+        format!("{t:.0} °C · {:.0} mm/yr", (p / 10.0).round() * 10.0)
+    }
     /// Number of river reaches (for tests and statistics).
     pub fn river_count(&self) -> usize {
         self.reaches.len()
@@ -650,10 +663,17 @@ impl RealisticWorld {
         // winds, cloud), which keeps the sea-ice edge and the biome borders
         // from following the latitude lines exactly.
         let t_noise = (self.variety.sample_2d(xk / 900.0 + 31.0, zk / 900.0 - 7.0) * 2.2).clamp(-1.0, 1.0);
-        let t_c = self.temperature.bilinear(wu, wv) + 3.5 * t_noise;
+        // Finer weather (valleys, slopes facing the sun, lakes): ~1 °C and
+        // a few % of rain over tens of km. Together with bicubic
+        // interpolation it keeps biome borders, which follow these fields,
+        // from running in the straight segments of the simulation grid.
+        let fine = self.variety.sample_2d(xk / 150.0 + 5.0, zk / 150.0 - 3.0)
+            + 0.5 * self.variety.sample_2d(xk / 18.0 - 11.0, zk / 18.0 + 7.0);
+        let t_c = self.temperature.bicubic(wu, wv) + 3.5 * t_noise + 1.2 * fine;
         let alt_norm = (e.max(0.0) / M_PER_NORMALIZED_BLOCK - 15.0).max(0.0);
         let temperature = climate::biome_temperature(t_c) - 0.49 * alt_norm / 160.0;
-        let mut humidity = self.humidity.bilinear(wu, wv);
+        let h_noise = self.variety.sample_2d(xk / 1200.0 - 13.0, zk / 1200.0 + 29.0) + 0.8 * fine;
+        let mut humidity = self.humidity.bicubic(wu, wv) + 0.09 * h_noise;
         // Bitter cold land is buried under snow and ice (Antarctica,
         // Greenland) instead of bare tundra: snowy biomes need some humidity.
         let deep_cold = smoothstep(-0.85, -1.05, temperature);
@@ -685,6 +705,7 @@ impl RealisticWorld {
             island: 0.0,
             vscale: self.norm_scale,
             water: water_y,
+            ..Shape::default()
         }
     }
 }

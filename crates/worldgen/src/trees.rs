@@ -35,7 +35,7 @@ pub const TREE_CELL: i32 = 5;
 /// The farthest any tree block reaches horizontally from its trunk origin.
 pub const TREE_REACH: i32 = 4;
 /// The highest any tree block reaches above the ground it stands on.
-pub const TREE_HEADROOM: i32 = 30;
+pub const TREE_HEADROOM: i32 = 40;
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Hash)]
 pub enum TreeKind {
@@ -51,6 +51,17 @@ pub enum TreeKind {
     RedMushroom,
     BrownMushroom,
     Bush,
+    /// Maple in autumn colours (red, orange or yellow by tree).
+    Maple,
+    /// Birch in autumn: yellow leaves.
+    AutumnBirch,
+    Cherry,
+    Palm,
+    Baobab,
+    /// Coast redwood / giant sequoia: 2×2 trunk, very tall, narrow crown.
+    Redwood,
+    /// A clump of bamboo canes.
+    Bamboo,
 }
 
 /// A resolved tree: species, trunk base (the first log above the ground)
@@ -71,7 +82,21 @@ pub fn biome_trees(biome: Biome) -> (f64, &'static [(TreeKind, u32)]) {
     use TreeKind as T;
     match biome {
         Plains => (0.03, &[(T::Oak, 9), (T::Bush, 1)]),
+        FlowerPlains => (0.02, &[(T::Oak, 2), (T::Birch, 1), (T::Bush, 1)]),
         Meadow => (0.02, &[(T::Oak, 1), (T::Birch, 1)]),
+        MixedForest => (0.65, &[(T::Spruce, 5), (T::Oak, 3), (T::Birch, 2), (T::Maple, 1)]),
+        AutumnForest => (0.6, &[(T::Maple, 5), (T::AutumnBirch, 2), (T::Oak, 3), (T::Spruce, 1)]),
+        CherryGrove => (0.35, &[(T::Cherry, 1)]),
+        LavenderFields => (0.01, &[(T::Oak, 1)]),
+        ThornScrub => (0.12, &[(T::Bush, 4), (T::Acacia, 1), (T::Cactus, 1)]),
+        TropicalDryForest => (0.45, &[(T::Acacia, 2), (T::Jungle, 1), (T::Oak, 2), (T::Bush, 2)]),
+        BaobabSavanna => (0.07, &[(T::Baobab, 2), (T::Acacia, 1), (T::Bush, 1)]),
+        BambooForest => (0.85, &[(T::Bamboo, 6), (T::Jungle, 1)]),
+        RedwoodForest => (0.6, &[(T::Redwood, 3), (T::TallSpruce, 1), (T::Spruce, 1)]),
+        // Pines cling to the pillar tops; jungle in the gorges.
+        PillarKarst => (0.45, &[(T::Spruce, 3), (T::Jungle, 1), (T::Bush, 2)]),
+        Outback => (0.02, &[(T::Bush, 3), (T::Acacia, 1)]),
+        Paramo => (0.02, &[(T::Bush, 1)]),
         Forest => (0.6, &[(T::Oak, 8), (T::Birch, 2)]),
         FlowerForest => (0.35, &[(T::Oak, 1), (T::Birch, 1)]),
         BirchForest => (0.6, &[(T::Birch, 1)]),
@@ -97,7 +122,7 @@ pub fn biome_trees(biome: Biome) -> (f64, &'static [(TreeKind, u32)]) {
         MangroveSwamp => (0.6, &[(T::Mangrove, 1)]),
         MushroomFields => (0.05, &[(T::RedMushroom, 1), (T::BrownMushroom, 1)]),
         CoastalDunes => (0.01, &[(T::Bush, 1)]),
-        TropicalBeach => (0.03, &[(T::Bush, 2), (T::Jungle, 1)]),
+        TropicalBeach => (0.08, &[(T::Palm, 4), (T::Bush, 1)]),
         RockyDesert => (0.01, &[(T::Cactus, 1), (T::Bush, 1)]),
         Bog => (0.12, &[(T::Spruce, 3), (T::Bush, 1)]),
         Moor => (0.02, &[(T::Bush, 3), (T::Spruce, 1)]),
@@ -141,14 +166,23 @@ pub fn resolve(x: i32, z: i32, hash: u64, biome: Biome, surface_y: i32, top: Blo
 
     let ground_ok = match kind {
         TreeKind::Cactus => top == blocks::SAND || top == blocks::RED_SAND,
-        TreeKind::Mangrove => top == blocks::MUD || top == blocks::GRASS,
+        TreeKind::Mangrove => top == blocks::MUD || top.is_grassy(),
+        TreeKind::Palm => top.is_grassy() || matches!(top, blocks::SAND | blocks::WHITE_SAND),
         TreeKind::RedMushroom | TreeKind::BrownMushroom => {
-            matches!(top, blocks::MYCELIUM | blocks::GRASS | blocks::PODZOL)
+            top.is_grassy() || matches!(top, blocks::MYCELIUM | blocks::PODZOL)
         }
-        _ => matches!(
-            top,
-            blocks::GRASS | blocks::DIRT | blocks::PODZOL | blocks::COARSE_DIRT | blocks::SNOW | blocks::MUD
-        ),
+        _ => {
+            top.is_grassy()
+                || matches!(
+                    top,
+                    blocks::DIRT
+                        | blocks::PODZOL
+                        | blocks::COARSE_DIRT
+                        | blocks::SNOW
+                        | blocks::MUD
+                        | blocks::LIMESTONE
+                )
+        }
     };
     if !ground_ok {
         return None;
@@ -336,6 +370,127 @@ pub fn build(tree: &Tree, emit: &mut dyn FnMut(i32, i32, i32, BlockId, bool)) {
             disc(&mut leaves, &mut rng, 0.0, 0.0, 0, 1.5, blocks::OAK_LEAVES);
             disc(&mut leaves, &mut rng, 0.0, 0.0, 1, 1.0, blocks::OAK_LEAVES);
         }
+        TreeKind::Maple | TreeKind::AutumnBirch => {
+            // Round crowns in the colours of a New England or Japanese
+            // autumn; each tree has its own.
+            let (lb, fb, h) = if tree.kind == TreeKind::Maple {
+                let fb = [blocks::RED_LEAVES, blocks::ORANGE_LEAVES, blocks::ORANGE_LEAVES, blocks::YELLOW_LEAVES]
+                    [rng.next_bounded(4) as usize];
+                (blocks::OAK_LOG, fb, 5 + rng.next_bounded(3) as i32)
+            } else {
+                (blocks::BIRCH_LOG, blocks::YELLOW_LEAVES, 5 + rng.next_bounded(3) as i32)
+            };
+            for dy in 0..h {
+                logs.push((0, dy, 0, lb));
+            }
+            let top = h - 1;
+            disc(&mut leaves, &mut rng, 0.0, 0.0, top - 2, 2.0, fb);
+            disc(&mut leaves, &mut rng, 0.0, 0.0, top - 1, 2.7, fb);
+            disc(&mut leaves, &mut rng, 0.0, 0.0, top, 2.4, fb);
+            disc(&mut leaves, &mut rng, 0.0, 0.0, top + 1, 1.5, fb);
+        }
+        TreeKind::Cherry => {
+            // A short trunk that forks, under a wide, flat cloud of blossom.
+            let h = 4 + rng.next_bounded(2) as i32;
+            for dy in 0..h {
+                logs.push((0, dy, 0, blocks::CHERRY_LOG));
+            }
+            let (sx, sz) = [(1, 0), (-1, 0), (0, 1), (0, -1)][rng.next_bounded(4) as usize];
+            logs.push((sx, h - 1, sz, blocks::CHERRY_LOG));
+            logs.push((-sx, h, -sz, blocks::CHERRY_LOG));
+            disc(&mut leaves, &mut rng, 0.0, 0.0, h - 1, 3.0, blocks::CHERRY_LEAVES);
+            disc(&mut leaves, &mut rng, 0.0, 0.0, h, 3.2, blocks::CHERRY_LEAVES);
+            disc(&mut leaves, &mut rng, 0.0, 0.0, h + 1, 2.2, blocks::CHERRY_LEAVES);
+            // A few blossoms hang below the crown.
+            for _ in 0..4 {
+                let (dx, dz) = (rng.next_bounded(5) as i32 - 2, rng.next_bounded(5) as i32 - 2);
+                leaves.push((dx, h - 2, dz, blocks::CHERRY_LEAVES));
+            }
+        }
+        TreeKind::Palm => {
+            // A slender trunk that leans one block halfway up, and a crown
+            // of fronds arching out and down.
+            let h = 6 + rng.next_bounded(4) as i32;
+            let (sx, sz) = [(1, 0), (-1, 0), (0, 1), (0, -1)][rng.next_bounded(4) as usize];
+            let lean = |dy: i32| if dy >= h / 2 { (sx, sz) } else { (0, 0) };
+            for dy in 0..h {
+                let (lx, lz) = lean(dy);
+                logs.push((lx, dy, lz, blocks::JUNGLE_LOG));
+            }
+            let (cx, cz) = (sx, sz);
+            leaves.push((cx, h, cz, blocks::PALM_LEAVES));
+            for (dx, dz) in [(1, 0), (-1, 0), (0, 1), (0, -1), (1, 1), (-1, -1), (1, -1), (-1, 1)] {
+                let diag = dx != 0 && dz != 0;
+                let reach = if diag { 2 } else { 3 };
+                for k in 1..=reach {
+                    let droop = if k == reach { -1 } else { 0 };
+                    leaves.push((cx + dx * k, h - 1 + droop + (k == 1) as i32, cz + dz * k, blocks::PALM_LEAVES));
+                }
+            }
+        }
+        TreeKind::Baobab => {
+            // A bottle-shaped trunk (a cross three blocks wide, narrowing
+            // at the top) with a few short branches and a flat crown.
+            let h = 6 + rng.next_bounded(3) as i32;
+            for dy in 0..h {
+                logs.push((0, dy, 0, blocks::BAOBAB_LOG));
+                if dy < h - 2 {
+                    for (dx, dz) in [(1, 0), (-1, 0), (0, 1), (0, -1)] {
+                        logs.push((dx, dy, dz, blocks::BAOBAB_LOG));
+                    }
+                }
+            }
+            for (dx, dz) in [(1, 0), (-1, 0), (0, 1), (0, -1)] {
+                if rng.next_bounded(3) > 0 {
+                    logs.push((dx, h, dz, blocks::BAOBAB_LOG));
+                    logs.push((dx * 2, h + 1, dz * 2, blocks::BAOBAB_LOG));
+                }
+            }
+            disc(&mut leaves, &mut rng, 0.0, 0.0, h + 1, 3.0, blocks::ACACIA_LEAVES);
+            disc(&mut leaves, &mut rng, 0.0, 0.0, h + 2, 2.0, blocks::ACACIA_LEAVES);
+        }
+        TreeKind::Redwood => {
+            // 2×2 trunk rising bare for half its height, then a narrow,
+            // slightly ragged cone.
+            let h = 22 + rng.next_bounded(11) as i32;
+            for dy in 0..h {
+                for (dx, dz) in [(0, 0), (1, 0), (0, 1), (1, 1)] {
+                    logs.push((dx, dy, dz, blocks::REDWOOD_LOG));
+                }
+            }
+            leaves.push((0, h, 0, blocks::SPRUCE_LEAVES));
+            leaves.push((1, h, 1, blocks::SPRUCE_LEAVES));
+            for (k, dy) in (h * 11 / 20..h).rev().enumerate() {
+                let base = (1.4 + k as f64 * 0.09).min(2.6);
+                let r = if k % 3 == 2 { base - 0.7 } else { base };
+                disc(&mut leaves, &mut rng, 0.5, 0.5, dy, r, blocks::SPRUCE_LEAVES);
+            }
+        }
+        TreeKind::Bamboo => {
+            // A clump of canes of different heights, leafy near the top.
+            let canes = 3 + rng.next_bounded(4) as usize;
+            let mut spots = vec![(0, 0)];
+            while spots.len() < canes {
+                let p = (rng.next_bounded(5) as i32 - 2, rng.next_bounded(5) as i32 - 2);
+                if !spots.contains(&p) {
+                    spots.push(p);
+                }
+            }
+            for (dx, dz) in spots {
+                let h = 8 + rng.next_bounded(8) as i32;
+                for dy in 0..h {
+                    logs.push((dx, dy, dz, blocks::BAMBOO));
+                }
+                for dy in h - 3..=h {
+                    for (lx, lz) in [(1, 0), (-1, 0), (0, 1), (0, -1)] {
+                        if rng.next_bounded(3) > 0 {
+                            leaves.push((dx + lx, dy, dz + lz, blocks::BAMBOO_LEAVES));
+                        }
+                    }
+                }
+                leaves.push((dx, h, dz, blocks::BAMBOO_LEAVES));
+            }
+        }
     }
 
     // Logs first so that, within one tree, leaves never cover the trunk.
@@ -351,7 +506,7 @@ pub fn build(tree: &Tree, emit: &mut dyn FnMut(i32, i32, i32, BlockId, bool)) {
 mod tests {
     use super::*;
 
-    const KINDS: [TreeKind; 12] = [
+    const KINDS: [TreeKind; 19] = [
         TreeKind::Oak,
         TreeKind::Birch,
         TreeKind::Spruce,
@@ -364,6 +519,13 @@ mod tests {
         TreeKind::RedMushroom,
         TreeKind::BrownMushroom,
         TreeKind::Bush,
+        TreeKind::Maple,
+        TreeKind::AutumnBirch,
+        TreeKind::Cherry,
+        TreeKind::Palm,
+        TreeKind::Baobab,
+        TreeKind::Redwood,
+        TreeKind::Bamboo,
     ];
 
     #[test]

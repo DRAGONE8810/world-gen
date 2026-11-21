@@ -6,6 +6,7 @@
 //! Module map:
 //! * [`biome`] – picks the biome of a column from its climate
 //! * [`trees`] – jittered-grid tree placement and tree shapes
+//! * [`region`] – rare regional landscapes (pillar forests, cherry groves, …)
 //! * [`rng`] – seeded random numbers and positional hashing
 //! * [`noise`] – Perlin noise and fractal (octave) noise
 //! * [`block`] – block ids and their properties
@@ -25,6 +26,7 @@ pub mod lod;
 pub mod noise;
 pub mod palette;
 pub mod realistic;
+pub mod region;
 pub mod rng;
 pub mod settings;
 pub mod spline;

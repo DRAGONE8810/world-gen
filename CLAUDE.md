@@ -26,23 +26,27 @@ Platforms: Windows and Linux required, macOS (MoltenVK) nice to have.
 
 ```
 crates/worldgen   Pure generator library. NO graphics, NO windowing, NO I/O.
-                  rng, noise, spline, terrain, biome, trees, block,
-                  palette, chunk, settings, generator, lod (far-view sampling),
+                  rng, noise, spline, terrain, biome, trees, region (rare
+                  regional landscapes), block, palette, chunk, settings,
+                  generator, lod (far-view sampling),
                   realistic/ (second generator: tectonics, climate, erosion,
                   earth relief + lakes, grid). data/earth_relief.bin is NOAA
                   ETOPO 2022 at 0.1°, compiled in (make_earth_relief.py).
                   examples/noise_stats calibrates noise;
                   examples/find_biome finds the nearest column of a biome;
                   examples/planet_stats prints realistic climate statistics;
-                  examples/continent_stats compares continent shapes with Earth.
+                  examples/continent_stats compares continent shapes with Earth;
+                  examples/biome_stats prints biome shares and how much
+                  biome borders interleave.
                   tint: grass/foliage colour from the climate.
 crates/wg-map     CLI: renders top-down PNG maps straight from the generator,
                   and benchmarks chunk generation. Use it to check accuracy.
 crates/game       Binary `world-gen`: winit window, egui menus, ash/Vulkan
                   renderer (render/: GPU-driven, pool.rs range allocator),
                   binary greedy mesher (mesh.rs), LOD quadtree + tile mesher
-                  (lod.rs), chunk/tile streaming (world.rs), world map (map.rs).
-docs/PLAN.md      The roadmap (steps 1–6) and its status.
+                  (lod.rs), chunk/tile streaming (world.rs), world map (map.rs:
+                  256-px tiles per zoom level, built on a worker, LRU cache).
+docs/PLAN.md      The roadmap (steps 1–8) and its status.
 docs/devlog/      One log per step: detailed technical write-up + a short
                   plain-language summary for non-programmers.
 ```
@@ -63,6 +67,8 @@ cargo run --release -p wg-map -- --seed 42 --bench 32   # ms per chunk and per L
 cargo run --release -p worldgen --example noise_stats   # climate noise percentiles
 cargo run --release -p worldgen --example find_biome -- 42 jungle   # where to put WG_CAMERA
 cargo run --release -p worldgen --example find_biome -- 42 snowy_slopes 17696   # in a tall world
+cargo run --release -p worldgen --example find_biome -- 42 cherry_grove 17696 continents   # on a planet
+cargo run --release -p worldgen --example biome_stats -- 42 [continents]   # biome shares, border interleaving
 cargo run --release -p wg-map -- --seed 42 --realistic earth --size-km 40000 --height 17696 --whole
 cargo run --release -p worldgen --example planet_stats -- 42 continents   # aridity classes vs Earth
 cargo run --release -p worldgen --example continent_stats -- continents 1 12   # continents, coasts vs Earth (WG_DUMP=dir writes PGMs)
@@ -106,10 +112,20 @@ render distance etc.
   `(H − y) + A·N > 0` on a 4×8×4 interpolation grid. Tune the world by
   editing curve tables, then check with `wg-map` layers and the statistics
   tests in `generator.rs`.
-- **Biomes** are a pure function of the climate (+ temperature, humidity)
-  and the final surface height (`biome::select`). Surface blocks come from
-  `surface_for(.., biome)`. Every biome must stay reachable: a test fails
-  if one never appears over 48 km.
+- **Biomes** are a pure function of the climate (+ temperature, humidity),
+  the final surface height and the column's region (`biome::select`).
+  Lowland biomes are the nearest `LOWLAND` target point in temperature ×
+  humidity. Surface blocks come from `surface_for(.., biome)`. Every biome
+  must stay reachable: a test fails if one never appears over 48 km.
+- **Transitions:** chunks, `sample_column` and LODs choose the biome with
+  `select_with(.., &Jitter)` from `BiomeDither::ground` (and trees with
+  `BiomeDither::tree` via `resolve_tree`), never from the raw climate, so
+  borders are interleaved zones. Keep any new biome rule inside
+  `select_with` so it gets dithered too.
+- **Regions** (`region.rs`): a warped Voronoi of rare flavours (cherry,
+  pillars, baobab, …) in `Shape.region`; `biome::regional` maps host biomes.
+  Pillars also raise the terrain (`Shape.pillar`, subtracted again for
+  climate-by-altitude).
 - **Grass colour** is a `Tint` (one byte per column: a climate colour map,
   or a few special biomes), not the biome, so borders fade. Chunks,
   `ColumnSample` and `LodColumn` all carry it from `Tint::of`; the mesher
@@ -126,6 +142,9 @@ render distance etc.
 - **LODs:** `WorldGenerator::lod_grid` is the only source of far terrain;
   at 1-block cells it must equal the generated chunk's top blocks (tested),
   so any generator change that breaks that test must be mirrored there.
+  Canopy in LOD cells is shown with the probability that trees cover the
+  cell (`cover_roll`), so forests look the same at every cell size.
+  `LodColumn::side` (from `ColumnSample::side_block`) colours cliff walls.
   The game's quadtree (`lod.rs`) must keep its leaves gap- and overlap-free
   and `draw_set` must never draw a mesh that isn't uploaded (tested).
   Levels go to `MAX_LEVEL` = 22 so the whole 60,000 km world fits

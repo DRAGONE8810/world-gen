@@ -29,6 +29,7 @@
 //! mushroom-field biomes.
 
 use crate::noise::{DoubleNoise, OctaveConfig};
+use crate::region::Region;
 use crate::rng::derive_seed;
 use crate::settings::{WorldType, SEA_LEVEL};
 use crate::spline::{lerp, smoothstep, Curve};
@@ -72,6 +73,12 @@ pub struct Shape {
     /// rivers and lakes of realistic worlds, which lie above the sea.
     /// Every air block at or below it is water.
     pub water: i32,
+    /// The rare regional landscape this column belongs to, if any (set by
+    /// the generator, not the shapers).
+    pub region: Region,
+    /// Height (blocks) a regional pillar adds to this column; the biome
+    /// rules measure altitude without it.
+    pub pillar: f64,
 }
 
 impl Default for Shape {
@@ -84,6 +91,8 @@ impl Default for Shape {
             island: 0.0,
             vscale: 0.0,
             water: SEA_LEVEL,
+            region: Region::NONE,
+            pillar: 0.0,
         }
     }
 }
@@ -303,7 +312,7 @@ impl TerrainShaper {
             roughness *= self.vscale;
         }
 
-        Shape { climate, height, roughness, river, island, vscale: self.vscale, water: SEA_LEVEL }
+        Shape { climate, height, roughness, river, island, vscale: self.vscale, ..Shape::default() }
     }
 }
 
