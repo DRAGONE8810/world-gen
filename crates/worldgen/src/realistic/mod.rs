@@ -605,8 +605,16 @@ impl RealisticWorld {
         // and coasts follow the terrain instead of the grid. (A per-cell
         // sea mask used here once cut the sea off in straight lines.)
         let basin = self.basin.bilinear(wu, wv);
-        if basin > 0.5 && lake.is_none_or(|(_, m)| m < 0.5) && height < SEA_LEVEL as f64 {
-            water = f64::NEG_INFINITY;
+        if basin > 0.25 && lake.is_none_or(|(_, m)| m < 0.5) {
+            // The terrain between grid cells can still dip below the sea
+            // across that contour, so the basin gets a rim: just outside
+            // it the land is lifted to sea level, and the sea and the dry
+            // depression never meet.
+            let rim = smoothstep(0.25, 0.4, basin) * (1.0 - smoothstep(0.5, 0.65, basin));
+            height = height.max(lerp(rim, height, SEA_LEVEL as f64 + 1.0));
+            if basin > 0.5 && height < SEA_LEVEL as f64 {
+                water = f64::NEG_INFINITY;
+            }
         }
 
         if let Some((dist, level, width, depth, q)) = near_river {
@@ -808,10 +816,11 @@ mod tests {
         (((lon + 180.0) / 360.0 * r.w as f64) as isize, ((90.0 - lat) / 180.0 * r.h as f64) as isize)
     }
 
-    /// Near the open sea, every column below sea level is under water:
-    /// the coast follows the terrain, never a straight "wall" where the sea
-    /// stops (the dry-depression rule once used a per-cell sea mask, so
-    /// dry land below sea level appeared in rectangles along coasts).
+    /// Near the open sea, every column below sea level is under water
+    /// unless land at or above sea level shuts it off (a basin rim): the
+    /// coast follows the terrain, never a "wall" where the sea stops (the
+    /// dry-depression rule once used a per-cell sea mask, so dry land below
+    /// sea level appeared in rectangles along coasts).
     #[test]
     fn coasts_never_hold_back_the_sea() {
         for planet in [Planet::Continents, Planet::Islands, Planet::Earth] {
@@ -822,7 +831,7 @@ mod tests {
                 size: WorldSize::from_km(4_000.0),
                 ..Default::default()
             });
-            let (mut dry, mut checked) = (0, 0);
+            let (mut walls, mut checked) = (0, 0);
             let n = 700;
             let half = (r.w as f64 * r.cell_blocks / 2.0) as i64;
             let halfz = (r.h as f64 * r.cell_blocks / 2.0) as i64;
@@ -840,12 +849,29 @@ mod tests {
                         .any(|a| (-1..=1).any(|b| r.sea.at(u.floor() as isize + a, v.floor() as isize + b) > 0.5));
                     if near_sea {
                         checked += 1;
-                        dry += (s.water < SEA_LEVEL) as usize;
+                        if s.water < SEA_LEVEL {
+                            // A dry column below the sea must be cut off
+                            // from it by land at or above sea level (a
+                            // basin rim); open water first would be a wall.
+                            let reach = (2.0 * r.cell_blocks) as i32;
+                            for (dx, dz) in [(1, 0), (-1, 0), (0, 1), (0, -1), (1, 1), (1, -1), (-1, 1), (-1, -1)] {
+                                for k in 1..=reach {
+                                    let t = r.shape(x + dx * k, z + dz * k);
+                                    if t.height >= SEA_LEVEL as f64 {
+                                        break;
+                                    }
+                                    if t.water >= SEA_LEVEL {
+                                        walls += 1;
+                                        break;
+                                    }
+                                }
+                            }
+                        }
                     }
                 }
             }
             assert!(checked > 1000, "{planet:?}: only {checked} coastal columns");
-            assert_eq!(dry, 0, "{planet:?}: {dry} of {checked} coastal columns below sea level are dry");
+            assert_eq!(walls, 0, "{planet:?}: {walls} of {checked} coastal columns below sea level are walled off");
         }
     }
 

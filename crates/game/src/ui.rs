@@ -124,11 +124,18 @@ pub fn create_world(ui: &mut egui::Ui, form: &mut WorldForm, actions: &mut Vec<A
             let ui = &mut cols[0];
             egui::Grid::new("world_form").num_columns(2).spacing([16.0, 12.0]).show(ui, |ui| {
                 ui.label("Seed");
-                ui.add(
-                    egui::TextEdit::singleline(&mut form.seed_text)
-                        .hint_text("leave empty for random")
-                        .desired_width(240.0),
-                );
+                ui.horizontal(|ui| {
+                    ui.add(
+                        egui::TextEdit::singleline(&mut form.seed_text)
+                            .hint_text("leave empty for random")
+                            .desired_width(190.0),
+                    );
+                    // A visible random seed: the preview shows it, and it can be
+                    // noted down or tweaked, unlike the one an empty field picks.
+                    if ui.button("Random").on_hover_text("Pick a random seed").clicked() {
+                        form.seed_text = (random_seed() % 1_000_000_000_000).to_string();
+                    }
+                });
                 ui.end_row();
 
                 ui.label("World size");
