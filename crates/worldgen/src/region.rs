@@ -95,22 +95,23 @@ pub struct Regions {
     seed: u64,
     /// Region size in blocks (distance between sites).
     cell: f64,
+    /// Width of a region's fading edge, in cells.
+    edge: f64,
     warp_x: OctaveNoise,
     warp_z: OctaveNoise,
     pillar_seed: u64,
 }
 
-/// Width of a region's fading edge, in cells.
-const EDGE: f64 = 0.3;
-
 impl Regions {
-    /// `cell` is the region size in blocks.
-    pub fn new(seed: u64, cell: f64) -> Self {
+    /// `cell` is the region size in blocks, `edge` the width of the fading
+    /// border in cells (0.3 is wide; smaller makes a purer core).
+    pub fn new(seed: u64, cell: f64, edge: f64) -> Self {
         // Warp in cell units: wavelengths of 2 cells and 1 cell.
         let warp = |salt| OctaveNoise::new(derive_seed(seed, salt), &OctaveConfig::new(-1, &[1.0, 0.5]));
         Self {
             seed: derive_seed(seed, "regions/sites"),
             cell,
+            edge,
             warp_x: warp("regions/warp_x"),
             warp_z: warp("regions/warp_z"),
             pillar_seed: derive_seed(seed, "regions/pillars"),
@@ -157,7 +158,7 @@ impl Regions {
                 edge = edge.min((s.3 - near.3) / (2.0 * ab));
             }
         }
-        Region { flavour: near.2, strength: smoothstep(0.0, EDGE, edge) as f32 }
+        Region { flavour: near.2, strength: smoothstep(0.0, self.edge, edge) as f32 }
     }
 
     /// Pillar terrain: how much a pillar raises this column (0..1 of its
@@ -204,7 +205,7 @@ mod tests {
 
     #[test]
     fn regions_are_large_patches_with_soft_edges() {
-        let r = Regions::new(42, 1000.0);
+        let r = Regions::new(42, 1000.0, 0.3);
         let mut flavoured = 0;
         let mut kinds = std::collections::HashSet::new();
         let mut changes = 0;
@@ -231,7 +232,7 @@ mod tests {
 
     #[test]
     fn pillars_have_steep_walls_and_gaps() {
-        let r = Regions::new(7, 1000.0);
+        let r = Regions::new(7, 1000.0, 0.3);
         let (mut inside, mut steep) = (0, 0);
         for z in 0..400 {
             for x in 0..400 {

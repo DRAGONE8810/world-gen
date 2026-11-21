@@ -264,16 +264,20 @@ pub enum Planet {
     Earth,
     /// A water world of archipelagos, island arcs and volcanic chains.
     Islands,
+    /// Continents like `Continents`, each ruled by one biome (a desert
+    /// continent, a jungle continent…) with a few kindred companions.
+    Mushoku,
 }
 
 impl Planet {
-    pub const ALL: [Planet; 4] = [Planet::Continents, Planet::Pangea, Planet::Earth, Planet::Islands];
+    pub const ALL: [Planet; 5] = [Planet::Continents, Planet::Pangea, Planet::Earth, Planet::Islands, Planet::Mushoku];
     pub fn label(self) -> &'static str {
         match self {
             Planet::Continents => "Continents",
             Planet::Pangea => "Pangea",
             Planet::Earth => "Earth",
             Planet::Islands => "Islands",
+            Planet::Mushoku => "Mushoku",
         }
     }
     pub fn description(self) -> &'static str {
@@ -282,6 +286,7 @@ impl Planet {
             Planet::Pangea => "One supercontinent in a world ocean, ringed by mountains.",
             Planet::Earth => "Today's Earth: real continents, mountains and sea floor.",
             Planet::Islands => "Mostly ocean: archipelagos, island arcs and volcanoes.",
+            Planet::Mushoku => "Each continent ruled by one biome: a desert, a jungle, a taiga…",
         }
     }
 }

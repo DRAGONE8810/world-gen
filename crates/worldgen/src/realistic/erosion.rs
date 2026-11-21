@@ -139,13 +139,26 @@ pub fn priority_flood_from(height: &[f32], w: usize, h: usize, outlet: &dyn Fn(u
             done[j] = true;
             receiver[j] = c as u32;
             // A hollow fills to just above its outlet, so even lakes drain
-            // (a tiny slope keeps the flow direction defined).
-            let f = (height[j] as f64).max(fc + 1e-3 * step);
+            // (a tiny slope keeps the flow direction defined). The slope is
+            // a little random: with equal steps the flood would cross a
+            // flat (a plain filled with sediment, a coastal plain at sea
+            // level) in straight lines, and so would its rivers.
+            let f = (height[j] as f64).max(fc + 1e-3 * step * (0.5 + flat_jitter(j)));
             filled[j] = f as f32;
             heap.push(Reverse((key(f), j as u32)));
         }
     }
     Drainage { order, receiver, filled }
+}
+
+/// A fixed pseudo-random value in [0, 1) per cell (SplitMix64 finaliser).
+#[inline]
+fn flat_jitter(i: usize) -> f64 {
+    let mut z = (i as u64).wrapping_add(0x9E37_79B9_7F4A_7C15);
+    z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+    z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+    z ^= z >> 31;
+    (z >> 11) as f64 / (1u64 << 53) as f64
 }
 
 impl Drainage {

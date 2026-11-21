@@ -52,6 +52,9 @@ pub struct LodColumn {
     /// What the cell's ground shows in a cliff below its top: the rock
     /// under the surface (the water itself over water).
     pub side: BlockId,
+    /// The terrain's top block (under any tree canopy), for the walls
+    /// below a canopy.
+    pub ground: BlockId,
     /// Biome of the ground.
     pub biome: Biome,
     /// Grass and leaf colour of the ground.
@@ -70,7 +73,16 @@ impl LodColumn {
             (s.surface_y, s.top_block)
         };
         let side = if s.underwater { block } else { s.side_block };
-        Self { inside: s.inside, top_y, block, side, biome: s.biome, tint: s.tint, ground_y: s.surface_y }
+        Self {
+            inside: s.inside,
+            top_y,
+            block,
+            side,
+            ground: block,
+            biome: s.biome,
+            tint: s.tint,
+            ground_y: s.surface_y,
+        }
     }
 
     /// Applies one tree block the way chunk generation does: above the top
@@ -94,7 +106,7 @@ impl WorldGenerator {
         let samples: Vec<ColumnSample> = (0..n * n)
             .map(|i| {
                 let (ix, iz) = ((i % n) as i32, (i / n) as i32);
-                self.sample_column(x0 + ix * cell + half, z0 + iz * cell + half)
+                self.sample_column_for_cell(x0 + ix * cell + half, z0 + iz * cell + half, cell)
             })
             .collect();
         let mut out: Vec<LodColumn> = samples.iter().map(LodColumn::from_sample).collect();
@@ -117,7 +129,7 @@ impl WorldGenerator {
                 if !self.settings().size.contains_column(tx, tz) {
                     continue;
                 }
-                if let Some(t) = self.resolve_tree(tx, tz, hash, s.surface_y, s.top_block, &s.shape) {
+                if let Some(t) = self.resolve_tree(tx, tz, hash, s.surface_y, s.top_block, &s.shape, cell >= 32) {
                     let mut c = out[i];
                     // Crown footprint: columns within TREE_REACH of the trunk.
                     let mut footprint = [0u64; 2];
@@ -165,7 +177,7 @@ impl WorldGenerator {
                     fresh = self.sample_column(x, z);
                     &fresh
                 };
-                let Some(t) = self.resolve_tree(x, z, hash, s.surface_y, s.top_block, &s.shape) else {
+                let Some(t) = self.resolve_tree(x, z, hash, s.surface_y, s.top_block, &s.shape, false) else {
                     continue;
                 };
                 trees::build(&t, &mut |wx, wy, wz, b, is_log| {
@@ -175,6 +187,13 @@ impl WorldGenerator {
                     let (ix, iz) = ((wx - x0).div_euclid(cell), (wz - z0).div_euclid(cell));
                     if (0..n as i32).contains(&ix) && (0..n as i32).contains(&iz) {
                         let i = ix as usize + iz as usize * n;
+                        // A crown hanging from a pillar or cliff top over a
+                        // cell whose ground is far below would make a
+                        // column of leaves down to that ground: leave it
+                        // out (1-block cells stay exact).
+                        if cell > 1 && wy > out[i].ground_y + trees::TREE_HEADROOM {
+                            return;
+                        }
                         out[i].add_tree_block(wy, b, is_log);
                         if cell > 1 {
                             let (bx, bz) = (wx - x0 - ix * cell, wz - z0 - iz * cell);

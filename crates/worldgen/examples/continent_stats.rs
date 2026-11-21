@@ -11,6 +11,7 @@ fn main() {
     let planet = match args.get(1).map(String::as_str) {
         Some("pangea") => Planet::Pangea,
         Some("islands") => Planet::Islands,
+        Some("mushoku") => Planet::Mushoku,
         _ => Planet::Continents,
     };
     let first: u64 = args.get(2).and_then(|s| s.parse().ok()).unwrap_or(1);

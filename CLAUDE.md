@@ -29,8 +29,9 @@ crates/worldgen   Pure generator library. NO graphics, NO windowing, NO I/O.
                   rng, noise, spline, terrain, biome, trees, region (rare
                   regional landscapes), block, palette, chunk, settings,
                   generator, lod (far-view sampling),
-                  realistic/ (second generator: tectonics, climate, erosion,
-                  earth relief + lakes, grid). data/earth_relief.bin is NOAA
+                  realistic/ (second generator: tectonics + island rounds,
+                  climate, erosion, earth relief + lakes, grid, theme =
+                  Mushoku continent themes). data/earth_relief.bin is NOAA
                   ETOPO 2022 at 0.1°, compiled in (make_earth_relief.py).
                   examples/noise_stats calibrates noise;
                   examples/find_biome finds the nearest column of a biome;
@@ -94,7 +95,7 @@ Environment switches: `WG_VALIDATION=1` (Khronos validation layer, must
 print no errors), `WG_AUTOSTART=<seed>` (skip menus), `WG_CAMERA=x,z[,yaw,pitch,height]`
 (with autostart: place the camera), `WG_SCREEN=create|settings` (open a menu; `map` with autostart),
 `WG_EXIT_AFTER_FRAMES=N`, `WG_HEIGHT=<blocks>` (with autostart: world height),
-`WG_PLANET=continents|pangea|earth|islands` (with autostart: a Realistic world),
+`WG_PLANET=continents|pangea|earth|islands|mushoku` (with autostart: a Realistic world),
 `WG_QUALITY=fast|balanced|quality`, `WG_SIZE_KM=<km>`, `WG_MAP_ZOOM=<blocks per point>` (map zoom). A `settings.ron` in the working directory sets
 render distance etc.
 
@@ -165,7 +166,20 @@ render distance etc.
   planet's crust is *planned* (`tectonics::plan_continents`: lobes,
   peninsulas, gulfs, islands, Voronoi straits); check shape changes with
   `continent_stats` and the `continents_are_many_separate_and_intricate`
-  test.
+  test. Islands come in rounds: `tectonics::island_rounds` (large and
+  medium, on the grid, before erosion) and `RealisticWorld::build_islets`
+  (open-ocean volcanoes, hills, atolls below the grid's resolution,
+  evaluated per column). Hills and dunes away from the ranges are
+  `build_hills` grids. Mushoku (`realistic::theme`) pulls the simulated
+  climate towards each continent's theme and hands its range to the
+  biome rules (`Shape::theme_t`/`theme_h`, clamped in `select_with`).
+- **Rivers** (realistic) are a drainage tree (`route_water`): every
+  reach has one successor, levels never rise, rivers never cross (keep
+  `rivers_form_networks_that_reach_the_sea_or_a_lake` passing) and end at
+  the sea or in a lake.
+- **Transition width:** `Shape::blend_t`/`blend_h` scale the biome dither
+  (realistic: by the climate gradient), `Shape::purity` removes ground
+  patches; LOD cells ≥ `COARSE_CELL` use the coarse dither (no patches).
 - **Water level per column:** `Shape.water` is the water surface (a river
   or lake can sit above `SEA_LEVEL`). Fill water up to it, put sea ice at
   it, use `ColumnSample::water_top()` to stand on it; `underwater` means

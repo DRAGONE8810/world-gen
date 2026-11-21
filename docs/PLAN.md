@@ -17,7 +17,8 @@ seed when it is needed, so a 60,000 km world costs the same as a 1 km one.
 | 5 | Realistic generator: whole-planet simulation (plate tectonics, climate, rivers, erosion, lakes), planets Continents / Pangea / Earth / Islands, simulation quality, graphics presets | **Done**, see [devlog 05](devlog/05-realistic.md) |
 | 6 | Whole-world far view: LOD to the world border and orbit, detail by height above ground, GPU mesh cache, faster tiles and bookkeeping | **Done**, see [devlog 06](devlog/06-far-view.md); RTX 2080 frame-rate check pending |
 | 7 | Coasts, continents and colours: no sea walls, LOD to 256k chunks, planned continents, beach types and sub-biomes, climate-blended grass, satellite map with clouds, random seed | **Done**, see [devlog 07](devlog/07-coasts-and-colours.md) |
-| 8 | Biome transitions and variety: dithered transition zones (ground and tree species), climate-chart biome classification, 15 new biomes incl. mangroves, autumn, cherry and flower biomes, rare regional landscapes (pillar forests, baobabs, redwoods, bamboo, …), consistent far-view canopy, sharp tiled world map | **Done** (in review), see [devlog 08](devlog/08-biome-transitions.md) |
+| 8 | Biome transitions and variety: dithered transition zones (ground and tree species), climate-chart biome classification, 15 new biomes incl. mangroves, autumn, cherry and flower biomes, rare regional landscapes (pillar forests, baobabs, redwoods, bamboo, …), consistent far-view canopy, sharp tiled world map | **Done**, see [devlog 08](devlog/08-biome-transitions.md) |
+| 9 | Pure biome cores and varied transitions, river networks (tributaries, no crossings, creeks to Amazon-sized), hills with a geological reason (foothills, old ranges, dune seas), island rounds (large, medium with their own range, Pacific volcanoes and atolls), Mushoku planet (one biome per continent) | **Done** (in review), see [devlog 09](devlog/09-rivers-islands-themes.md) |
 
 ## Step 1: Foundation ✔
 
@@ -189,5 +190,22 @@ Pending: frame rate on an RTX 2080; a screen-space error metric.
   straight colour seams).
 - ✔ World map in tiles per zoom level, no blur; clouds fade when zoomed
   in; hover shows °C and mm/yr.
+
+## Step 9: Rivers, hills, islands and the Mushoku planet ✔
+
+- ✔ Transitions only near borders (dither scaled by the climate gradient
+  on planets), of varying width; pure biome cores; no repeating pattern
+  in the far view (coarse LOD cells skip the patch noise).
+- ✔ Rivers: a drainage tree with tributaries, no crossings, no rivers
+  across lakes or ending on dry land (terminal lakes), sizes from creeks
+  to ~200,000 m³/s.
+- ✔ Pillar forests only on plains and in valleys.
+- ✔ Hills: foothills, old worn ranges, rolling uplands, dune seas across
+  the prevailing wind.
+- ✔ Island rounds: large (arc, ridge, block), medium with their own
+  cordillera or hilly, and open-ocean volcanoes, hills and atolls in
+  hotspot chains and coral archipelagos.
+- ✔ Mushoku planet: a theme per continent, companions of the same
+  family, opposite biomes impossible.
 
 Next: clouds in the world; RTX 2080 frame-rate check.

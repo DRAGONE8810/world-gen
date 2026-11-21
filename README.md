@@ -27,7 +27,13 @@ wide transition zones (ground and tree species mix in proportion), chose
 biomes from a temperature × rainfall chart, added 15 biomes (mangroves,
 autumn and cherry forests, flower plains, …) and rare regional landscapes
 such as pillar forests, baobab savannas and redwoods, and made the world
-map sharp at every zoom.
+map sharp at every zoom. Step 9 made biome cores pure (transitions only
+near borders, of varying width), turned rivers into networks from creeks
+to Amazon-sized rivers that always reach the sea or a lake, added hills
+with a geological reason (foothills, old worn ranges, dune seas), rounds
+of islands (Japan- and Cuba-sized, Taiwan-sized with their own range,
+Pacific volcanoes and atolls) and the Mushoku planet, where each continent
+is ruled by one biome.
 
 There are two generators:
 
@@ -37,8 +43,9 @@ There are two generators:
   created: plate tectonics (ranges where plates collide, trenches, island
   arcs, mid-ocean ridges), climate from latitude, winds and rain shadows,
   and rivers that erode valleys and drain to the sea. Planets:
-  Continents, Pangea, Earth (the real one, from NOAA relief data) and
-  Islands, at three simulation qualities. In a 40,000 km × 17,696-block
+  Continents, Pangea, Earth (the real one, from NOAA relief data),
+  Islands and Mushoku (one biome per continent), at three simulation
+  qualities. In a 40,000 km × 17,696-block
   world, one block is one real metre.
 
 The 60 FPS budget on an RTX 2080 is still to be confirmed on real
@@ -85,7 +92,7 @@ cargo run --release -p wg-map -- --seed 42 --layer biome  # also: height, temper
 cargo run --release -p wg-map -- --seed 42 --bench 32     # generation speed (chunks and LOD tiles)
 cargo run --release -p wg-map -- --seed 42 --size-km 60000 --height 17696 --extent 737000  # a tall world
 cargo run --release -p wg-map -- --seed 42 --realistic earth --size-km 40000 --height 17696 --whole --px 1200
-cargo run --release -p wg-map -- --seed 42 --realistic continents --quality quality --whole  # planets: continents|pangea|earth|islands
+cargo run --release -p wg-map -- --seed 42 --realistic continents --quality quality --whole  # planets: continents|pangea|earth|islands|mushoku
 cargo run --release -p worldgen --example planet_stats -- 42 continents   # climate and aridity statistics
 ```
 

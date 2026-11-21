@@ -52,6 +52,24 @@
 //! the climate changes: a few hundred blocks in a classic world, tens of
 //! km on a realistic planet, where climate changes slowly.
 //!
+//! Transitions vary, and biomes have pure hearts:
+//!
+//! * **Width follows the climate.** The dither is scaled per column by
+//!   `Shape::blend_t` / `blend_h`. A realistic planet's climate changes
+//!   so slowly that a fixed dither would make zones ~100 km wide covering
+//!   most of the land; there the scale is set from the climate gradient
+//!   so a zone reaches at most ~8 km each side of a border. A slow
+//!   "character" noise then narrows it further in places (0.1–1×), so
+//!   some borders are wide mixed belts and others almost a line.
+//! * **Purity.** The same character noise sets `Shape::purity`: where it
+//!   is high, a biome's ground is all its main block (pure sand, pure
+//!   snow, an unbroken lawn) and flowers thin out. Away from borders the
+//!   dither changes nothing anyway, so the core of every biome is pure.
+//! * **Coarse LOD cells** (32 blocks and more) take the biome from the
+//!   per-column randomness only ([`BiomeDither::ground_coarse`]) and no
+//!   ground patches: sampled on a power-of-two lattice, the smooth patch
+//!   noise aliased into a repeating pattern seen from far away.
+//!
 //! Trees choose their species the same way, with their own dither that is
 //! half the column's patch and half per-tree randomness: in the middle of a
 //! forest–taiga border half the trees are spruces and half are oaks, mixed
@@ -330,6 +348,16 @@ impl BiomeDither {
         Self::jitter(0.8 * a + 0.2 * wa, 0.8 * b + 0.2 * wb)
     }
 
+    /// Dither of the ground for a far-view cell many blocks wide: per-cell
+    /// randomness only. The patch noise is smooth at the scale of a few
+    /// blocks; sampled once per cell on a regular grid it would alias into
+    /// a repeating pattern (or vanish, at the lattice points of its
+    /// octaves), and the transitions would turn back into lines.
+    pub fn ground_coarse(&self, x: i32, z: i32) -> Jitter {
+        let (wa, wb) = white(hash_position(self.seed, x, 0, z));
+        Self::jitter(wa, wb)
+    }
+
     /// Dither of a tree standing at a column (`hash` is the tree's): half
     /// the ground's patches, half its own randomness, so species mix both
     /// in groves and tree by tree.
@@ -337,6 +365,12 @@ impl BiomeDither {
         let (a, b) = self.patches(x, z);
         let (wa, wb) = white(hash >> 24);
         Self::jitter(0.5 * a + 0.5 * wa, 0.5 * b + 0.5 * wb)
+    }
+
+    /// A tree's dither in a far-view cell (see [`Self::ground_coarse`]).
+    pub fn tree_coarse(&self, hash: u64) -> Jitter {
+        let (wa, wb) = white(hash >> 24);
+        Self::jitter(wa, wb)
     }
 }
 
@@ -461,8 +495,8 @@ pub fn select_with(shape: &Shape, surface_y: i32, j: &Jitter) -> Biome {
     let ground_y = surface_y - shape.pillar as i32;
     let alt = ground_y - shape.water;
     let alt_n = shape.normalized_y(ground_y as f64) - SEA_LEVEL as f64 + j.alt;
-    let t = effective_temperature(shape, ground_y) + j.t;
-    let hum = cl.humidity + j.h;
+    let t = (effective_temperature(shape, ground_y) + j.t * shape.blend_t).clamp(shape.theme_t[0], shape.theme_t[1]);
+    let hum = (cl.humidity + j.h * shape.blend_h).clamp(shape.theme_h[0], shape.theme_h[1]);
     let tb = TempBand::of(t);
     let hb = HumidBand::of(hum);
     let (c, e, pv) = (cl.continentalness, cl.erosion, cl.peaks_valleys);
