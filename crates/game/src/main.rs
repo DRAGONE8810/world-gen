@@ -20,7 +20,7 @@ use config::GameSettings;
 use glam::DVec3;
 use render::{Renderer, UiFrame};
 use std::collections::HashSet;
-use std::sync::Arc;
+use std::sync::{mpsc, Arc};
 use std::time::Instant;
 use ui::{Action, Screen, WorldForm};
 use winit::application::ApplicationHandler;
@@ -63,7 +63,13 @@ struct App {
     exit_after_frames: Option<u64>,
     frames: u64,
     fatal: Option<String>,
+    /// A world being created on a worker thread: its settings, the
+    /// generator and spawn point when ready, and when it started.
+    loading: Option<(WorldSettings, mpsc::Receiver<NewWorld>, Instant)>,
 }
+
+/// A created world's generator and spawn point.
+type NewWorld = (WorldGenerator, (i32, i32, i32));
 
 impl App {
     fn new() -> Self {
@@ -88,15 +94,34 @@ impl App {
             exit_after_frames,
             frames: 0,
             fatal: None,
+            loading: None,
         }
     }
 
     fn start_world(&mut self, settings: WorldSettings) {
+        let gen = WorldGenerator::new(settings.clone());
+        let spawn = gen.find_spawn();
+        self.enter_world(settings, gen, spawn);
+    }
+
+    /// Creates the world on a worker thread (a realistic planet takes
+    /// seconds to simulate) and shows the loading screen meanwhile.
+    fn start_world_in_background(&mut self, settings: WorldSettings) {
+        let (tx, rx) = mpsc::channel();
+        let job = settings.clone();
+        std::thread::spawn(move || {
+            let gen = WorldGenerator::new(job);
+            let spawn = gen.find_spawn();
+            let _ = tx.send((gen, spawn));
+        });
+        self.loading = Some((settings, rx, Instant::now()));
+        self.set_screen(Screen::Loading);
+    }
+
+    fn enter_world(&mut self, settings: WorldSettings, gen: WorldGenerator, (x, y, z): (i32, i32, i32)) {
         log::info!("Starting world {settings:?}");
         self.settings.last_world = settings.clone();
         self.settings.save();
-        let gen = WorldGenerator::new(settings.clone());
-        let (x, y, z) = gen.find_spawn();
         let mut camera = Camera::new(DVec3::new(x as f64 + 0.5, y as f64 + 24.0, z as f64 + 0.5));
         camera.fov_y_deg = self.settings.fov_deg;
         if let Some(r) = &mut self.renderer {
@@ -128,8 +153,15 @@ impl App {
 
     fn handle_action(&mut self, action: Action, event_loop: &ActiveEventLoop) {
         match action {
+            Action::StartWorld(s) if s.generator == worldgen::Generator::Realistic => self.start_world_in_background(s),
             Action::StartWorld(s) => self.start_world(s),
-            Action::Goto(s) => self.set_screen(s),
+            Action::Goto(s) => {
+                if self.screen == Screen::Loading {
+                    // Cancelled: the worker finishes on its own, unheard.
+                    self.loading = None;
+                }
+                self.set_screen(s)
+            }
             Action::Resume => self.set_screen(Screen::Playing),
             Action::QuitToMenu => {
                 self.session = None;
@@ -143,6 +175,13 @@ impl App {
     }
 
     fn update_game(&mut self, dt: f32) {
+        if let Some((settings, rx, _)) = &self.loading {
+            if let Ok((gen, spawn)) = rx.try_recv() {
+                let settings = settings.clone();
+                self.loading = None;
+                self.enter_world(settings, gen, spawn);
+            }
+        }
         let Some(s) = &mut self.session else { return };
         s.camera.fov_y_deg = self.settings.fov_deg;
 
@@ -173,9 +212,9 @@ impl App {
                 s.camera.pos += v.as_dvec3();
             }
             // Stay inside the world border and the vertical build range.
-            let h = s.settings.size.half_width() as f64;
-            s.camera.pos.x = s.camera.pos.x.clamp(-h + 0.5, h - 0.5);
-            s.camera.pos.z = s.camera.pos.z.clamp(-h + 0.5, h - 0.5);
+            let (hx, hz) = (s.settings.size.half_width() as f64, s.settings.size.half_depth() as f64);
+            s.camera.pos.x = s.camera.pos.x.clamp(-hx + 0.5, hx - 0.5);
+            s.camera.pos.z = s.camera.pos.z.clamp(-hz + 0.5, hz - 0.5);
             let (lo, hi) = (s.settings.height.min_y() as f64, s.settings.height.max_y() as f64);
             s.camera.pos.y = s.camera.pos.y.clamp(lo, hi + 200.0);
         }
@@ -213,6 +252,10 @@ impl App {
         let output = ctx.run_ui(raw, |ui| match self.screen {
             Screen::MainMenu => ui::main_menu(ui, &mut actions),
             Screen::CreateWorld => ui::create_world(ui, &mut self.form, &mut actions),
+            Screen::Loading => match &self.loading {
+                Some((s, _, t0)) => ui::loading(ui, s, t0.elapsed().as_secs_f32(), &mut actions),
+                None => actions.push(Action::Goto(Screen::CreateWorld)),
+            },
             Screen::Settings { .. } => settings_done = ui::settings(ui, &mut self.settings),
             Screen::Playing | Screen::Paused => {
                 if let Some(s) = &self.session {
@@ -223,6 +266,11 @@ impl App {
                             frame_ms: self.frame_ms,
                             pos: s.camera.pos,
                             world: &s.settings,
+                            latitude: s
+                                .chunks
+                                .generator()
+                                .realistic()
+                                .map(|r| r.latitude(s.camera.pos.z.floor() as i32)),
                             column: s
                                 .chunks
                                 .generator()
@@ -257,8 +305,8 @@ impl App {
         });
         if let Some((x, z)) = teleport {
             if let Some(s) = &mut self.session {
-                let ground = s.chunks.generator().sample_column(x.floor() as i32, z.floor() as i32).surface_y;
-                s.camera.pos = DVec3::new(x, ground.max(worldgen::SEA_LEVEL) as f64 + 40.0, z);
+                let ground = s.chunks.generator().sample_column(x.floor() as i32, z.floor() as i32).water_top();
+                s.camera.pos = DVec3::new(x, ground as f64 + 40.0, z);
             }
             actions.push(Action::Resume);
         }
@@ -316,14 +364,30 @@ impl App {
             if let Some(h) = std::env::var("WG_HEIGHT").ok().and_then(|h| h.trim().parse().ok()) {
                 s.height = worldgen::settings::WorldHeight::from_blocks(h);
             }
-            self.start_world(s);
+            // WG_PLANET=continents|pangea|earth|islands: a realistic world;
+            // WG_QUALITY=optimized|balanced|quality; WG_SIZE_KM=km.
+            let pick = |var: &str, label: fn(usize) -> Option<&'static str>| {
+                let v = std::env::var(var).ok()?.trim().to_lowercase();
+                (0..).map_while(label).position(|l| l.to_lowercase() == v)
+            };
+            if let Some(i) = pick("WG_PLANET", |i| worldgen::Planet::ALL.get(i).map(|p| p.label())) {
+                s.generator = worldgen::Generator::Realistic;
+                s.planet = worldgen::Planet::ALL[i];
+            }
+            if let Some(i) = pick("WG_QUALITY", |i| worldgen::SimQuality::ALL.get(i).map(|q| q.label())) {
+                s.quality = worldgen::SimQuality::ALL[i];
+            }
+            if let Some(km) = std::env::var("WG_SIZE_KM").ok().and_then(|v| v.trim().parse().ok()) {
+                s.size = worldgen::WorldSize::from_km(km);
+            }
+            self.start_world(s.normalized());
             // Optional camera placement for screenshots: WG_CAMERA=x,z[,yaw_deg,pitch_deg,height]
             if let (Ok(spec), Some(sess)) = (std::env::var("WG_CAMERA"), self.session.as_mut()) {
                 let v: Vec<f64> = spec.split(',').filter_map(|p| p.trim().parse().ok()).collect();
                 if v.len() >= 2 {
-                    let ground = sess.chunks.generator().sample_column(v[0] as i32, v[1] as i32).surface_y;
+                    let ground = sess.chunks.generator().sample_column(v[0] as i32, v[1] as i32).water_top();
                     let above = v.get(4).copied().unwrap_or(40.0);
-                    sess.camera.pos = DVec3::new(v[0], ground.max(worldgen::SEA_LEVEL) as f64 + above, v[1]);
+                    sess.camera.pos = DVec3::new(v[0], ground as f64 + above, v[1]);
                     sess.camera.yaw = v.get(2).copied().unwrap_or(0.0).to_radians() as f32;
                     sess.camera.pitch = v.get(3).copied().unwrap_or(-20.0).to_radians() as f32;
                 }

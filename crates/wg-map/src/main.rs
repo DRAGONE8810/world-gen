@@ -11,7 +11,10 @@
 
 use rayon::prelude::*;
 use worldgen::settings::WorldHeight;
-use worldgen::{blocks, Biome, ColumnSample, WorldGenerator, WorldSettings, WorldSize, WorldType, SEA_LEVEL};
+use worldgen::{
+    blocks, Biome, ColumnSample, Generator, Planet, SimQuality, WorldGenerator, WorldSettings, WorldSize, WorldType,
+    SEA_LEVEL,
+};
 
 struct Args {
     seed: u64,
@@ -25,6 +28,10 @@ struct Args {
     bench: Option<u32>,
     layer: Layer,
     features: bool,
+    generator: Generator,
+    planet: Planet,
+    quality: SimQuality,
+    whole: bool,
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -46,6 +53,7 @@ fn usage() -> ! {
          \x20             [--center X,Z] [--extent BLOCKS] [--px PIXELS] [--out FILE.png]\n\
          \x20             [--layer surface|height|biome|continentalness|erosion|pv|roughness|temperature|humidity]\n\
          \x20             [--no-trees] [--legend]\n\
+         \x20             [--realistic continents|pangea|earth|islands] [--quality fast|balanced|quality] [--whole]\n\
          \x20      wg-map --bench N   (time generating an N×N square of chunks, and N LOD tiles per level, on one thread)"
     );
     std::process::exit(2)
@@ -64,6 +72,10 @@ fn parse_args() -> Args {
         bench: None,
         layer: Layer::Surface,
         features: true,
+        generator: Generator::Classic,
+        planet: Planet::Continents,
+        quality: SimQuality::Balanced,
+        whole: false,
     };
     let mut it = std::env::args().skip(1);
     while let Some(flag) = it.next() {
@@ -105,6 +117,25 @@ fn parse_args() -> Args {
                 }
             }
             "--no-trees" => a.features = false,
+            "--realistic" => {
+                a.generator = Generator::Realistic;
+                a.planet = match val().as_str() {
+                    "continents" => Planet::Continents,
+                    "pangea" => Planet::Pangea,
+                    "earth" => Planet::Earth,
+                    "islands" => Planet::Islands,
+                    _ => usage(),
+                };
+            }
+            "--quality" => {
+                a.quality = match val().as_str() {
+                    "fast" => SimQuality::Fast,
+                    "balanced" => SimQuality::Balanced,
+                    "quality" => SimQuality::Quality,
+                    _ => usage(),
+                };
+            }
+            "--whole" => a.whole = true,
             "--bench" => a.bench = Some(val().parse().unwrap_or_else(|_| usage())),
             "-h" | "--help" => usage(),
             _ => usage(),
@@ -114,27 +145,52 @@ fn parse_args() -> Args {
 }
 
 fn main() {
-    let args = parse_args();
+    let mut args = parse_args();
+    let created = std::time::Instant::now();
     let gen = WorldGenerator::new(WorldSettings {
         seed: args.seed,
         size: WorldSize::from_km(args.size_km),
         world_type: args.world_type,
         features: args.features,
         height: WorldHeight::from_blocks(args.height),
+        generator: args.generator,
+        planet: args.planet,
+        quality: args.quality,
     });
+    if let Some(r) = gen.realistic() {
+        let (w, h) = r.grid_size();
+        eprintln!(
+            "planet simulated in {:.2?}: {w}x{h} grid, {:.1} km per cell, {} river reaches",
+            created.elapsed(),
+            r.cell_blocks() / 1000.0,
+            r.river_count()
+        );
+    }
+    if args.whole {
+        let size = gen.settings().size;
+        args.extent = size.max_extent();
+        args.center = (0, 0);
+    }
     if let Some(n) = args.bench {
         bench(&gen, n as i32);
         bench_lod(&gen, n as i32);
         return;
     }
     let px = args.px.max(16);
+    // A whole 2:1 world (Earth) is drawn 2:1; everything else square.
+    let pz = if args.whole {
+        let size = gen.settings().size;
+        ((px as f64 * size.depth_blocks() as f64 / size.width_blocks() as f64).round() as u32).max(16)
+    } else {
+        px
+    };
     let blocks_per_px = args.extent as f64 / px as f64;
     let x0 = args.center.0 as f64 - args.extent as f64 / 2.0;
-    let z0 = args.center.1 as f64 - args.extent as f64 / 2.0;
+    let z0 = args.center.1 as f64 - pz as f64 * blocks_per_px / 2.0;
 
     let start = std::time::Instant::now();
     // One extra row/column so every pixel has a south-east neighbour for shading.
-    let samples: Vec<_> = (0..(px + 1) * (px + 1))
+    let samples: Vec<_> = (0..(px + 1) * (pz + 1))
         .into_par_iter()
         .map(|i| {
             let (ix, iz) = (i % (px + 1), i / (px + 1));
@@ -144,12 +200,12 @@ fn main() {
         })
         .collect();
 
-    let mut img = image::RgbImage::new(px, px);
+    let mut img = image::RgbImage::new(px, pz);
     let mut land = 0u64;
     let mut inside = 0u64;
-    let mut heights = Vec::with_capacity((px * px) as usize);
+    let mut heights = Vec::with_capacity((px * pz) as usize);
     let mut biome_count = vec![0u64; Biome::ALL.len()];
-    for iz in 0..px {
+    for iz in 0..pz {
         for ix in 0..px {
             let s = samples[(iz * (px + 1) + ix) as usize];
             if s.inside {
@@ -159,7 +215,7 @@ fn main() {
                 biome_count[s.biome as usize] += 1;
             }
             let se = samples[((iz + 1) * (px + 1) + ix + 1) as usize];
-            let color = pixel_color(args.layer, &s, &se, blocks_per_px);
+            let color = pixel_color(args.layer, &s, &se, blocks_per_px, gen.realistic().is_some());
             img.put_pixel(ix, iz, image::Rgb(color));
         }
     }
@@ -168,7 +224,7 @@ fn main() {
         "wrote {} ({}x{} px, {:.1} blocks/px, {} columns in {:.2?}); land {:.1}% of world area shown",
         args.out,
         px,
-        px,
+        pz,
         blocks_per_px,
         samples.len(),
         start.elapsed(),
@@ -204,13 +260,16 @@ fn main() {
     }
 }
 
-/// Single-threaded chunk generation benchmark.
+/// Single-threaded chunk generation benchmark, around the spawn point
+/// (on land: a realistic world's origin is often open ocean).
 fn bench(gen: &WorldGenerator, n: i32) {
+    let (sx, _, sz) = gen.find_spawn();
+    let c = worldgen::ChunkPos::from_block(sx, sz);
     let start = std::time::Instant::now();
     let mut bytes = 0usize;
     for cz in 0..n {
         for cx in 0..n {
-            bytes += gen.generate_chunk(worldgen::ChunkPos::new(cx - n / 2, cz - n / 2)).memory_bytes();
+            bytes += gen.generate_chunk(worldgen::ChunkPos::new(c.x + cx - n / 2, c.z + cz - n / 2)).memory_bytes();
         }
     }
     let total = (n * n) as f64;
@@ -227,6 +286,7 @@ fn bench(gen: &WorldGenerator, n: i32) {
 /// Single-threaded LOD sampling benchmark: one tile = an 18 × 18 grid of
 /// cells (16 × 16 plus a border), as the game samples it.
 fn bench_lod(gen: &WorldGenerator, n: i32) {
+    let (sx, _, sz) = gen.find_spawn();
     for level in [1u32, 2, 3, 4, 6, 8] {
         let cell = 1i32 << level;
         let tile = 16 * cell;
@@ -234,7 +294,7 @@ fn bench_lod(gen: &WorldGenerator, n: i32) {
         let mut canopy = 0;
         for i in 0..n {
             // Tiles along a line through the world, like a ring of the view.
-            let grid = gen.lod_grid(i * tile - cell, -cell, cell, 18);
+            let grid = gen.lod_grid(sx + i * tile - cell, sz - cell, cell, 18);
             canopy += grid.iter().filter(|c| c.block.is_tree_part()).count();
         }
         let t = start.elapsed();
@@ -246,13 +306,18 @@ fn bench_lod(gen: &WorldGenerator, n: i32) {
 }
 
 /// Colour of one map pixel for the chosen layer.
-fn pixel_color(layer: Layer, s: &ColumnSample, se: &ColumnSample, blocks_per_px: f64) -> [u8; 3] {
+fn pixel_color(layer: Layer, s: &ColumnSample, se: &ColumnSample, blocks_per_px: f64, realistic: bool) -> [u8; 3] {
     if !s.inside {
         return [12, 12, 16];
     }
-    // Hill shading: brighter on slopes facing the north-west light.
-    let slope = (s.surface_y - se.surface_y) as f64 / blocks_per_px.max(1.0) / s.shape.scale();
-    let shade = (1.0 + slope * 0.35).clamp(0.55, 1.4);
+    // Hill shading: brighter on slopes facing the north-west light. Maps
+    // of whole realistic planets need it exaggerated to show anything.
+    let slope = if realistic {
+        (s.surface_y - se.surface_y) as f64 / blocks_per_px.max(1.0) * 3.0 * (blocks_per_px / 16.0).max(1.0).sqrt()
+    } else {
+        (s.surface_y - se.surface_y) as f64 / blocks_per_px.max(1.0) / s.shape.scale() * 0.35
+    };
+    let shade = (1.0 + slope).clamp(0.55, 1.4);
     let shaded = |c: [u8; 3]| c.map(|v| (v as f64 * shade).clamp(0.0, 255.0) as u8);
     let water = |depth: i32| {
         let d = (depth.clamp(0, 60) as f64) / 60.0;
@@ -275,7 +340,7 @@ fn pixel_color(layer: Layer, s: &ColumnSample, se: &ColumnSample, blocks_per_px:
             if s.ice {
                 shaded(blocks::ICE.info().color)
             } else if s.underwater {
-                water(((SEA_LEVEL - s.surface_y) as f64 / s.shape.scale()) as i32)
+                water(((s.shape.water - s.surface_y) as f64 / s.shape.scale()) as i32)
             } else {
                 shaded(s.top_color())
             }
@@ -283,14 +348,14 @@ fn pixel_color(layer: Layer, s: &ColumnSample, se: &ColumnSample, blocks_per_px:
         Layer::Biome => {
             // Flat biome colours, lightly hill-shaded so relief stays readable.
             let c = s.biome.map_color();
-            let k = (1.0 + slope * 0.15).clamp(0.8, 1.15);
+            let k = (1.0 + slope * 0.43).clamp(0.8, 1.15);
             c.map(|v| (v as f64 * k).clamp(0.0, 255.0) as u8)
         }
         Layer::Temperature => ramp(s.shape.climate.temperature),
         Layer::Humidity => ramp(s.shape.climate.humidity),
         Layer::Height => {
             if s.underwater {
-                water(((SEA_LEVEL - s.surface_y) as f64 / s.shape.scale()) as i32)
+                water(((s.shape.water - s.surface_y) as f64 / s.shape.scale()) as i32)
             } else {
                 // Hypsometric tint: green lowlands, yellow/brown hills, grey
                 // mountains, white peaks.

@@ -8,6 +8,14 @@ rust-version.workspace = true
 
 [dependencies]
 serde.workspace = true
+# Portable transcendental functions: the same bits on every platform, so a
+# seed makes the same planet on Windows, Linux and macOS.
+libm = "0.2"
+# Decompresses the embedded Earth relief (pure Rust).
+miniz_oxide = "0.8"
+# Planet simulation runs its per-cell passes in parallel (results are
+# collected in cell order, so they stay deterministic).
+rayon.workspace = true
 
 [dev-dependencies]
 ron.workspace = true

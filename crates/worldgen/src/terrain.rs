@@ -51,7 +51,7 @@ pub struct Climate {
 }
 
 /// Output of the shaping stage for one column.
-#[derive(Clone, Copy, Debug, Default, PartialEq)]
+#[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Shape {
     pub climate: Climate,
     /// Base surface height (absolute y, before 3D noise).
@@ -68,6 +68,24 @@ pub struct Shape {
     /// rate) divide heights above sea level by it. 0 (the `Default`) is
     /// treated as 1.
     pub vscale: f64,
+    /// Y of the water surface over this column: `SEA_LEVEL` except in the
+    /// rivers and lakes of realistic worlds, which lie above the sea.
+    /// Every air block at or below it is water.
+    pub water: i32,
+}
+
+impl Default for Shape {
+    fn default() -> Self {
+        Self {
+            climate: Climate::default(),
+            height: 0.0,
+            roughness: 0.0,
+            river: 0.0,
+            island: 0.0,
+            vscale: 0.0,
+            water: SEA_LEVEL,
+        }
+    }
 }
 
 impl Shape {
@@ -285,7 +303,7 @@ impl TerrainShaper {
             roughness *= self.vscale;
         }
 
-        Shape { climate, height, roughness, river, island, vscale: self.vscale }
+        Shape { climate, height, roughness, river, island, vscale: self.vscale, water: SEA_LEVEL }
     }
 }
 

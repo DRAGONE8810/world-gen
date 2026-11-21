@@ -64,7 +64,7 @@ impl WorldMap {
     /// and `yaw` its heading.
     pub fn ui(&mut self, ui: &mut egui::Ui, gen: &Arc<WorldGenerator>, player: (f64, f64), yaw: f32) -> MapAction {
         let mut action = MapAction::None;
-        let half_world = gen.settings().size.half_width() as f64;
+        let half_world = gen.settings().size.max_extent() as f64 / 2.0;
         let max_bpp = (2.0 * half_world / 256.0).max(1.0);
         let vscale = gen.settings().height.terrain_scale();
 
@@ -248,7 +248,7 @@ pub fn map_color(c: &ColumnSample, vscale: f64) -> [u8; 3] {
     } else if c.ice {
         worldgen::blocks::ICE.info().color
     } else if c.underwater {
-        let d = ((SEA_LEVEL - c.surface_y) as f64 / (50.0 * vscale)).clamp(0.0, 1.0) as f32;
+        let d = ((c.shape.water - c.surface_y) as f64 / (50.0 * vscale)).clamp(0.0, 1.0) as f32;
         [(40.0 - d * 20.0) as u8, (90.0 - d * 40.0) as u8, (200.0 - d * 60.0) as u8]
     } else {
         let alt = ((c.surface_y - SEA_LEVEL) as f64 / (150.0 * vscale)).clamp(0.0, 1.0);

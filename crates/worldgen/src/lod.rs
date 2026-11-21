@@ -25,7 +25,6 @@
 use crate::biome::Biome;
 use crate::block::{blocks, BlockId};
 use crate::generator::{ColumnSample, WorldGenerator};
-use crate::settings::SEA_LEVEL;
 use crate::trees::{self, TREE_CELL, TREE_REACH};
 
 /// Cells up to this size get exact tree rasterisation.
@@ -51,8 +50,8 @@ impl LodColumn {
     fn from_sample(s: &ColumnSample) -> Self {
         let (top_y, block) = if !s.inside {
             (s.surface_y, blocks::AIR)
-        } else if s.surface_y < SEA_LEVEL {
-            (SEA_LEVEL, if s.ice { blocks::ICE } else { blocks::WATER })
+        } else if s.underwater {
+            (s.shape.water, if s.ice { blocks::ICE } else { blocks::WATER })
         } else {
             (s.surface_y, s.top_block)
         };
@@ -162,7 +161,7 @@ impl WorldGenerator {
 mod tests {
     use super::*;
     use crate::chunk::ChunkPos;
-    use crate::settings::{WorldHeight, WorldSize, WorldType};
+    use crate::settings::{Generator, Planet, SimQuality, WorldHeight, WorldSize, WorldType, SEA_LEVEL};
     use crate::WorldSettings;
 
     /// Highest non-air block of a real chunk column.
@@ -207,6 +206,51 @@ mod tests {
                 }
             }
             assert!(seed != 42 || height != 384 || trees_seen > 0, "test area has no trees");
+        }
+    }
+
+    /// The same for realistic worlds, including columns under rivers and
+    /// lakes above sea level.
+    #[test]
+    fn one_block_cells_match_realistic_chunks() {
+        for planet in [Planet::Continents, Planet::Earth] {
+            let g = WorldGenerator::new(WorldSettings {
+                seed: 12,
+                generator: Generator::Realistic,
+                planet,
+                quality: SimQuality::Fast,
+                height: WorldHeight::from_blocks(2048),
+                size: WorldSize::from_km(4000.0),
+                ..Default::default()
+            });
+            let (sx, _, sz) = g.find_spawn();
+            let mut spots: Vec<(i32, i32)> =
+                [(0, 0), (5, -3), (-7, 9), (40, 40)].iter().map(|&(dx, dz)| (sx + dx * 16, sz + dz * 16)).collect();
+            // A river or lake above the sea, found on a coarse scan.
+            let half = g.settings().size.half_width().min(g.settings().size.half_depth()) - 64;
+            'scan: for j in 0..300 {
+                for i in 0..300 {
+                    let (x, z) = (-half + 2 * half / 300 * i, -half + 2 * half / 300 * j);
+                    let s = g.sample_column(x, z);
+                    if s.underwater && s.shape.water > SEA_LEVEL + 10 {
+                        spots.push((x, z));
+                        break 'scan;
+                    }
+                }
+            }
+            assert!(spots.len() == 5, "{planet:?}: no river or lake found");
+            for (x, z) in spots {
+                let pos = ChunkPos::from_block(x, z);
+                let chunk = g.generate_chunk(pos);
+                let lod = g.lod_grid(pos.min_block_x(), pos.min_block_z(), 1, 16);
+                for lz in 0..16 {
+                    for lx in 0..16 {
+                        let l = lod[(lx + lz * 16) as usize];
+                        let (y, b) = chunk_top(&chunk, lx, lz);
+                        assert_eq!((l.top_y, l.block), (y, b), "{planet:?} {pos:?} column {lx},{lz}");
+                    }
+                }
+            }
         }
     }
 

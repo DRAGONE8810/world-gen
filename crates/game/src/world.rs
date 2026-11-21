@@ -136,10 +136,10 @@ impl ChunkManager {
 
     /// Does node `k` overlap the world (inside the border)?
     fn in_world(gen: &WorldGenerator, k: NodeKey) -> bool {
-        let h = gen.settings().size.half_width() as i64;
+        let (hx, hz) = (gen.settings().size.half_width() as i64, gen.settings().size.half_depth() as i64);
         let (x0, z0) = k.origin_block();
         let (x0, z0, n) = (x0 as i64, z0 as i64, k.size_blocks() as i64);
-        x0 < h && x0 + n > -h && z0 < h && z0 + n > -h
+        x0 < hx && x0 + n > -hx && z0 < hz && z0 + n > -hz
     }
 
     /// Advances streaming. `center` is the camera's chunk.

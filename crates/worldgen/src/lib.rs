@@ -14,6 +14,7 @@
 //! * [`settings`] – world size, type and seed
 //! * [`spline`] – monotone cubic curves used to shape terrain
 //! * [`terrain`] – climate parameters → height, roughness, rivers
+//! * [`realistic`] – the Earth-like generator: plates, erosion, rivers, climate
 //! * [`generator`] – turns settings + chunk position into blocks
 
 pub mod biome;
@@ -23,6 +24,7 @@ pub mod generator;
 pub mod lod;
 pub mod noise;
 pub mod palette;
+pub mod realistic;
 pub mod rng;
 pub mod settings;
 pub mod spline;
@@ -33,4 +35,6 @@ pub use biome::Biome;
 pub use block::{blocks, BlockId};
 pub use chunk::{Chunk, ChunkPos, CHUNK_SIZE};
 pub use generator::{ColumnSample, WorldGenerator};
-pub use settings::{WorldSettings, WorldSize, WorldType, MAX_Y, MIN_Y, SEA_LEVEL, WORLD_HEIGHT};
+pub use settings::{
+    Generator, Planet, SimQuality, WorldSettings, WorldSize, WorldType, MAX_Y, MIN_Y, SEA_LEVEL, WORLD_HEIGHT,
+};
