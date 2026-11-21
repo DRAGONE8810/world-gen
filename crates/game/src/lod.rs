@@ -345,7 +345,7 @@ pub fn mesh_tile(gen: &WorldGenerator, key: NodeKey) -> MeshData {
 
     // Tops, greedy-merged by (height, block, biome tint).
     let key_of = |c: &worldgen::lod::LodColumn| -> Option<(i32, BlockId, [u8; 3])> {
-        c.inside.then(|| (c.top_y, c.block, block_color(c.block, c.biome)))
+        c.inside.then(|| (c.top_y, c.block, block_color(c.block, c.tint)))
     };
     let mut done = [[false; TILE_CELLS]; TILE_CELLS];
     for j in 0..TILE_CELLS {
@@ -382,7 +382,7 @@ pub fn mesh_tile(gen: &WorldGenerator, key: NodeKey) -> MeshData {
             if !c.inside {
                 continue;
             }
-            let color = block_color(c.block, c.biome);
+            let color = block_color(c.block, c.tint);
             let top = (c.top_y + 1) as f32;
             // (di, dj, face, edge of tile?)
             for (di, dj, face) in [(1i32, 0i32, 0usize), (-1, 0, 1), (0, 1, 4), (0, -1, 5)] {

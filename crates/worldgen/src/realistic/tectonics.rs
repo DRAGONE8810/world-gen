@@ -17,9 +17,16 @@
 //!
 //! Steps:
 //!
-//! 1. **Continental crust.** A noise field picks which ~40 % of the surface
-//!    is light continental crust (12 % for the Islands planet, one blob for
-//!    Pangea). Its edge, ~100 km beyond the coast, is the shelf break.
+//! 1. **Continental crust.** A field picks which part of the surface is
+//!    light continental crust. On the Continents planet it is *planned*:
+//!    4–7 continents spread apart, each built from ellipses (a body of
+//!    lobes, peninsulas, gulfs, offshore islands) in one of four
+//!    characters taken from Earth (massive like Africa, a cordillera like
+//!    western North America, fragmented like Europe, an island continent
+//!    like Australia), then warped and roughened by noise in proportion to
+//!    how rugged that continent is. Pangea and Islands use noise around a
+//!    few blobs. The crust edge, ~100 km beyond the coast, is the shelf
+//!    break.
 //! 2. **Plates.** 10–14 plates grow from random seeds with Dijkstra's
 //!    algorithm. Crossing continental crust is expensive, so boundaries
 //!    tend to run through oceans and along coasts, as on Earth.
@@ -86,6 +93,397 @@ impl Plate {
     }
 }
 
+/// An ellipse on the planet, in km: centre, rotation (cos, sin) and the two
+/// half-axes, `rx` along the rotated x axis.
+#[derive(Clone, Copy, Debug)]
+struct Ellipse {
+    x: f64,
+    z: f64,
+    c: f64,
+    s: f64,
+    rx: f64,
+    rz: f64,
+}
+
+impl Ellipse {
+    fn new(x: f64, z: f64, angle: f64, rx: f64, rz: f64) -> Self {
+        Self { x, z, c: libm::cos(angle), s: libm::sin(angle), rx, rz }
+    }
+    /// 0 at the centre, 1 on the rim, growing outwards.
+    fn dist(&self, x: f64, z: f64) -> f64 {
+        let (dx, dz) = (x - self.x, z - self.z);
+        let u = (dx * self.c + dz * self.s) / self.rx;
+        let v = (dz * self.c - dx * self.s) / self.rz;
+        (u * u + v * v).sqrt()
+    }
+    /// The rim point in direction `a` (relative to the ellipse's own axis).
+    fn rim(&self, a: f64) -> (f64, f64) {
+        let (u, v) = (libm::cos(a) * self.rx, libm::sin(a) * self.rz);
+        (self.x + u * self.c - v * self.s, self.z + u * self.s + v * self.c)
+    }
+    /// The outward direction (world angle) at the rim point `a`.
+    fn normal(&self, a: f64) -> f64 {
+        libm::atan2(libm::sin(a) / self.rz, libm::cos(a) / self.rx) + libm::atan2(self.s, self.c)
+    }
+    fn scale(&mut self, ox: f64, oz: f64, k: f64) {
+        self.x = ox + (self.x - ox) * k;
+        self.z = oz + (self.z - oz) * k;
+        self.rx *= k;
+        self.rz *= k;
+    }
+}
+
+/// The plan of one continent: overlapping land lobes (body, arms,
+/// peninsulas, offshore islands) minus water ellipses (gulfs, inland seas),
+/// and how rugged its coast is.
+#[derive(Clone, Debug)]
+struct ContinentPlan {
+    /// Centre in km; the continent may not come closer than a strait's
+    /// width to the border of its Voronoi cell around this point.
+    cx: f64,
+    cz: f64,
+    land: Vec<Ellipse>,
+    /// The first `body` land ellipses are the main body (the rest are
+    /// peninsulas and islands).
+    body: usize,
+    water: Vec<Ellipse>,
+    /// 0 = smooth coast (Africa), 1 = shattered (Europe, Canadian Arctic).
+    rugged: f64,
+}
+
+impl ContinentPlan {
+    /// Signed "inside-ness": 1 at a lobe centre, 0 on the planned coast,
+    /// negative outside or inside a gulf.
+    fn field(&self, x: f64, z: f64) -> f64 {
+        let mut f = self.land.iter().fold(-1.0f64, |f, e| f.max(1.0 - e.dist(x, z)));
+        // Water ellipses cut the land down to their rim.
+        for e in &self.water {
+            f = f.min(1.5 * (e.dist(x, z) - 1.0));
+        }
+        f
+    }
+}
+
+/// Half the width (km) of the sea kept between two continents.
+const STRAIT_KM: f64 = 260.0;
+
+/// Distance (km) from a point to the border of continent `i`'s Voronoi
+/// cell, positive inside.
+fn voronoi_margin(plans: &[ContinentPlan], i: usize, x: f64, z: f64) -> f64 {
+    let p = &plans[i];
+    let mut m = f64::MAX;
+    for (j, q) in plans.iter().enumerate() {
+        if i != j {
+            let (dx, dz) = (q.cx - p.cx, q.cz - p.cz);
+            let len = dx.hypot(dz);
+            let (mx, mz) = ((p.cx + q.cx) * 0.5, (p.cz + q.cz) * 0.5);
+            m = m.min(-((x - mx) * dx + (z - mz) * dz) / len);
+        }
+    }
+    m
+}
+
+/// The combined plan field at a point and the softmax-blended ruggedness.
+/// Each continent is clipped to its Voronoi cell (around the plan
+/// centres) shrunk by `gap` km, so neighbours are parted by a sea at least
+/// `2 · gap` wide wherever their lobes would touch; the domain warp in
+/// `build` bends those partings like real seaways. A negative `gap` lets
+/// lobes cross over (a land bridge).
+fn planned_field(plans: &[ContinentPlan], x: f64, z: f64, gap: f64) -> (f64, f64) {
+    let (mut f, mut wsum, mut rug) = (-9.0f64, 0.0, 0.0);
+    for (i, p) in plans.iter().enumerate() {
+        let mut fc = p.field(x, z);
+        // Distance to the Voronoi border: to each bisector with another
+        // centre, positive on this continent's side.
+        let m = voronoi_margin(plans, i, x, z);
+        fc = fc.min((m - gap) / 500.0);
+        f = f.max(fc);
+        let wt = libm::exp(6.0 * fc.clamp(-3.0, 2.0));
+        wsum += wt;
+        rug += wt * p.rugged;
+    }
+    (f, rug / wsum.max(1e-12))
+}
+
+/// Lays out the Continents planet: 4–7 continents spread over the map, each
+/// of one of four characters seen on Earth:
+///
+/// * **massive** (Africa, South America): one or two fat lobes, few
+///   bays, smooth coasts;
+/// * **cordillera** (western North America, Alaska to Baja California):
+///   a long bent chain of lobes with a thin peninsula or two, a gulf and an
+///   island arc offshore;
+/// * **fragmented** (Europe, Southeast Asia): a branching body with many
+///   peninsulas, inland seas and islands, and a rugged coast;
+/// * **island continent** (Australia): one compact body with a deep bight,
+///   a cape and an island across a strait.
+///
+/// The ellipses only plan the shape; noise and warping in `build` turn
+/// them into coasts.
+fn plan_continents(seed: u64, width: f64, depth: f64) -> Vec<ContinentPlan> {
+    let mut rng = Xoroshiro128PlusPlus::from_seed(derive_seed(seed, "realistic/continent_plan"));
+    let mut r = move || rng.next_f64();
+    let n = |r: &mut dyn FnMut() -> f64, k: usize| (r() * k as f64) as usize;
+    let k = 4 + (r() * 4.0) as usize;
+    // Spread the centres: best of several candidates (Mitchell's
+    // best-candidate sampling), so continents don't pile into one mass.
+    let mut centres: Vec<(f64, f64)> = Vec::new();
+    for _ in 0..k {
+        let mut best = (0.0, 0.0, -1.0);
+        for _ in 0..12 {
+            let (x, z) = (width * (0.17 + 0.66 * r()), depth * (0.17 + 0.66 * r()));
+            let d = centres.iter().map(|&(a, b)| (x - a).hypot(z - b)).fold(f64::MAX, f64::min);
+            if d > best.2 {
+                best = (x, z, d);
+            }
+        }
+        centres.push((best.0, best.1));
+    }
+    // Characters: at most two massive continents, at least one fragmented
+    // and one cordillera, the rest drawn at random.
+    let mut kinds: Vec<u8> = vec![2, 1];
+    while kinds.len() < k {
+        let massive = kinds.iter().filter(|&&c| c == 0).count();
+        let pick = (r() * 4.0) as u8;
+        kinds.push(if pick == 0 && massive >= 2 { 2 } else { pick });
+    }
+    // Shuffle so the character doesn't follow the placement order.
+    for i in (1..k).rev() {
+        let j = (r() * (i + 1) as f64) as usize;
+        kinds.swap(i, j.min(i));
+    }
+
+    let tau = std::f64::consts::TAU;
+    let mut plans: Vec<ContinentPlan> = Vec::new();
+    for (&(cx, cz), &kind) in centres.iter().zip(&kinds) {
+        // Relative size: a spread like Earth's (Asia ≈ 6 × Australia).
+        let size = libm::exp(0.9 * (r() - 0.5)) * if kind == 3 { 0.65 } else { 1.0 };
+        let base = 0.1 * width * size;
+        let (lobes, aspect, taper, turn, peninsulas, gulfs, islands, rugged) = match kind {
+            0 => (
+                1 + n(&mut r, 2),
+                1.0 + 0.5 * r(),
+                0.6,
+                0.5,
+                n(&mut r, 3),
+                n(&mut r, 2),
+                n(&mut r, 2),
+                0.15 + 0.2 * r(),
+            ),
+            1 => (
+                4 + n(&mut r, 3),
+                1.5 + 0.8 * r(),
+                0.85,
+                0.45,
+                2 + n(&mut r, 2),
+                1 + n(&mut r, 2),
+                3 + n(&mut r, 4),
+                0.5 + 0.3 * r(),
+            ),
+            2 => (
+                3 + n(&mut r, 2),
+                1.2 + 0.6 * r(),
+                0.72,
+                1.1,
+                5 + n(&mut r, 4),
+                3 + n(&mut r, 3),
+                3 + n(&mut r, 5),
+                0.75 + 0.25 * r(),
+            ),
+            _ => (1, 1.2 + 0.3 * r(), 0.6, 0.3, 1 + n(&mut r, 2), 1, 1 + n(&mut r, 2), 0.25 + 0.2 * r()),
+        };
+        let mut plan = ContinentPlan { cx, cz, land: Vec::new(), body: 0, water: Vec::new(), rugged };
+        // Body: lobes along a bending spine, shrinking as it goes.
+        let mut dir = r() * tau;
+        let (mut x, mut z) = (cx, cz);
+        let mut rad = base;
+        for j in 0..lobes {
+            if j > 0 {
+                let prev = rad;
+                rad *= taper * (0.85 + 0.3 * r());
+                let step = (prev + rad) * 0.55 * if kind == 1 { aspect * 0.8 } else { 1.0 };
+                // Of three bends, take the one heading into the most room
+                // (farthest from the other continents' centres).
+                let mut best = (dir, f64::MIN);
+                for _ in 0..3 {
+                    let d = dir + (r() - 0.5) * 2.0 * turn;
+                    let (nx, nz) = (x + libm::cos(d) * step, z + libm::sin(d) * step);
+                    let room = centres
+                        .iter()
+                        .filter(|&&c| c != (cx, cz))
+                        .map(|&(a, b)| (nx - a).hypot(nz - b))
+                        .fold(f64::MAX, f64::min);
+                    if room > best.1 {
+                        best = (d, room);
+                    }
+                }
+                dir = best.0;
+                x += libm::cos(dir) * step;
+                z += libm::sin(dir) * step;
+                // Bounce off the border zone, which is kept as ocean.
+                if !(0.15 * width..0.85 * width).contains(&x) || !(0.15 * depth..0.85 * depth).contains(&z) {
+                    x = x.clamp(0.15 * width, 0.85 * width);
+                    z = z.clamp(0.15 * depth, 0.85 * depth);
+                    dir += std::f64::consts::PI * (0.6 + 0.3 * r());
+                }
+            }
+            let a = aspect * (0.85 + 0.3 * r());
+            plan.land.push(Ellipse::new(x, z, dir + (r() - 0.5) * 0.5, rad * a.sqrt(), rad / a.sqrt()));
+        }
+        let body = plan.land.len();
+        plan.body = body;
+        // A point on the outer coast and the outward direction there:
+        // start on a random body lobe's rim and walk out until no lobe
+        // covers the point (a feature placed inside the union
+        // would put a gulf in the middle of the land). Of a few tries, keep
+        // the one with the shortest walk, where the coast is convex.
+        let coast_point = |r: &mut dyn FnMut() -> f64, land: &[Ellipse]| -> (Ellipse, f64, f64, f64) {
+            let union = |x: f64, z: f64| land.iter().fold(-1.0f64, |f, e| f.max(1.0 - e.dist(x, z)));
+            let mut best = (land[0], 0.0, 0.0, 0.0, f64::MAX);
+            for _ in 0..6 {
+                let host = land[(r() * body as f64) as usize];
+                let a = r() * tau;
+                let (mut px, mut pz) = host.rim(a);
+                let out = host.normal(a);
+                let step = 0.05 * host.rx.min(host.rz);
+                let mut walked = 0.0;
+                while union(px, pz) > 0.0 && walked < 40.0 * step {
+                    px += libm::cos(out) * step;
+                    pz += libm::sin(out) * step;
+                    walked += step;
+                }
+                if walked < best.4 {
+                    best = (host, out, px, pz, walked);
+                }
+            }
+            (best.0, best.1, best.2, best.3)
+        };
+        // Gulfs and inland seas (Gulf of California, Red Sea, Baltic,
+        // Mediterranean): long water ellipses reaching in from the rim, so
+        // they open onto the ocean.
+        for _ in 0..gulfs {
+            let (host, out, px, pz) = coast_point(&mut r, &plan.land);
+            let inward = out + std::f64::consts::PI + (r() - 0.5) * 0.8;
+            let reach = if kind == 2 { 0.6 + 0.5 * r() } else { 0.35 + 0.4 * r() };
+            let len = host.rx.min(host.rz) * reach;
+            let wide = len * (0.3 + 0.3 * r());
+            let (gx, gz) = (px + libm::cos(inward) * len * 0.4, pz + libm::sin(inward) * len * 0.4);
+            plan.water.push(Ellipse::new(gx, gz, inward, len, wide));
+        }
+        // Peninsulas (Iberia, Italy, Baja California, Cape York): thin
+        // lobes leaving the rim outwards.
+        for _ in 0..peninsulas {
+            let (host, out, px, pz) = coast_point(&mut r, &plan.land);
+            let out = out + (r() - 0.5) * 0.9;
+            let len = host.rx.min(host.rz) * (0.7 + 0.7 * r());
+            let thick = len * (0.2 + 0.2 * r());
+            let (ox, oz) = (px + libm::cos(out) * len * 0.55, pz + libm::sin(out) * len * 0.55);
+            plan.land.push(Ellipse::new(ox, oz, out, len, thick));
+        }
+        // Offshore islands (Britain, Tasmania, Vancouver Island).
+        for _ in 0..islands {
+            let (host, out, px, pz) = coast_point(&mut r, &plan.land);
+            let size = host.rx.min(host.rz) * (0.12 + 0.18 * r());
+            let gap = size * (1.3 + 0.8 * r());
+            let stretch = 1.0 + 2.0 * r();
+            plan.land.push(Ellipse::new(
+                px + libm::cos(out) * gap,
+                pz + libm::sin(out) * gap,
+                out + std::f64::consts::FRAC_PI_2 + (r() - 0.5),
+                size * stretch.sqrt(),
+                size / stretch.sqrt(),
+            ));
+        }
+        plans.push(plan);
+    }
+    // Scale every continent about its centre so the planned land covers
+    // ~36 % of the map (measured on a coarse grid, since lobes overlap).
+    // Each continent may grow only until its body would come within a
+    // strait of its Voronoi border or near the world border, so shapes are
+    // kept whole instead of being cut straight; the others grow to make up
+    // the area.
+    let target = 0.36;
+    let room = |i: usize| -> f64 {
+        let p = &plans[i];
+        let (lo_x, hi_x, lo_z, hi_z) = (0.07 * width, 0.93 * width, 0.07 * depth, 0.93 * depth);
+        let mut s = 8.0f64;
+        for e in &p.land[..p.body] {
+            for t in 0..16 {
+                let (x, z) = e.rim(t as f64 * tau / 16.0);
+                let (vx, vz) = (x - p.cx, z - p.cz);
+                for (v, c, lo, hi) in [(vx, p.cx, lo_x, hi_x), (vz, p.cz, lo_z, hi_z)] {
+                    if v > 1e-9 {
+                        s = s.min((hi - c) / v);
+                    } else if v < -1e-9 {
+                        s = s.min((lo - c) / v);
+                    }
+                }
+                for (j, q) in plans.iter().enumerate() {
+                    if j != i {
+                        let (nx, nz) = (q.cx - p.cx, q.cz - p.cz);
+                        let len = nx.hypot(nz);
+                        let reach = (vx * nx + vz * nz) / len;
+                        if reach > 1e-9 {
+                            s = s.min((0.5 * len - 1.2 * STRAIT_KM).max(0.0) / reach);
+                        }
+                    }
+                }
+            }
+        }
+        s.max(0.05)
+    };
+    let limits: Vec<f64> = (0..plans.len()).map(room).collect();
+    let scaled = |sg: f64| -> Vec<ContinentPlan> {
+        let mut out = plans.clone();
+        for (p, &lim) in out.iter_mut().zip(&limits) {
+            let (cx, cz, k) = (p.cx, p.cz, sg.min(lim));
+            for e in p.land.iter_mut().chain(p.water.iter_mut()) {
+                e.scale(cx, cz, k);
+            }
+        }
+        out
+    };
+    let coverage = |plans: &[ContinentPlan]| -> f64 {
+        let g = 128;
+        let mut covered = 0;
+        for j in 0..g {
+            for i in 0..g {
+                let (x, z) = ((i as f64 + 0.5) / g as f64 * width, (j as f64 + 0.5) / g as f64 * depth);
+                covered += (planned_field(plans, x, z, STRAIT_KM).0 > 0.0) as usize;
+            }
+        }
+        covered as f64 / (g * g) as f64
+    };
+    let (mut lo, mut hi) = (0.05f64, 8.0f64);
+    for _ in 0..14 {
+        let mid = (lo * hi).sqrt();
+        if coverage(&scaled(mid)) < target {
+            lo = mid;
+        } else {
+            hi = mid;
+        }
+    }
+    let mut plans = scaled(lo);
+    // Peninsulas and islands that still reach across are shortened.
+    for i in 0..plans.len() {
+        for l in plans[i].body..plans[i].land.len() {
+            let e = plans[i].land[l];
+            let worst = (0..16)
+                .map(|t| {
+                    let (x, z) = e.rim(t as f64 * tau / 16.0);
+                    voronoi_margin(&plans, i, x, z) - 1.2 * STRAIT_KM
+                })
+                .fold(f64::MAX, f64::min);
+            if worst < 0.0 {
+                let e = &mut plans[i].land[l];
+                e.rx = (e.rx + worst).max(0.25 * e.rx);
+                e.rz = (e.rz + worst).max(0.25 * e.rz);
+            }
+        }
+    }
+    plans
+}
+
 #[inline]
 fn bump(d: f64, centre: f64, width: f64) -> f64 {
     let t = (d - centre) / width;
@@ -129,36 +527,58 @@ pub fn build(seed: u64, planet: Planet, w: usize, h: usize, km: f64) -> Tectonic
             }
             (0.11, 0.9, 0.45)
         }
-        _ => {
-            let k = 5 + rng.next_bounded(3) as usize;
-            for _ in 0..k {
-                blobs.push((
-                    width_km * (0.1 + 0.8 * rng.next_f64()),
-                    depth_km * (0.1 + 0.8 * rng.next_f64()),
-                    (0.05 + 0.06 * rng.next_f64()) * width_km,
-                ));
-            }
-            (0.40, 0.55, 0.15)
-        }
+        _ => (0.32, 0.55, 0.15),
     };
+    let plans = if planet == Planet::Continents { plan_continents(seed, width_km, depth_km) } else { Vec::new() };
+    let mid_warp_x = fbm("realistic/crust_mid_warp_x", -10, 3);
+    let mid_warp_z = fbm("realistic/crust_mid_warp_z", -10, 3);
+    let strait_noise = fbm("realistic/crust_straits", -11, 2);
     let field_at = |i: usize| -> f32 {
         let (x, z) = pos(i);
-        let wx = x + 1100.0 * warp_x.sample_2d(x, z);
-        let wz = z + 1100.0 * warp_z.sample_2d(x, z);
+        // Planned continents keep more of their outline: a smaller warp.
+        let warp = if plans.is_empty() { 1100.0 } else { 650.0 };
+        let wx = x + warp * warp_x.sample_2d(x, z);
+        let wz = z + warp * warp_z.sample_2d(x, z);
         let mut f: f64 = -1.0;
-        for &(bx, bz, r) in &blobs {
-            let d = ((wx - bx) * (wx - bx) + (wz - bz) * (wz - bz)).sqrt();
-            f = f.max(1.0 - d / r);
+        if plans.is_empty() {
+            for &(bx, bz, r) in &blobs {
+                let d = ((wx - bx) * (wx - bx) + (wz - bz) * (wz - bz)).sqrt();
+                f = f.max(1.0 - d / r);
+            }
+            f += noise_weight * crust_noise.sample_2d(wx, wz) * 2.2 + fine_weight * fine_noise.sample_2d(wx, wz) * 2.2;
+        } else {
+            let bridge = smoothstep(0.15, 0.35, strait_noise.sample_2d(wx, wz));
+            let gap = lerp(bridge, STRAIT_KM, -STRAIT_KM);
+            let (f1, rug) = planned_field(&plans, wx, wz, gap);
+            // A rugged coast is warped again at a finer scale, which bends
+            // it into peninsulas and bays, then roughened by finer noise.
+            let mx = wx + 550.0 * rug * mid_warp_x.sample_2d(wx, wz);
+            let mz = wz + 550.0 * rug * mid_warp_z.sample_2d(wx, wz);
+            let g = planned_field(&plans, mx, mz, gap).0;
+            f = lerp(rug, f1, g);
+            f += lerp(rug, 0.18, 0.3) * crust_noise.sample_2d(mx, mz) * 2.2
+                + lerp(rug, 0.05, 0.3) * fine_noise.sample_2d(mx, mz) * 2.2;
         }
-        f += noise_weight * crust_noise.sample_2d(wx, wz) * 2.2 + fine_weight * fine_noise.sample_2d(wx, wz) * 2.2;
         // The world border is open ocean: keep continents off the edges so
         // no coast is cut by the border.
         let edge = (x.min(width_km - x).min(z).min(depth_km - z)) / width_km;
-        f -= 3.0 * (1.0 - smoothstep(0.0, 0.08, edge));
+        if plans.is_empty() {
+            f -= 3.0 * (1.0 - smoothstep(0.0, 0.08, edge));
+        } else {
+            // Measured on the warped point, the margin bends like any
+            // other coast instead of running straight along the border;
+            // a thin strict band still keeps the border itself at sea.
+            let bent = (wx.min(width_km - wx).min(wz).min(depth_km - wz)) / width_km;
+            f -= 3.0 * (1.0 - smoothstep(0.0, 0.08, bent)) + 3.0 * (1.0 - smoothstep(0.0, 0.025, edge));
+        }
         f as f32
     };
     let field = Grid { w, h, data: (0..n).into_par_iter().map(field_at).collect() };
+    // A planned layout already has about the right amount of land; an
+    // unbounded quantile would inflate it (merging continents) whenever the
+    // plan came out small.
     let threshold = field.quantile(1.0 - fraction) as f64;
+    let threshold = if plans.is_empty() { threshold } else { threshold.clamp(-0.15, 0.15) };
     let continental: Vec<bool> = field.data.iter().map(|&f| f as f64 > threshold).collect();
 
     // Signed distance (km) to the crust edge: + on continental crust.
@@ -610,6 +1030,93 @@ fn hotspots(
     }
 }
 
+/// Shape statistics of the land on a grid (elevation ≥ 0 is land), used to
+/// compare generated continents with the real Earth.
+#[derive(Clone, Debug)]
+pub struct LandShape {
+    /// Connected landmasses (4-neighbour) as (cells, coast cells), largest
+    /// first.
+    pub masses: Vec<(usize, usize)>,
+    /// All cells of the grid.
+    pub cells: usize,
+}
+
+impl LandShape {
+    fn land(&self) -> usize {
+        self.masses.iter().map(|m| m.0).sum()
+    }
+    /// Share of the grid that is land.
+    pub fn land_share(&self) -> f64 {
+        self.land() as f64 / self.cells.max(1) as f64
+    }
+    /// Landmasses of at least `share` of all land (continents, not islands).
+    pub fn continents(&self, share: f64) -> usize {
+        let land = self.land() as f64;
+        self.masses.iter().filter(|m| m.0 as f64 >= share * land).count()
+    }
+    /// Mean coastline complexity of the continents (landmasses of at least
+    /// `share` of the land): coast cells / √cells. A disc scores ~3.5;
+    /// peninsulas, gulfs and inland seas score more.
+    pub fn coast_index(&self, share: f64) -> f64 {
+        let land = self.land() as f64;
+        let c: Vec<f64> = self
+            .masses
+            .iter()
+            .filter(|m| m.0 as f64 >= share * land)
+            .map(|&(a, c)| c as f64 / (a as f64).sqrt())
+            .collect();
+        c.iter().sum::<f64>() / c.len().max(1) as f64
+    }
+    /// Share of the land in islands (landmasses under `share` of the land).
+    pub fn island_share(&self, share: f64) -> f64 {
+        let land = self.land() as f64;
+        self.masses.iter().filter(|m| (m.0 as f64) < share * land).map(|m| m.0 as f64).sum::<f64>() / land.max(1.0)
+    }
+}
+
+pub fn land_shape(elevation: &Grid<f32>) -> LandShape {
+    let (w, h) = (elevation.w, elevation.h);
+    let land = |i: usize, j: usize| elevation.get(i, j) >= 0.0;
+    let nb = [(1isize, 0isize), (-1, 0), (0, 1), (0, -1)];
+    let coastal = |i: usize, j: usize| {
+        nb.iter().any(|&(a, b)| {
+            let (x, y) = (i as isize + a, j as isize + b);
+            x >= 0 && y >= 0 && x < w as isize && y < h as isize && !land(x as usize, y as usize)
+        })
+    };
+    let mut seen = vec![false; w * h];
+    let mut masses = Vec::new();
+    for j in 0..h {
+        for i in 0..w {
+            if !land(i, j) || seen[i + j * w] {
+                continue;
+            }
+            // Flood fill one landmass.
+            let mut stack = vec![(i, j)];
+            seen[i + j * w] = true;
+            let (mut size, mut coast) = (0, 0);
+            while let Some((x, y)) = stack.pop() {
+                size += 1;
+                coast += coastal(x, y) as usize;
+                for (a, b) in nb {
+                    let (nx, ny) = (x as isize + a, y as isize + b);
+                    if nx < 0 || ny < 0 || nx >= w as isize || ny >= h as isize {
+                        continue;
+                    }
+                    let (nx, ny) = (nx as usize, ny as usize);
+                    if land(nx, ny) && !seen[nx + ny * w] {
+                        seen[nx + ny * w] = true;
+                        stack.push((nx, ny));
+                    }
+                }
+            }
+            masses.push((size, coast));
+        }
+    }
+    masses.sort_unstable_by(|a, b| b.cmp(a));
+    LandShape { masses, cells: w * h }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -652,5 +1159,34 @@ mod tests {
             let median = sea[sea.len() / 2];
             assert!((-6000.0..-3500.0).contains(&median), "{planet:?}: median ocean depth {median}");
         }
+    }
+
+    /// The Continents planet looks like Earth's map, not like one or two
+    /// blobs: several separate continents (Earth has 5 at this
+    /// resolution), none holding most of the land, about Earth's share of
+    /// land, and coasts at least as intricate as a disc's (3.5).
+    #[test]
+    fn continents_are_many_separate_and_intricate() {
+        let (w, km) = (384, 40_000.0 / 384.0);
+        let (mut total, mut largest) = (0, 0.0);
+        for seed in 1..=8 {
+            let t = build(seed, Planet::Continents, w, w, km);
+            let s = land_shape(&t.elevation);
+            let count = s.continents(0.02);
+            let big = s.masses[0].0 as f64 / s.masses.iter().map(|m| m.0).sum::<usize>() as f64;
+            let land = s.land_share();
+            println!(
+                "seed {seed}: {count} continents, largest {big:.2}, land {land:.2}, coast {:.1}",
+                s.coast_index(0.02)
+            );
+            assert!(count >= 3, "seed {seed}: only {count} continents");
+            assert!(big < 0.7, "seed {seed}: one landmass holds {big:.2} of the land");
+            assert!((0.12..0.4).contains(&land), "seed {seed}: land share {land:.2}");
+            assert!(s.coast_index(0.02) > 5.0, "seed {seed}: coast index {:.1}", s.coast_index(0.02));
+            total += count;
+            largest += big;
+        }
+        assert!(total as f64 / 8.0 >= 4.5, "mean {} continents", total as f64 / 8.0);
+        assert!(largest / 8.0 < 0.5, "mean largest landmass {:.2}", largest / 8.0);
     }
 }

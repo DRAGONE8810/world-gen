@@ -29,6 +29,7 @@ pub mod rng;
 pub mod settings;
 pub mod spline;
 pub mod terrain;
+pub mod tint;
 pub mod trees;
 
 pub use biome::Biome;
@@ -38,3 +39,4 @@ pub use generator::{ColumnSample, WorldGenerator};
 pub use settings::{
     Generator, Planet, SimQuality, WorldSettings, WorldSize, WorldType, MAX_Y, MIN_Y, SEA_LEVEL, WORLD_HEIGHT,
 };
+pub use tint::Tint;

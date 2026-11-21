@@ -120,6 +120,9 @@ pub struct RealisticWorld {
     lake: Grid<f32>,
     /// 1 where a cell is the open sea (connected to the world ocean).
     sea: Grid<f32>,
+    /// 1 where a cell is land below sea level cut off from the open sea
+    /// (Dead Sea, Caspian depression): it stays dry unless it is a lake.
+    basin: Grid<f32>,
 
     nodes: Vec<RiverNode>,
     reaches: Vec<Reach>,
@@ -203,6 +206,11 @@ impl RealisticWorld {
             water_balance_lakes(&elevation, &drainage, &sea, &discharge, &clim, area_m2)
         };
 
+        let basin = Grid {
+            w,
+            h,
+            data: (0..w * h).map(|i| (sea.data[i] < 0.5 && elevation.data[i] < 0.0) as u8 as f32).collect(),
+        };
         let mut world = Self {
             w,
             h,
@@ -223,6 +231,7 @@ impl RealisticWorld {
             temperature: clim.temperature,
             humidity: clim.aridity.map(|a| climate::biome_humidity(a as f64) as f32),
             lake,
+            basin,
             sea,
             nodes: Vec::new(),
             reaches: Vec::new(),
@@ -512,7 +521,6 @@ impl RealisticWorld {
         // kink in it at cell edges would show as a straight crease.
         let m = self.mountain.bicubic(wu, wv).clamp(0.0, 1.0);
         let relief = self.relief.bicubic(wu, wv).max(60.0);
-        let sea = self.sea.bilinear(u0, v0);
         let (sc, ss) = (self.strike_c.bilinear(wu, wv), self.strike_s.bilinear(wu, wv));
         let sl = (sc * sc + ss * ss).sqrt().max(1e-9);
         let (c2, s2) = (sc / sl, ss / sl);
@@ -589,10 +597,24 @@ impl RealisticWorld {
             roughness = lerp(smoothstep(0.1, 0.5, mask), roughness, roughness.min(1.0));
         }
 
-        // Land below sea level that isn't open sea stays dry (Dead Sea,
-        // Caspian depression) unless it is a lake.
-        if sea <= 0.0 && lake.is_none_or(|(_, m)| m < 0.5) && height < SEA_LEVEL as f64 {
-            water = f64::NEG_INFINITY;
+        // Land below sea level inside a closed depression (Dead Sea,
+        // Caspian depression) stays dry unless it is a lake. Everywhere
+        // else the sea fills anything below its level. The depression mask
+        // is sampled through the same warp as the terrain: a basin cell
+        // never touches an open-sea cell, so its 0.5 contour lies inland,
+        // and coasts follow the terrain instead of the grid. (A per-cell
+        // sea mask used here once cut the sea off in straight lines.)
+        let basin = self.basin.bilinear(wu, wv);
+        if basin > 0.25 && lake.is_none_or(|(_, m)| m < 0.5) {
+            // The terrain between grid cells can still dip below the sea
+            // across that contour, so the basin gets a rim: just outside
+            // it the land is lifted to sea level, and the sea and the dry
+            // depression never meet.
+            let rim = smoothstep(0.25, 0.4, basin) * (1.0 - smoothstep(0.5, 0.65, basin));
+            height = height.max(lerp(rim, height, SEA_LEVEL as f64 + 1.0));
+            if basin > 0.5 && height < SEA_LEVEL as f64 {
+                water = f64::NEG_INFINITY;
+            }
         }
 
         if let Some((dist, level, width, depth, q)) = near_river {
@@ -792,6 +814,65 @@ mod tests {
 
     fn cell(r: &RealisticWorld, lat: f64, lon: f64) -> (isize, isize) {
         (((lon + 180.0) / 360.0 * r.w as f64) as isize, ((90.0 - lat) / 180.0 * r.h as f64) as isize)
+    }
+
+    /// Near the open sea, every column below sea level is under water
+    /// unless land at or above sea level shuts it off (a basin rim): the
+    /// coast follows the terrain, never a "wall" where the sea stops (the
+    /// dry-depression rule once used a per-cell sea mask, so dry land below
+    /// sea level appeared in rectangles along coasts).
+    #[test]
+    fn coasts_never_hold_back_the_sea() {
+        for planet in [Planet::Continents, Planet::Islands, Planet::Earth] {
+            let r = RealisticWorld::new(&WorldSettings {
+                generator: crate::settings::Generator::Realistic,
+                planet,
+                quality: SimQuality::Fast,
+                size: WorldSize::from_km(4_000.0),
+                ..Default::default()
+            });
+            let (mut walls, mut checked) = (0, 0);
+            let n = 700;
+            let half = (r.w as f64 * r.cell_blocks / 2.0) as i64;
+            let halfz = (r.h as f64 * r.cell_blocks / 2.0) as i64;
+            for j in 0..n {
+                for i in 0..n {
+                    let x = (-half + 2 * half * i / n) as i32;
+                    let z = (-halfz + 2 * halfz * j / n) as i32;
+                    let s = r.shape(x, z);
+                    if s.height >= SEA_LEVEL as f64 - 1.0 {
+                        continue;
+                    }
+                    // Within one cell of the open sea.
+                    let (u, v) = ((x as f64 - r.x0) / r.cell_blocks, (z as f64 - r.z0) / r.cell_blocks);
+                    let near_sea = (-1..=1)
+                        .any(|a| (-1..=1).any(|b| r.sea.at(u.floor() as isize + a, v.floor() as isize + b) > 0.5));
+                    if near_sea {
+                        checked += 1;
+                        if s.water < SEA_LEVEL {
+                            // A dry column below the sea must be cut off
+                            // from it by land at or above sea level (a
+                            // basin rim); open water first would be a wall.
+                            let reach = (2.0 * r.cell_blocks) as i32;
+                            for (dx, dz) in [(1, 0), (-1, 0), (0, 1), (0, -1), (1, 1), (1, -1), (-1, 1), (-1, -1)] {
+                                for k in 1..=reach {
+                                    let t = r.shape(x + dx * k, z + dz * k);
+                                    if t.height >= SEA_LEVEL as f64 {
+                                        break;
+                                    }
+                                    if t.water >= SEA_LEVEL {
+                                        walls += 1;
+                                        break;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            assert!(checked > 1000, "{planet:?}: only {checked} coastal columns");
+            assert_eq!(walls, 0, "{planet:?}: {walls} of {checked} coastal columns below sea level are walled off");
+        }
     }
 
     /// The real Earth gets its real lakes at their real levels (the

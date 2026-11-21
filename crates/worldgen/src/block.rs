@@ -95,6 +95,8 @@ blocks! {
     43 MUSHROOM_STEM      "mushroom_stem"       [203, 196, 185]  Opaque,
     44 RED_MUSHROOM_BLOCK "red_mushroom_block"  [200, 46, 45]    Opaque,
     45 BROWN_MUSHROOM_BLOCK "brown_mushroom_block" [149, 111, 81] Opaque,
+    // Step 7: coral sand of tropical beaches.
+    46 WHITE_SAND         "white_sand"          [240, 233, 208]  Opaque,
 }
 
 impl BlockId {

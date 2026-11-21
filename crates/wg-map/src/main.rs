@@ -342,7 +342,7 @@ fn pixel_color(layer: Layer, s: &ColumnSample, se: &ColumnSample, blocks_per_px:
             } else if s.underwater {
                 water(((s.shape.water - s.surface_y) as f64 / s.shape.scale()) as i32)
             } else {
-                shaded(s.top_color())
+                shaded(s.orbit_color())
             }
         }
         Layer::Biome => {
