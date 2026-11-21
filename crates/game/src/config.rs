@@ -69,7 +69,7 @@ impl GraphicsPreset {
         match self {
             GraphicsPreset::Optimized => (8, 64, false),
             GraphicsPreset::Balanced => (12, 128, false),
-            GraphicsPreset::Quality => (24, MAX_LOD_DISTANCE, true),
+            GraphicsPreset::Quality => (24, 256, true),
         }
     }
 
@@ -93,8 +93,10 @@ impl GraphicsPreset {
 
 /// Full-detail radius range, in chunks.
 pub const MAX_RENDER_DISTANCE: u32 = 64;
-/// LOD radius range: 256 chunks = 512 × 512 = 262,144 chunks of area.
-pub const MAX_LOD_DISTANCE: u32 = 256;
+/// LOD radius range: up to 262,144 chunks (4,194,304 blocks, a 8,400 km
+/// wide view). Detail halves each time the distance doubles, so this is
+/// only ~10 more rings of tiles than 256 chunks (see `lod.rs`).
+pub const MAX_LOD_DISTANCE: u32 = 262_144;
 
 /// Fly speed range. The top end (2^20 ≈ 1 million blocks/s) crosses the
 /// full 60,000 km world in about a minute; chunk generation can't keep up at
@@ -130,7 +132,9 @@ impl GameSettings {
             // From a corner, the opposite corner is one world width away.
             world_chunks.max(detail + 1)
         } else if self.lod_distance > self.render_distance {
-            (self.lod_distance as f64 * terrain_scale.max(1.0)).round() as i32
+            // Never further than the whole world needs.
+            let scaled = (self.lod_distance as f64 * terrain_scale.max(1.0)).round() as i32;
+            scaled.min(world_chunks.max(detail + 1))
         } else {
             0
         };
@@ -175,6 +179,12 @@ mod tests {
         s.whole_world = true;
         let l = s.layout(1.0, 3_749_998, 7);
         assert_eq!((l.lod, l.altitude), (3_749_998, 7));
+        // The longest LOD distance, magnified by a tall world, stops at the world's width.
+        s.whole_world = false;
+        s.lod_distance = MAX_LOD_DISTANCE;
+        assert_eq!(s.layout(46.0, 3_749_998, 0).lod, 3_749_998);
+        assert_eq!(s.layout(1.0, 3_749_998, 0).lod, 262_144);
+        s.whole_world = true;
         // A 1 km world still gets LOD rings past the render distance.
         assert!(s.layout(1.0, 63, 0).lod_enabled());
         // Old settings files without the field load with it off.

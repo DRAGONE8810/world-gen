@@ -421,7 +421,8 @@ pub fn format_km(km: f64) -> String {
 }
 
 /// `17696` → `"17,696"`.
-pub fn group_thousands(n: u32) -> String {
+pub fn group_thousands(n: impl Into<u64>) -> String {
+    let n: u64 = n.into();
     let digits = n.to_string();
     let mut out = String::new();
     for (i, c) in digits.chars().enumerate() {
@@ -473,7 +474,10 @@ pub fn settings(ui: &mut egui::Ui, s: &mut GameSettings) -> bool {
                 ui.vertical(|ui| {
                     ui.add_enabled(
                         !s.whole_world,
-                        egui::Slider::new(&mut s.lod_distance, 0..=crate::config::MAX_LOD_DISTANCE).suffix(" chunks"),
+                        // Logarithmic: 16 and 262,144 chunks both need fine control.
+                        egui::Slider::new(&mut s.lod_distance, 0..=crate::config::MAX_LOD_DISTANCE)
+                            .logarithmic(true)
+                            .suffix(" chunks"),
                     );
                     ui.checkbox(&mut s.whole_world, "Whole world");
                     let side = 2 * s.lod_distance.max(s.render_distance) as u64;
@@ -486,10 +490,10 @@ pub fn settings(ui: &mut egui::Ui, s: &mut GameSettings) -> bool {
                         } else if s.lod_distance > s.render_distance {
                             format!(
                                 "Simplified terrain out to {} blocks ({} × {} = {} chunks of area). Tall worlds see further, by their terrain scale.",
-                                group_thousands(s.lod_distance * 16),
+                                group_thousands(s.lod_distance as u64 * 16),
                                 side,
                                 side,
-                                group_thousands((side * side) as u32)
+                                group_thousands(side * side)
                             )
                         } else {
                             "Off: set it above the render distance.".to_string()
@@ -698,8 +702,8 @@ mod tests {
         assert_eq!(format_km(16.0), "16 km");
         assert_eq!(format_km(1000.0), "1,000 km");
         assert_eq!(format_km(59_999.968), "60,000 km (full)");
-        assert_eq!(group_thousands(256), "256");
-        assert_eq!(group_thousands(17_696), "17,696");
-        assert_eq!(group_thousands(1_048_576), "1,048,576");
+        assert_eq!(group_thousands(256u32), "256");
+        assert_eq!(group_thousands(17_696u32), "17,696");
+        assert_eq!(group_thousands(1_048_576u32), "1,048,576");
     }
 }
