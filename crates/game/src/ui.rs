@@ -263,7 +263,11 @@ pub fn settings(ui: &mut egui::Ui, s: &mut GameSettings) -> bool {
                 ui.add(egui::Slider::new(&mut s.mouse_sensitivity, 0.1..=3.0));
                 ui.end_row();
                 ui.label("Fly speed");
-                ui.add(egui::Slider::new(&mut s.fly_speed, 5.0..=500.0).logarithmic(true).suffix(" blocks/s"));
+                ui.add(
+                    egui::Slider::new(&mut s.fly_speed, crate::config::MIN_FLY_SPEED..=crate::config::MAX_FLY_SPEED)
+                        .logarithmic(true)
+                        .suffix(" blocks/s"),
+                );
                 ui.end_row();
                 ui.label("VSync");
                 ui.checkbox(&mut s.vsync, "Limit FPS to the monitor refresh rate");
@@ -313,6 +317,7 @@ pub struct HudInfo<'a> {
     pub gpu: &'a str,
     pub pending: usize,
     pub show_debug: bool,
+    pub fly_speed: f32,
 }
 
 pub fn hud(ui: &mut egui::Ui, h: &HudInfo) {
@@ -325,6 +330,7 @@ pub fn hud(ui: &mut egui::Ui, h: &HudInfo) {
                     let mono = |s: String| RichText::new(s).monospace().color(Color32::WHITE);
                     ui.label(mono(format!("{:.0} fps ({:.1} ms)   {}", h.fps, h.frame_ms, h.gpu)));
                     ui.label(mono(format!("XYZ  {:.1} / {:.1} / {:.1}", h.pos.x, h.pos.y, h.pos.z)));
+                    ui.label(mono(format!("Speed {} blocks/s  (wheel: ×2 / ÷2, Ctrl ×5)", format_speed(h.fly_speed))));
                     let (cx, cz) = ((h.pos.x.floor() as i64) >> 4, (h.pos.z.floor() as i64) >> 4);
                     ui.label(mono(format!("Chunk {cx} {cz}")));
                     ui.label(mono(format!(
@@ -392,16 +398,41 @@ pub fn hud(ui: &mut egui::Ui, h: &HudInfo) {
         &ctx,
         |ui| {
             ui.label(
-                RichText::new("WASD move · Space / Shift up / down · Ctrl faster · Esc pause · F3 debug")
-                    .color(Color32::from_white_alpha(200)),
+                RichText::new(
+                    "WASD move · Space / Shift up / down · Wheel speed ×2 / ÷2 · Ctrl faster · Esc pause · F3 debug",
+                )
+                .color(Color32::from_white_alpha(200)),
             );
         },
     );
 }
 
+/// "0.25", "20", "1,048,576".
+fn format_speed(v: f32) -> String {
+    if v < 10.0 {
+        return format!("{}", (v * 100.0).round() / 100.0);
+    }
+    let digits = format!("{}", v.round() as u64);
+    let mut out = String::new();
+    for (i, ch) in digits.chars().enumerate() {
+        if i > 0 && (digits.len() - i).is_multiple_of(3) {
+            out.push(',');
+        }
+        out.push(ch);
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn speed_formatting() {
+        assert_eq!(format_speed(0.25), "0.25");
+        assert_eq!(format_speed(20.0), "20");
+        assert_eq!(format_speed(1_048_576.0), "1,048,576");
+    }
 
     #[test]
     fn km_formatting() {

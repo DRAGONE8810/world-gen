@@ -22,7 +22,7 @@ use std::sync::Arc;
 use std::time::Instant;
 use ui::{Action, Screen, WorldForm};
 use winit::application::ApplicationHandler;
-use winit::event::{DeviceEvent, DeviceId, ElementState, KeyEvent, WindowEvent};
+use winit::event::{DeviceEvent, DeviceId, ElementState, KeyEvent, MouseScrollDelta, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
 use winit::keyboard::{KeyCode, PhysicalKey};
 use winit::window::{CursorGrabMode, Window, WindowId};
@@ -49,6 +49,8 @@ struct App {
     form: WorldForm,
     session: Option<Session>,
     keys: HashSet<KeyCode>,
+    /// Touchpads scroll in pixels; collect them until they add up to a notch.
+    wheel_pixels: f64,
     last_frame: Instant,
     fps: f32,
     frame_ms: f32,
@@ -74,6 +76,7 @@ impl App {
             form,
             session: None,
             keys: HashSet::new(),
+            wheel_pixels: 0.0,
             last_frame: Instant::now(),
             fps: 0.0,
             frame_ms: 0.0,
@@ -223,6 +226,7 @@ impl App {
                             gpu: &gpu,
                             pending,
                             show_debug: self.settings.show_debug,
+                            fly_speed: self.settings.fly_speed,
                         },
                     );
                 }
@@ -379,6 +383,24 @@ impl ApplicationHandler for App {
                     self.keys.remove(&code);
                 }
             },
+            WindowEvent::MouseWheel { delta, .. } if self.screen == Screen::Playing => {
+                // Each notch doubles (wheel up) or halves (wheel down) the fly
+                // speed, so going from walking pace to crossing a continent
+                // takes a few flicks instead of a settings menu.
+                let notches = match delta {
+                    MouseScrollDelta::LineDelta(_, y) => y.round() as i32,
+                    MouseScrollDelta::PixelDelta(p) => {
+                        const PIXELS_PER_NOTCH: f64 = 60.0;
+                        self.wheel_pixels += p.y;
+                        let n = (self.wheel_pixels / PIXELS_PER_NOTCH).trunc();
+                        self.wheel_pixels -= n * PIXELS_PER_NOTCH;
+                        n as i32
+                    }
+                };
+                if notches != 0 {
+                    self.settings.fly_speed = config::wheel_speed(self.settings.fly_speed, notches);
+                }
+            }
             WindowEvent::RedrawRequested => self.redraw(event_loop),
             _ => {}
         }

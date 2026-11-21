@@ -39,6 +39,7 @@ Linux; shaders are compiled by the build itself.
 | Mouse | look |
 | W A S D | move |
 | Space / Shift | up / down |
+| Mouse wheel | fly speed ×2 (up) / ÷2 (down), 0.25 to ~1 million blocks/s |
 | Ctrl | 5× speed |
 | Esc | pause menu |
 | F3 | debug overlay |
