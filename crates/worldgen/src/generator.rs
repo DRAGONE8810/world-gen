@@ -32,20 +32,23 @@
 
 use crate::biome::{self, Biome};
 use crate::block::{blocks, BlockId};
-use crate::chunk::{Chunk, ChunkPos, CHUNK_SIZE, SECTIONS_PER_CHUNK};
+use crate::chunk::{Chunk, ChunkPos, CHUNK_SIZE};
 use crate::noise::{OctaveConfig, OctaveNoise};
 use crate::palette::{section_index, PalettedSection, SECTION_SIZE, SECTION_VOLUME};
 use crate::rng::{derive_seed, hash_position, hash_position_f64, Xoroshiro128PlusPlus};
-use crate::settings::{WorldSettings, WorldType, MAX_Y, MIN_Y, SEA_LEVEL, WORLD_HEIGHT};
+use crate::settings::{WorldSettings, WorldType, SEA_LEVEL};
 use crate::terrain::{Shape, TerrainShaper};
 use crate::trees::{self, Tree, TREE_CELL, TREE_REACH};
 
 /// Horizontal size of a density-noise cell, in blocks.
 const CELL_XZ: i32 = 4;
-/// Vertical size of a density-noise cell, in blocks.
+/// Vertical size of a density-noise cell, in blocks, in a default world.
+/// Tall worlds use 8·k with k the largest power of two ≤ the terrain scale
+/// (max 16): their noise is k times smoother, so coarser cells lose nothing.
 const CELL_Y: i32 = 8;
-/// Number of cell corners stacked vertically over the world height.
-const GRID_Y: usize = (WORLD_HEIGHT / CELL_Y) as usize + 1;
+/// Blocks below the lowest possible surface that can still differ from
+/// stone (surface layers, 40 blocks of badlands terracotta, basalt, …).
+const SUBSURFACE: i32 = 44;
 /// Scales the raw fBm (std ≈ 0.25) so `A` is roughly "blocks of variation".
 const NOISE_GAIN: f64 = 2.5;
 /// Upper bound of `|N|` after gain (fBm is bounded by ~1.04 · gain).
@@ -75,8 +78,10 @@ pub struct ColumnSample {
 }
 
 impl ColumnSample {
+    /// A column outside the world border (`surface_y` is the default
+    /// world's floor; `WorldGenerator::sample_column` sets the real one).
     const OUTSIDE: ColumnSample = ColumnSample {
-        surface_y: MIN_Y - 1,
+        surface_y: crate::settings::MIN_Y - 1,
         top_block: blocks::AIR,
         underwater: false,
         inside: false,
@@ -93,6 +98,7 @@ impl ColumnSample {
             roughness: 0.0,
             river: 0.0,
             island: 0.0,
+            vscale: 1.0,
         },
         biome: Biome::Plains,
         ice: false,
@@ -123,8 +129,15 @@ pub struct WorldGenerator {
     patch: OctaveNoise,
     /// Badlands terracotta colour stripes, one entry per y (mod 32).
     bands: [BlockId; BAND_PERIOD],
-    /// Horizontal stretch: 4 for "Large biomes", else 1.
+    /// Horizontal stretch: 4 for "Large biomes", times the terrain scale.
     scale: f64,
+    /// Terrain scale of the world height (1 for 384 blocks).
+    vscale: f64,
+    min_y: i32,
+    max_y: i32,
+    /// Vertical density-noise cell size and number of grid corners.
+    cell_y: i32,
+    grid_y: usize,
 }
 
 /// Height range of a column where the density noise matters.
@@ -139,9 +152,16 @@ struct Band {
 impl WorldGenerator {
     pub fn new(settings: WorldSettings) -> Self {
         let seed = settings.seed;
-        let scale = if settings.world_type == WorldType::LargeBiomes { 4.0 } else { 1.0 };
+        let vscale = settings.height.terrain_scale();
+        let scale = if settings.world_type == WorldType::LargeBiomes { 4.0 } else { 1.0 } * vscale;
+        let mut k = 1;
+        while k * 2 <= 16 && (k * 2) as f64 <= vscale {
+            k *= 2;
+        }
+        let cell_y = CELL_Y * k;
+        let (min_y, max_y) = (settings.height.min_y(), settings.height.max_y());
         Self {
-            shaper: TerrainShaper::new(seed, settings.world_type),
+            shaper: TerrainShaper::new(seed, settings.world_type, vscale),
             // Features 64 blocks down to 8 blocks: blob-sized overhangs and
             // ledges rather than single-block speckle.
             density_noise: OctaveNoise::new(
@@ -154,8 +174,20 @@ impl WorldGenerator {
             patch: OctaveNoise::new(derive_seed(seed, "surface/patch"), &OctaveConfig::new(-4, &[1.0, 1.0])),
             bands: Self::make_bands(derive_seed(seed, "surface/badlands_bands")),
             scale,
+            vscale,
+            min_y,
+            max_y,
+            cell_y,
+            grid_y: ((max_y - min_y + 1) as usize).div_ceil(cell_y as usize) + 1,
             settings,
         }
+    }
+
+    pub fn min_y(&self) -> i32 {
+        self.min_y
+    }
+    pub fn max_y(&self) -> i32 {
+        self.max_y
     }
 
     pub fn settings(&self) -> &WorldSettings {
@@ -170,7 +202,7 @@ impl WorldGenerator {
     fn column_shape(&self, x: i32, z: i32) -> Shape {
         let mut s = self.shaper.shape(x, z);
         let margin = s.roughness * NOISE_BOUND;
-        s.height = s.height.clamp(MIN_Y as f64 + 8.0 + margin, MAX_Y as f64 - 2.0 - margin);
+        s.height = s.height.clamp(self.min_y as f64 + 8.0 + margin, self.max_y as f64 - 2.0 - margin);
         s
     }
 
@@ -179,11 +211,14 @@ impl WorldGenerator {
         Band { bottom: (shape.height - m).ceil() as i32, top: (shape.height + m).floor() as i32 }
     }
 
-    /// Density noise at grid corner (gx, gy, gz) = block (4gx, MIN_Y + 8gy, 4gz).
+    /// Density noise at grid corner (gx, gy, gz) = block (4gx, min_y + cell_y·gy, 4gz).
     #[inline]
     fn corner(&self, gx: i32, gy: usize, gz: i32) -> f64 {
         let x = (gx * CELL_XZ) as f64 / self.scale;
-        let y = (MIN_Y + gy as i32 * CELL_Y) as f64;
+        let wy = (self.min_y + gy as i32 * self.cell_y) as f64;
+        // Heights are measured in default-world blocks, like x and z, so the
+        // whole 3D noise field is magnified with the terrain.
+        let y = if self.vscale == 1.0 { wy } else { SEA_LEVEL as f64 + (wy - SEA_LEVEL as f64) / self.vscale };
         let z = (gz * CELL_XZ) as f64 / self.scale;
         self.density_noise.sample(x, y, z) * NOISE_GAIN
     }
@@ -192,6 +227,11 @@ impl WorldGenerator {
     /// corners of its cell (order: bit0 = +x, bit1 = +y, bit2 = +z).
     #[inline]
     fn solid(shape: &Shape, y: i32, c: &[f64; 8], fx: f64, fy: f64, fz: f64) -> bool {
+        Self::density(shape, y, c, fx, fy, fz) > 0.0
+    }
+
+    #[inline]
+    fn density(shape: &Shape, y: i32, c: &[f64; 8], fx: f64, fy: f64, fz: f64) -> f64 {
         let x00 = c[0] + fx * (c[1] - c[0]);
         let x10 = c[2] + fx * (c[3] - c[2]);
         let x01 = c[4] + fx * (c[5] - c[4]);
@@ -199,7 +239,43 @@ impl WorldGenerator {
         let y0 = x00 + fy * (x10 - x00);
         let y1 = x01 + fy * (x11 - x01);
         let n = y0 + fz * (y1 - y0);
-        (shape.height - y as f64) + shape.roughness * n > 0.0
+        (shape.height - y as f64) + shape.roughness * n
+    }
+
+    /// Whether every block of a column between `y_lo` and `y_hi` (both in
+    /// the same noise cell) is solid (`Some(true)`), air (`Some(false)`), or
+    /// mixed (`None`).
+    ///
+    /// Inside one cell, trilinear interpolation is linear in y, and so is
+    /// `H − y`, so the density along the column is a straight line: if it
+    /// has the same sign at both ends, it has that sign everywhere in
+    /// between. The small margin covers floating-point rounding, so the
+    /// shortcut never disagrees with evaluating each block. Tall worlds
+    /// have bands thousands of blocks thick; this turns them into a few
+    /// evaluations per cell.
+    #[inline]
+    #[allow(clippy::too_many_arguments)]
+    fn span_state(
+        &self,
+        shape: &Shape,
+        c: &[f64; 8],
+        fx: f64,
+        fz: f64,
+        gy: usize,
+        y_lo: i32,
+        y_hi: i32,
+    ) -> Option<bool> {
+        const MARGIN: f64 = 1e-6;
+        let cell_lo = self.min_y + gy as i32 * self.cell_y;
+        let d = |y: i32| Self::density(shape, y, c, fx, (y - cell_lo) as f64 / self.cell_y as f64, fz);
+        let (a, b) = (d(y_lo), d(y_hi));
+        if a > MARGIN && b > MARGIN {
+            Some(true)
+        } else if a < -MARGIN && b < -MARGIN {
+            Some(false)
+        } else {
+            None
+        }
     }
 
     /// Badlands stripes: mostly plain terracotta with coloured bands 1–3
@@ -280,9 +356,12 @@ impl WorldGenerator {
                 _ => (SAND, SAND),
             };
         }
-        // Jitter the snow and tree lines by a few blocks per column.
+        // Jitter the snow and tree lines by a few blocks per column. The
+        // lines are defined for a default world; `ny` is the height this
+        // block would have there, so they move up in tall worlds.
         let jitter = (hash_position(self.surface_seed, x, 2, z) % 9) as i32 - 4;
-        if y >= 200 + jitter {
+        let ny = shape.normalized_y(y as f64);
+        if ny >= (200 + jitter) as f64 {
             return (SNOW, STONE);
         }
         let (top, filler) = match biome {
@@ -314,7 +393,8 @@ impl WorldGenerator {
         };
         // Above the tree line, and on crags, soil gives way to bare rock.
         let soil = matches!(top, GRASS | PODZOL | COARSE_DIRT | MYCELIUM | MUD);
-        if soil && (y >= 160 + jitter || shape.roughness > 9.0 && y > 120 + jitter) {
+        let crag = shape.roughness > 9.0 * shape.scale() && ny > (120 + jitter) as f64;
+        if soil && (ny >= (160 + jitter) as f64 || crag) {
             return (STONE, STONE);
         }
         (top, filler)
@@ -339,7 +419,7 @@ impl WorldGenerator {
             // Badlands: 40 blocks of striped terracotta, so cliffs and
             // canyon walls show the colour bands.
             Biome::Badlands if depth < 40 && !self.is_flat() => return self.stripe(x, y, z),
-            Biome::Karst if depth >= filler_depth => return blocks::LIMESTONE,
+            Biome::Karst if depth >= filler_depth && depth < 40 => return blocks::LIMESTONE,
             Biome::Volcanic if depth < 12 => return blocks::BASALT,
             _ => {}
         }
@@ -360,10 +440,10 @@ impl WorldGenerator {
 
     pub fn sample_column(&self, x: i32, z: i32) -> ColumnSample {
         if !self.settings.size.contains_column(x, z) {
-            return ColumnSample::OUTSIDE;
+            return ColumnSample { surface_y: self.min_y - 1, ..ColumnSample::OUTSIDE };
         }
         if self.is_flat() {
-            let y = MIN_Y + 3;
+            let y = self.min_y + 3;
             return ColumnSample {
                 surface_y: y,
                 top_block: blocks::GRASS,
@@ -388,25 +468,33 @@ impl WorldGenerator {
             ]
         };
 
+        // Scan down cell by cell; inside a cell, skip straight past spans
+        // that are certainly air (see `span_state`).
         let mut surface = band.bottom - 1; // everything below the band is solid
-        let mut cached: Option<(usize, [f64; 8])> = None;
-        for y in (band.bottom..=band.top).rev() {
-            let ly = y - MIN_Y;
-            let gy = (ly / CELL_Y) as usize;
-            let fy = (ly % CELL_Y) as f64 / CELL_Y as f64;
-            let c = match cached {
-                Some((g, c)) if g == gy => c,
-                _ => {
-                    let (lo, hi) = (level(gy), level(gy + 1));
-                    let c = [lo[0], lo[1], hi[0], hi[1], lo[2], lo[3], hi[2], hi[3]];
-                    cached = Some((gy, c));
-                    c
+        let mut y = band.top;
+        'scan: while y >= band.bottom {
+            let ly = y - self.min_y;
+            let gy = (ly / self.cell_y) as usize;
+            let cell_lo = (self.min_y + gy as i32 * self.cell_y).max(band.bottom);
+            let (lo, hi) = (level(gy), level(gy + 1));
+            let c = [lo[0], lo[1], hi[0], hi[1], lo[2], lo[3], hi[2], hi[3]];
+            match self.span_state(&shape, &c, fx, fz, gy, cell_lo, y) {
+                Some(false) => {}
+                Some(true) => {
+                    surface = y;
+                    break 'scan;
                 }
-            };
-            if Self::solid(&shape, y, &c, fx, fy, fz) {
-                surface = y;
-                break;
+                None => {
+                    for yy in (cell_lo..=y).rev() {
+                        let fy = ((yy - self.min_y) % self.cell_y) as f64 / self.cell_y as f64;
+                        if Self::solid(&shape, yy, &c, fx, fy, fz) {
+                            surface = yy;
+                            break 'scan;
+                        }
+                    }
+                }
             }
+            y = cell_lo - 1;
         }
         let biome = biome::select(&shape, surface);
         let underwater = surface < SEA_LEVEL;
@@ -423,9 +511,10 @@ impl WorldGenerator {
 
     /// Generates one full-height chunk.
     pub fn generate_chunk(&self, pos: ChunkPos) -> Chunk {
-        let mut chunk = Chunk::empty(pos);
+        let height = self.settings.height;
+        let (min_y, max_y) = (self.min_y, self.max_y);
         if !self.chunk_touches_world(pos) {
-            return chunk;
+            return Chunk::empty(pos, height);
         }
         let (bx0, bz0) = (pos.min_block_x(), pos.min_block_z());
 
@@ -449,13 +538,35 @@ impl WorldGenerator {
             }
         }
 
-        // Density-noise corners for this chunk: 5 × GRID_Y × 5, filled only
+        // Which sections need to be generated block by block (the
+        // "window"). Everything more than SUBSURFACE blocks below the lowest
+        // possible surface is plain stone, and everything above the highest
+        // terrain, the sea and the trees is air; those sections are never
+        // touched. In a 17,696-block world this skips ~90% of the column.
+        // Chunks cut by the world border are generated in full, because
+        // their outside columns must be air all the way down.
+        let section_of = |y: i32| ((y - min_y) / SECTION_SIZE as i32) as usize;
+        let all_inside = inside.iter().all(|&b| b);
+        let (s_lo, s_hi) = if self.is_flat() {
+            (0, 0)
+        } else {
+            let deepest = lo_y - SUBSURFACE;
+            let top = (hi_y.max(SEA_LEVEL) + if self.settings.features { trees::TREE_HEADROOM } else { 0 }).min(max_y);
+            let s_lo = if all_inside && deepest >= min_y { section_of(deepest) } else { 0 };
+            (s_lo, section_of(top).max(s_lo))
+        };
+        // The column loop stops here; below it (when s_lo > 0) only the
+        // floor section is left, filled separately with stone and bedrock.
+        let stop_y = min_y + (s_lo * SECTION_SIZE) as i32;
+
+        // Density-noise corners for this chunk: 5 × grid_y × 5, filled only
         // for the vertical range some column actually needs.
-        let mut grid = vec![0.0f64; 5 * GRID_Y * 5];
+        let cell_y = self.cell_y;
+        let mut grid = vec![0.0f64; 5 * self.grid_y * 5];
         let gidx = |i: usize, gy: usize, k: usize| (gy * 5 + k) * 5 + i;
         if lo_y <= hi_y {
-            let gy_lo = ((lo_y - MIN_Y) / CELL_Y) as usize;
-            let gy_hi = (((hi_y - MIN_Y) / CELL_Y) as usize + 1).min(GRID_Y - 1);
+            let gy_lo = ((lo_y.max(stop_y) - min_y) / cell_y) as usize;
+            let gy_hi = (((hi_y - min_y) / cell_y) as usize + 1).min(self.grid_y - 1);
             let (gx0, gz0) = (bx0.div_euclid(CELL_XZ), bz0.div_euclid(CELL_XZ));
             for gy in gy_lo..=gy_hi {
                 for k in 0..5 {
@@ -467,15 +578,24 @@ impl WorldGenerator {
         }
 
         // Highest solid block and its top block per column, for trees.
-        let mut surface = [MIN_Y - 1; 256];
+        let mut surface = [min_y - 1; 256];
         let mut tops = [blocks::AIR; 256];
+        let mut heightmap = [(min_y - 1) as i16; 256];
+        let mut biomes = [Biome::default(); 256];
 
-        // Fill a dense [section][16^3] buffer first: sequential writes into
+        // Fill dense [section][16^3] buffers first: sequential writes into
         // plain arrays are much faster than palette writes block by block.
-        let mut dense = vec![[blocks::AIR; SECTION_VOLUME]; SECTIONS_PER_CHUNK];
+        let mut floor = [blocks::AIR; SECTION_VOLUME];
+        let mut dense = vec![[blocks::AIR; SECTION_VOLUME]; s_hi - s_lo + 1];
         let mut put = |lx: usize, y: i32, lz: usize, b: BlockId| {
-            let ly = (y - MIN_Y) as usize;
-            dense[ly / SECTION_SIZE][section_index(lx, ly % SECTION_SIZE, lz)] = b;
+            let ly = (y - min_y) as usize;
+            let si = ly / SECTION_SIZE;
+            let idx = section_index(lx, ly % SECTION_SIZE, lz);
+            if si == 0 && s_lo > 0 {
+                floor[idx] = b;
+            } else if si >= s_lo && si <= s_hi {
+                dense[si - s_lo][idx] = b;
+            }
         };
 
         for lz in 0..CHUNK_SIZE as usize {
@@ -487,12 +607,12 @@ impl WorldGenerator {
                 let (x, z) = (bx0 + lx as i32, bz0 + lz as i32);
 
                 if self.is_flat() {
-                    put(lx, MIN_Y, lz, blocks::BEDROCK);
-                    put(lx, MIN_Y + 1, lz, blocks::DIRT);
-                    put(lx, MIN_Y + 2, lz, blocks::DIRT);
-                    put(lx, MIN_Y + 3, lz, blocks::GRASS);
-                    chunk.heightmap[i] = (MIN_Y + 3) as i16;
-                    surface[i] = MIN_Y + 3;
+                    put(lx, min_y, lz, blocks::BEDROCK);
+                    put(lx, min_y + 1, lz, blocks::DIRT);
+                    put(lx, min_y + 2, lz, blocks::DIRT);
+                    put(lx, min_y + 3, lz, blocks::GRASS);
+                    heightmap[i] = (min_y + 3) as i16;
+                    surface[i] = min_y + 3;
                     tops[i] = blocks::GRASS;
                     continue;
                 }
@@ -506,7 +626,7 @@ impl WorldGenerator {
                 // aren't perfectly flat.
                 let filler_depth = 3 + (hash_position(self.surface_seed, x, 1, z) % 3) as i32;
 
-                let mut highest = MIN_Y - 1;
+                let mut highest = min_y - 1;
                 // Depth below the most recent exposed surface, and the
                 // block types chosen for that surface.
                 let mut depth = i32::MAX;
@@ -515,26 +635,36 @@ impl WorldGenerator {
                 // The biome is decided at the first (highest) surface and
                 // shared by any lower surfaces under overhangs.
                 let mut col_biome: Option<Biome> = None;
-                for y in (MIN_Y..=band.top.max(SEA_LEVEL)).rev() {
+                // Current noise cell, its corners and whether the band part
+                // of it is all solid, all air or mixed (see `span_state`).
+                let mut cell: Option<(usize, [f64; 8], Option<bool>)> = None;
+                for y in (stop_y..=band.top.max(SEA_LEVEL)).rev() {
                     let solid = if y > band.top {
                         false
                     } else if y < band.bottom {
                         true
                     } else {
-                        let ly = y - MIN_Y;
-                        let gy = (ly / CELL_Y) as usize;
-                        let fy = (ly % CELL_Y) as f64 / CELL_Y as f64;
-                        let c = [
-                            grid[gidx(ci, gy, ck)],
-                            grid[gidx(ci + 1, gy, ck)],
-                            grid[gidx(ci, gy + 1, ck)],
-                            grid[gidx(ci + 1, gy + 1, ck)],
-                            grid[gidx(ci, gy, ck + 1)],
-                            grid[gidx(ci + 1, gy, ck + 1)],
-                            grid[gidx(ci, gy + 1, ck + 1)],
-                            grid[gidx(ci + 1, gy + 1, ck + 1)],
-                        ];
-                        Self::solid(shape, y, &c, fx, fy, fz)
+                        let ly = y - min_y;
+                        let gy = (ly / cell_y) as usize;
+                        if cell.is_none_or(|(g, _, _)| g != gy) {
+                            let c = [
+                                grid[gidx(ci, gy, ck)],
+                                grid[gidx(ci + 1, gy, ck)],
+                                grid[gidx(ci, gy + 1, ck)],
+                                grid[gidx(ci + 1, gy + 1, ck)],
+                                grid[gidx(ci, gy, ck + 1)],
+                                grid[gidx(ci + 1, gy, ck + 1)],
+                                grid[gidx(ci, gy + 1, ck + 1)],
+                                grid[gidx(ci + 1, gy + 1, ck + 1)],
+                            ];
+                            let cell_lo = (min_y + gy as i32 * cell_y).max(band.bottom);
+                            cell = Some((gy, c, self.span_state(shape, &c, fx, fz, gy, cell_lo, y)));
+                        }
+                        let (_, c, state) = cell.as_ref().expect("set above");
+                        match state {
+                            Some(b) => *b,
+                            None => Self::solid(shape, y, c, fx, (ly % cell_y) as f64 / cell_y as f64, fz),
+                        }
                     };
 
                     if !solid {
@@ -560,7 +690,7 @@ impl WorldGenerator {
                     solid_above = true;
                     highest = highest.max(y);
 
-                    let b = if y == MIN_Y || (y < MIN_Y + 5 && self.is_bedrock(x, y, z)) {
+                    let b = if y == min_y || (y < min_y + 5 && self.is_bedrock(x, y, z)) {
                         blocks::BEDROCK
                     } else if depth == 0 {
                         top
@@ -570,45 +700,66 @@ impl WorldGenerator {
                     put(lx, y, lz, b);
                     depth = depth.saturating_add(1);
                 }
+                if s_lo > 0 {
+                    // The floor section, far below anything interesting.
+                    for y in min_y..min_y + SECTION_SIZE as i32 {
+                        let b = if y == min_y || (y < min_y + 5 && self.is_bedrock(x, y, z)) {
+                            blocks::BEDROCK
+                        } else {
+                            blocks::STONE
+                        };
+                        put(lx, y, lz, b);
+                    }
+                }
                 let biome = col_biome.unwrap_or_default();
-                chunk.biomes[i] = biome;
+                biomes[i] = biome;
                 if surface[i] < SEA_LEVEL && self.frozen_surface(x, z, biome) {
                     put(lx, SEA_LEVEL, lz, blocks::ICE);
                 }
-                chunk.heightmap[i] = highest as i16;
+                heightmap[i] = highest as i16;
             }
         }
 
         if self.settings.features {
-            let local = |lx: usize, lz: usize| (surface[lx + lz * 16], tops[lx + lz * 16], chunk.biomes[lx + lz * 16]);
+            let local = |lx: usize, lz: usize| (surface[lx + lz * 16], tops[lx + lz * 16], biomes[lx + lz * 16]);
             for tree in self.trees_for_chunk(pos, Some(&local)) {
                 trees::build(&tree, &mut |wx, wy, wz, b, is_log| {
                     let (lx, lz) = (wx - bx0, wz - bz0);
-                    if !(0..16).contains(&lx) || !(0..16).contains(&lz) || !(MIN_Y..=MAX_Y).contains(&wy) {
+                    if !(0..16).contains(&lx) || !(0..16).contains(&lz) || !(min_y..=max_y).contains(&wy) {
                         return;
                     }
                     if !self.settings.size.contains_column(wx, wz) {
                         return;
                     }
                     let (lx, lz) = (lx as usize, lz as usize);
-                    let ly = (wy - MIN_Y) as usize;
-                    let cell = &mut dense[ly / SECTION_SIZE][section_index(lx, ly % SECTION_SIZE, lz)];
+                    let si = section_of(wy);
+                    if si < s_lo || si > s_hi {
+                        return; // can't happen: the window includes TREE_HEADROOM
+                    }
+                    let ly = (wy - min_y) as usize;
+                    let cell = &mut dense[si - s_lo][section_index(lx, ly % SECTION_SIZE, lz)];
                     // Logs grow through air, water and leaves; leaves only
                     // fill air. See `trees` for why this makes overlaps
                     // independent of chunk order.
                     let free = cell.is_air() || (is_log && (*cell == blocks::WATER || cell.is_leaves()));
                     if free {
                         *cell = b;
-                        let h = &mut chunk.heightmap[lx + lz * 16];
+                        let h = &mut heightmap[lx + lz * 16];
                         *h = (*h).max(wy as i16);
                     }
                 });
             }
         }
 
-        for (section, blocks) in chunk.sections.iter_mut().zip(dense.iter()) {
-            *section = PalettedSection::from_dense(blocks);
-        }
+        let mut sections = dense.iter().map(PalettedSection::from_dense);
+        let (floor, window_start) = if s_lo == 0 {
+            (sections.next().expect("window has at least one section"), 1)
+        } else {
+            (PalettedSection::from_dense(&floor), s_lo)
+        };
+        let mut chunk = Chunk::assemble(pos, height, floor, window_start, sections.collect());
+        chunk.heightmap = heightmap;
+        chunk.biomes = biomes;
         chunk
     }
 
@@ -644,7 +795,7 @@ impl WorldGenerator {
                         (s.surface_y, s.top_block, s.biome)
                     }
                 };
-                if let Some(t) = trees::resolve(x, z, hash, biome, surface_y, top) {
+                if let Some(t) = trees::resolve(x, z, hash, biome, surface_y, top, self.max_y) {
                     out.push(t);
                 }
             }
@@ -652,10 +803,10 @@ impl WorldGenerator {
         out
     }
 
-    /// Bedrock floor: always at MIN_Y, then a ragged layer that thins out
-    /// over the next 4 blocks.
+    /// Bedrock floor: always at the lowest layer, then a ragged layer that
+    /// thins out over the next 4 blocks.
     fn is_bedrock(&self, x: i32, y: i32, z: i32) -> bool {
-        let layer = (y - MIN_Y) as f64; // 1..=4
+        let layer = (y - self.min_y) as f64; // 1..=4
         hash_position_f64(self.bedrock_seed, x, y, z) < 1.0 - layer / 5.0
     }
 
@@ -671,8 +822,9 @@ impl WorldGenerator {
     /// A dry-land spawn point as close to the centre as possible, searched
     /// along an outward spiral. Falls back to (0, 0) if the world is all sea.
     pub fn find_spawn(&self) -> (i32, i32, i32) {
-        let max_radius = (self.settings.size.half_width() - 8).clamp(0, 6000);
-        let step = 16;
+        // Continents are `scale` times wider in tall worlds; search as far.
+        let max_radius = (self.settings.size.half_width() - 8).clamp(0, (6000.0 * self.vscale) as i32);
+        let step = (16.0 * self.vscale) as i32;
         let mut r = 0;
         while r <= max_radius {
             let n = if r == 0 { 1 } else { (r * 8) / step };
@@ -680,7 +832,8 @@ impl WorldGenerator {
                 let a = i as f64 / n as f64 * std::f64::consts::TAU;
                 let (x, z) = ((a.cos() * r as f64) as i32, (a.sin() * r as f64) as i32);
                 let c = self.sample_column(x, z);
-                if c.inside && !c.underwater && c.surface_y < 140 && c.shape.river < 0.1 {
+                if c.inside && !c.underwater && c.shape.normalized_y(c.surface_y as f64) < 140.0 && c.shape.river < 0.1
+                {
                     return (x, c.surface_y + 1, z);
                 }
             }
@@ -691,21 +844,20 @@ impl WorldGenerator {
     }
 }
 
-const _: () = assert!((WORLD_HEIGHT as usize).is_multiple_of(SECTION_SIZE));
-const _: () = assert!((WORLD_HEIGHT as usize).is_multiple_of(CELL_Y as usize));
+const _: () = assert!(SECTION_SIZE.is_multiple_of(CELL_Y as usize));
 const _: () = assert!(CHUNK_SIZE % CELL_XZ == 0);
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::settings::WorldSize;
+    use crate::settings::{WorldHeight, WorldSize, MAX_Y, MIN_Y};
 
     fn generator(seed: u64, world_type: WorldType) -> WorldGenerator {
-        WorldGenerator::new(WorldSettings { seed, world_type, size: WorldSize::from_km(64.0), features: true })
+        WorldGenerator::new(WorldSettings { seed, world_type, size: WorldSize::from_km(64.0), ..Default::default() })
     }
 
     fn chunks_equal(a: &Chunk, b: &Chunk) -> bool {
-        a.sections == b.sections && a.heightmap == b.heightmap
+        a == b
     }
 
     #[test]
@@ -734,47 +886,99 @@ mod tests {
     /// sea ice; with features, also tree parts.
     #[test]
     fn column_sample_matches_generated_chunk() {
+        let default = WorldHeight::default();
+        let mut cases = Vec::new();
         for features in [false, true] {
             for t in
                 [WorldType::Normal, WorldType::Amplified, WorldType::Islands, WorldType::LargeBiomes, WorldType::Flat]
             {
-                let g = WorldGenerator::new(WorldSettings {
-                    seed: 77,
-                    world_type: t,
-                    size: WorldSize::from_km(64.0),
-                    features,
-                });
-                for pos in
-                    [ChunkPos::new(-3, 12), ChunkPos::new(40, -7), ChunkPos::new(-90, -60), ChunkPos::new(150, 151)]
-                {
-                    let c = g.generate_chunk(pos);
-                    for lz in 0..16 {
-                        for lx in 0..16 {
-                            let s = g.sample_column(pos.min_block_x() + lx as i32, pos.min_block_z() + lz as i32);
-                            let ctx = format!("{t:?} features={features} {pos:?} {lx},{lz}");
-                            assert_eq!(c.get(lx, s.surface_y, lz), s.top_block, "{ctx}");
-                            assert_eq!(c.biome_at(lx, lz), s.biome, "{ctx}");
-                            assert_eq!(c.get(lx, SEA_LEVEL, lz) == blocks::ICE, s.ice, "{ctx}");
-                            for y in s.surface_y + 1..=MAX_Y {
-                                let b = c.get(lx, y, lz);
-                                let ok = b == blocks::AIR
-                                    || b == blocks::WATER
-                                    || b == blocks::ICE
-                                    || (features && b.is_tree_part());
-                                assert!(ok, "{ctx}: {} above surface at y={y}", b.info().name);
-                            }
-                            assert_eq!(c.get(lx, MIN_Y, lz), blocks::BEDROCK);
-                            let water_top = s.surface_y.max(if s.underwater { SEA_LEVEL } else { MIN_Y });
-                            if features {
-                                assert!(c.height_at(lx, lz) >= water_top, "{ctx}");
-                            } else {
-                                assert_eq!(c.height_at(lx, lz), water_top, "{ctx}");
-                            }
+                cases.push((t, features, default));
+            }
+        }
+        // Tall and short worlds, where most sections are implied, not stored.
+        for h in [256, 1000, 5000, 17_696] {
+            cases.push((WorldType::Normal, true, WorldHeight::from_blocks(h)));
+        }
+        cases.push((WorldType::Amplified, true, WorldHeight::from_blocks(17_696)));
+        for (t, features, height) in cases {
+            let g = WorldGenerator::new(WorldSettings {
+                seed: 77,
+                world_type: t,
+                size: WorldSize::from_km(64.0),
+                features,
+                height,
+            });
+            let (min_y, max_y) = (g.min_y(), g.max_y());
+            for pos in [ChunkPos::new(-3, 12), ChunkPos::new(40, -7), ChunkPos::new(-90, -60), ChunkPos::new(150, 151)]
+            {
+                let c = g.generate_chunk(pos);
+                for lz in 0..16 {
+                    for lx in 0..16 {
+                        let s = g.sample_column(pos.min_block_x() + lx as i32, pos.min_block_z() + lz as i32);
+                        let ctx = format!("{t:?} features={features} height={} {pos:?} {lx},{lz}", height.blocks());
+                        assert_eq!(c.get(lx, s.surface_y, lz), s.top_block, "{ctx}");
+                        assert_eq!(c.biome_at(lx, lz), s.biome, "{ctx}");
+                        assert_eq!(c.get(lx, SEA_LEVEL, lz) == blocks::ICE, s.ice, "{ctx}");
+                        for y in s.surface_y + 1..=max_y {
+                            let b = c.get(lx, y, lz);
+                            let ok = b == blocks::AIR
+                                || b == blocks::WATER
+                                || b == blocks::ICE
+                                || (features && b.is_tree_part());
+                            assert!(ok, "{ctx}: {} above surface at y={y}", b.info().name);
+                        }
+                        assert_eq!(c.get(lx, min_y, lz), blocks::BEDROCK, "{ctx}");
+                        // Deep underground is stone (whether stored or implied).
+                        if t != WorldType::Flat {
+                            assert_eq!(c.get(lx, min_y + 8, lz), blocks::STONE, "{ctx}");
+                        }
+                        let water_top = s.surface_y.max(if s.underwater { SEA_LEVEL } else { min_y });
+                        if features {
+                            assert!(c.height_at(lx, lz) >= water_top, "{ctx}");
+                        } else {
+                            assert_eq!(c.height_at(lx, lz), water_top, "{ctx}");
                         }
                     }
                 }
             }
         }
+    }
+
+    /// A tall world is the default world magnified: same land/ocean
+    /// pattern, heights stretched around sea level, and chunks that store
+    /// only the sections around the surface.
+    #[test]
+    fn tall_worlds_scale_the_terrain() {
+        let tall = WorldHeight::from_blocks(17_696);
+        let s = tall.terrain_scale();
+        let g1 = generator(5, WorldType::Normal);
+        let gt =
+            WorldGenerator::new(WorldSettings { seed: 5, height: tall, size: WorldSize::full(), ..Default::default() });
+        let (mut same_water, mut n, mut max_t) = (0, 0, MIN_Y);
+        for iz in 0..40 {
+            for ix in 0..40 {
+                let (x, z) = (ix * 400 - 8000, iz * 400 - 8000);
+                let a = g1.sample_column(x, z);
+                let b = gt.sample_column((x as f64 * s) as i32, (z as f64 * s) as i32);
+                n += 1;
+                same_water += (a.underwater == b.underwater) as i32;
+                max_t = max_t.max(b.surface_y);
+                // Base heights match after un-scaling (the 3D noise differs a
+                // little because its sample grid lands on other points).
+                let unscaled = SEA_LEVEL as f64 + (b.shape.height - SEA_LEVEL as f64) / s;
+                assert!((unscaled - a.shape.height).abs() < 3.0, "{x},{z}: {} vs {}", a.shape.height, unscaled);
+            }
+        }
+        assert!(same_water as f64 / n as f64 > 0.9, "{same_water}/{n}");
+        assert!(max_t > SEA_LEVEL + 2000, "tall world peaks only reach {max_t}");
+        assert!(max_t < tall.max_y());
+
+        // Storage: a tall chunk is a few hundred KB at most, not 1,106 sections.
+        let (x, y, z) = gt.find_spawn();
+        let c = gt.generate_chunk(ChunkPos::from_block(x, z));
+        assert!(c.window().len() < 120, "window {:?}", c.window());
+        assert!(c.memory_bytes() < 400_000, "{} bytes", c.memory_bytes());
+        assert!(!gt.sample_column(x, z).underwater && y > SEA_LEVEL);
     }
 
     #[test]
@@ -829,8 +1033,12 @@ mod tests {
     /// Statistics over a 40 km × 40 km grid. These are the "is the world
     /// believable?" checks; the exact numbers are recorded in devlog 02.
     fn stats(t: WorldType, seed: u64) -> (f64, i32, i32, f64) {
-        let g =
-            WorldGenerator::new(WorldSettings { seed, world_type: t, size: WorldSize::from_km(64.0), features: true });
+        let g = WorldGenerator::new(WorldSettings {
+            seed,
+            world_type: t,
+            size: WorldSize::from_km(64.0),
+            ..Default::default()
+        });
         let (mut land, mut n, mut max_h, mut min_h, mut mountains) = (0, 0, MIN_Y, MAX_Y, 0);
         for iz in 0..80 {
             for ix in 0..80 {
@@ -1037,8 +1245,8 @@ mod tests {
         for cz in -5..5 {
             for cx in -5..5 {
                 let c = g.generate_chunk(ChunkPos::new(cx, cz));
-                for s in &c.sections {
-                    assert!(s.palette().iter().all(|b| !b.is_tree_part()));
+                for si in 0..c.section_count() {
+                    assert!(c.section(si).palette().iter().all(|b| !b.is_tree_part()));
                 }
             }
         }

@@ -6,7 +6,8 @@ Guidance for Claude Code (and humans) working in this repository.
 
 A Minecraft-like voxel **world generator** in Rust with a Vulkan viewer and a
 game-style menu. World size is configurable from 1 km up to the full
-Minecraft world (59,999,968 blocks ≈ 60,000 km across).
+Minecraft world (59,999,968 blocks ≈ 60,000 km across), and world height
+from 256 to 17,696 blocks.
 
 **Priorities, in order:**
 1. **Accuracy of the generated world.** Deterministic, seed-stable, no
@@ -51,6 +52,7 @@ cargo run --release -p wg-map -- --seed 42 --layer biome    # also: height|conti
 cargo run --release -p wg-map -- --seed 42 --bench 32   # ms per chunk
 cargo run --release -p worldgen --example noise_stats   # climate noise percentiles
 cargo run --release -p worldgen --example find_biome -- 42 jungle   # where to put WG_CAMERA
+cargo run --release -p worldgen --example find_biome -- 42 snowy_slopes 17696   # in a tall world
 ```
 
 Shaders live in `crates/game/shaders/*.vert|frag` (Vulkan GLSL) and are
@@ -72,7 +74,7 @@ sleep 25; DISPLAY=:99 import -window root shot.png
 Environment switches: `WG_VALIDATION=1` (Khronos validation layer, must
 print no errors), `WG_AUTOSTART=<seed>` (skip menus), `WG_CAMERA=x,z[,yaw,pitch,height]`
 (with autostart: place the camera), `WG_SCREEN=create|settings` (open a menu),
-`WG_EXIT_AFTER_FRAMES=N`. A `settings.ron` in the working directory sets
+`WG_EXIT_AFTER_FRAMES=N`, `WG_HEIGHT=<blocks>` (with autostart: world height). A `settings.ron` in the working directory sets
 render distance etc.
 
 ## Conventions
@@ -104,8 +106,17 @@ render distance etc.
 - **Coordinates:** blocks are `i32`, noise inputs `f64` and wrapped
   (`noise::wrap`); camera position is `f64`; the GPU only sees
   camera-relative `f32`.
-- **World height:** `MIN_Y = -64`, `MAX_Y = 319`, `SEA_LEVEL = 63`; chunks are
-  16×384×16 in 24 palette-compressed 16³ sections.
+- **World height** is a setting (`WorldHeight`, 256..=17,696, whole
+  sections). `terrain_scale = height / 384` stretches the terrain both
+  vertically and horizontally; use `Shape::normalized_y` for rules about
+  mountains (snow line, peaks, lapse rate) and absolute blocks for rules
+  about the sea (beaches, shallow water). `SEA_LEVEL = 63` always. The
+  `MIN_Y`/`MAX_Y` constants describe only the default 384 world: use
+  `generator.min_y()/max_y()` or `chunk.min_y()/max_y()` instead.
+- **Chunk storage:** floor section 0 plus a contiguous window of
+  palette-compressed 16³ sections; stone below the window and air above it
+  are implied. Read with `chunk.section(i)` (a `SectionRef`), never assume
+  every section is stored.
 - Code comments explain *why*; each module starts with a doc comment that
   explains the technique for a reader new to voxel engines.
 - Original work only: we take ideas from published algorithms and open

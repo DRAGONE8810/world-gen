@@ -193,7 +193,9 @@ const LAPSE_BLOCKS: f64 = 160.0;
 
 /// Temperature at a surface height, cooled by altitude.
 pub fn effective_temperature(shape: &Shape, surface_y: i32) -> f64 {
-    let alt = (surface_y - SEA_LEVEL) as f64;
+    // Altitude in default-world blocks, so a 9 km summit in a tall world
+    // is as cold as a 200-block summit in a default one.
+    let alt = shape.normalized_y(surface_y as f64) - SEA_LEVEL as f64;
     shape.climate.temperature - (alt - LAPSE_START).max(0.0) / LAPSE_BLOCKS
 }
 
@@ -204,7 +206,11 @@ pub fn select(shape: &Shape, surface_y: i32) -> Biome {
     use TempBand::*;
 
     let cl = &shape.climate;
+    // `alt` is the true height above the sea, used for things that keep
+    // their real size in every world (beaches, shallow water). `alt_n` is
+    // the height a default world would have here, for mountain rules.
     let alt = surface_y - SEA_LEVEL;
+    let alt_n = shape.normalized_y(surface_y as f64) - SEA_LEVEL as f64;
     let t = effective_temperature(shape, surface_y);
     let tb = TempBand::of(t);
     let hb = HumidBand::of(cl.humidity);
@@ -243,7 +249,7 @@ pub fn select(shape: &Shape, surface_y: i32) -> Biome {
 
     // 3. Coast.
     let rugged = e < -0.3;
-    if c < 0.0 && alt <= 14 && rugged {
+    if c < 0.0 && alt_n <= 14.0 && rugged {
         return if tb <= Cold { Fjord } else { StonyShore };
     }
     if c < -0.03 && alt <= 3 {
@@ -256,7 +262,7 @@ pub fn select(shape: &Shape, surface_y: i32) -> Biome {
     }
 
     // 4. Mountains.
-    let summit = alt > 125 || (alt > 85 && pv > 0.5 && e < -0.2);
+    let summit = alt_n > 125.0 || (alt_n > 85.0 && pv > 0.5 && e < -0.2);
     if summit {
         return match tb {
             Frozen | Cold if w > 0.0 => JaggedPeaks,
@@ -264,7 +270,7 @@ pub fn select(shape: &Shape, surface_y: i32) -> Biome {
             _ => StonyPeaks,
         };
     }
-    if alt > 55 {
+    if alt_n > 55.0 {
         match (tb, hb) {
             (Frozen | Cold, _) if t < -0.3 => return if cl.humidity > 0.0 { Grove } else { SnowySlopes },
             (Warm | Hot, Wet | VeryWet) => return CloudForest,
@@ -275,7 +281,7 @@ pub fn select(shape: &Shape, surface_y: i32) -> Biome {
     }
 
     // 5. Lowlands: Whittaker grid.
-    let swampy = e > 0.35 && alt < 6;
+    let swampy = e > 0.35 && alt_n < 6.0;
     match (tb, hb) {
         (Frozen, Arid | Dry) => Tundra,
         (Frozen, Medium) => SnowyPlains,
@@ -320,7 +326,7 @@ pub fn select(shape: &Shape, surface_y: i32) -> Biome {
             }
         }
         (Warm, Wet) => {
-            if pv > 0.1 && alt > 6 {
+            if pv > 0.1 && alt_n > 6.0 {
                 Karst
             } else {
                 SparseJungle
@@ -411,6 +417,7 @@ mod tests {
             roughness: 1.0,
             river: 0.0,
             island: 0.0,
+            vscale: 1.0,
         }
     }
 
@@ -446,6 +453,24 @@ mod tests {
         let s = shape(0.5, -0.8, 0.6, 0.1, 0.0);
         assert!(matches!(select(&s, SEA_LEVEL + 180), Biome::JaggedPeaks | Biome::FrozenPeaks));
         assert_eq!(select(&s, SEA_LEVEL + 180), Biome::JaggedPeaks);
+    }
+
+    #[test]
+    fn altitude_rules_scale_with_tall_worlds() {
+        // The same column in a 46× world: a summit 46× higher is still a
+        // summit, and is as cold as the default one.
+        let mut s = shape(0.5, -0.8, 0.6, 0.1, 0.0);
+        let normal = select(&s, SEA_LEVEL + 180);
+        let t = effective_temperature(&s, SEA_LEVEL + 180);
+        s.vscale = 46.0;
+        assert_eq!(select(&s, SEA_LEVEL + 180 * 46), normal);
+        assert!((effective_temperature(&s, SEA_LEVEL + 180 * 46) - t).abs() < 1e-9);
+        // Beaches keep their real size.
+        let b = shape(-0.05, 0.3, 0.3, 0.0, 0.0);
+        let mut tall = b;
+        tall.vscale = 46.0;
+        assert_eq!(select(&b, SEA_LEVEL + 2), Biome::Beach);
+        assert_eq!(select(&tall, SEA_LEVEL + 2), Biome::Beach);
     }
 
     #[test]

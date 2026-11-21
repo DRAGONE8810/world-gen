@@ -3,7 +3,7 @@
 Goal: a Minecraft-like world generator, accurate first, fast second, pretty
 third. Rust + Vulkan, Windows and Linux (macOS a plus), smooth on an RTX 2080.
 World size from 1 km to the full 60,000 km Minecraft world; world height
-up to ~17,700 blocks (twice Mount Everest) from step 4.
+up to 17,696 blocks (twice Mount Everest) from step 4.
 
 The core idea: the world is never stored. Every block is computed from the
 seed when it is needed, so a 60,000 km world costs the same as a 1 km one.
@@ -13,7 +13,7 @@ seed when it is needed, so a 60,000 km world costs the same as a 1 km one.
 | 1 | Foundation: project layout, world settings, chunk storage, generator skeleton, game menu, Vulkan renderer, map tool | **Done**, see [devlog 01](devlog/01-foundation.md) |
 | 2 | Terrain: continents, oceans, erosion, mountains, rivers, 3D overhangs | **Done**, see [devlog 02](devlog/02-terrain.md) |
 | 3 | Biomes and trees | **Done**, see [devlog 03](devlog/03-biomes.md) |
-| 4 | Scale and speed: tall worlds (cubic chunks), LODs to 256 chunks, faster meshing, GPU-driven drawing, world map | Next |
+| 4 | Scale and speed: tall worlds (cubic chunks), LODs to 256 chunks, faster meshing, GPU-driven drawing, world map | **In progress**: 4a tall worlds done, see [devlog 04](devlog/04-scale.md) |
 
 ## Step 1: Foundation ✔
 
@@ -69,15 +69,18 @@ Result: all 48 biomes occur within 24 km of seed 42; 0.90 ms per chunk.
 
 ## Step 4: Scale and speed
 
-Scope extended after owner feedback (tall worlds, very far view).
+Scope extended after owner feedback (tall worlds, very far view). Lands
+in three PRs: 4a tall worlds, 4b far view and LODs, 4c speed and world map.
 
-- **Configurable world height**, chosen in the create-world menu like the
-  world size: 384 (today), 1,000, 5,000, 10,000, up to ~17,700 blocks
-  (2 × Everest's 8,849 m). Terrain height and the altitude rules of
-  biomes (lapse rate, snow line, peaks) scale with it.
-- **Cubic chunks:** 16³ sections generated, stored and streamed on their
-  own in 3D (a 17,700-block column is 1,100 sections; only those near the
-  camera or the surface are loaded).
+- ✔ (4a) **Configurable world height**, chosen in the create-world menu
+  like the world size: 256 to 17,696 blocks (2 × Everest's 8,849 m),
+  presets 256, 384, 1,000, 2,000, 5,000, 10,000, 17,696. Terrain grows
+  with it in all three directions; altitude rules of biomes (lapse rate,
+  snow line, peaks) scale with it, sea-level rules don't.
+- ✔ (4a) **Cubic-chunk storage:** a column stores only a window of 16³
+  sections around the surface; stone below and air above are implied, so
+  a 17,696-block chunk costs 3.3 KiB and 3.5 ms. 3D streaming of single
+  sections waits for caves, when there is something to see underground.
 - **Two view distances:** full detail up to 64 chunks of radius, and an
   **LOD distance** up to 256 chunks of radius (512 × 512 = 262,144 chunks),
   in the style of Voxy and Distant Horizons.

@@ -2,8 +2,9 @@
 
 A Minecraft-like voxel world generator written in Rust, with a Vulkan viewer
 and a game-style menu. Worlds range from **1 km to 60,000 km** across (the
-full Minecraft world), and are generated on the fly from a seed, so a huge
-world costs no more than a small one.
+full Minecraft world) and from **256 to 17,696 blocks** tall (twice Mount
+Everest). They are generated on the fly from a seed, so a huge world costs
+no more than a small one.
 
 Accuracy of the generated world comes first, then performance. Visuals are
 deliberately plain.
@@ -13,7 +14,9 @@ deliberately plain.
 ## Status
 
 Steps 1–3 of 4 are done: foundation, terrain (continents, oceans,
-mountains, rivers), and 48 biomes with trees. See [docs/PLAN.md](docs/PLAN.md) for the
+mountains, rivers), and 48 biomes with trees. Step 4 (scale and speed) is
+in progress: configurable world height is in, LOD rings and faster drawing
+are next. See [docs/PLAN.md](docs/PLAN.md) for the
 roadmap and [docs/devlog/](docs/devlog/) for a detailed log of each step,
 each with a short plain-language summary.
 
@@ -53,6 +56,7 @@ way to check what a seed looks like:
 cargo run --release -p wg-map -- --seed 42 --extent 16000 --px 1024 --out map.png
 cargo run --release -p wg-map -- --seed 42 --layer biome  # also: height, temperature, humidity, …
 cargo run --release -p wg-map -- --seed 42 --bench 32     # generation speed
+cargo run --release -p wg-map -- --seed 42 --size-km 60000 --height 17696 --extent 737000  # a tall world
 ```
 
 ## Layout

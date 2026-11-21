@@ -27,7 +27,7 @@ use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
 use winit::keyboard::{KeyCode, PhysicalKey};
 use winit::window::{CursorGrabMode, Window, WindowId};
 use world::{ChunkManager, MeshEvent};
-use worldgen::{ChunkPos, WorldGenerator, WorldSettings, MAX_Y, MIN_Y};
+use worldgen::{ChunkPos, WorldGenerator, WorldSettings};
 
 const SKY: [f32; 3] = [0.62, 0.78, 0.98];
 const MENU_BG: [f32; 3] = [0.10, 0.12, 0.16];
@@ -167,7 +167,8 @@ impl App {
             let h = s.settings.size.half_width() as f64;
             s.camera.pos.x = s.camera.pos.x.clamp(-h + 0.5, h - 0.5);
             s.camera.pos.z = s.camera.pos.z.clamp(-h + 0.5, h - 0.5);
-            s.camera.pos.y = s.camera.pos.y.clamp(MIN_Y as f64, MAX_Y as f64 + 200.0);
+            let (lo, hi) = (s.settings.height.min_y() as f64, s.settings.height.max_y() as f64);
+            s.camera.pos.y = s.camera.pos.y.clamp(lo, hi + 200.0);
         }
 
         let center = ChunkPos::from_block(s.camera.pos.x.floor() as i32, s.camera.pos.z.floor() as i32);
@@ -286,6 +287,10 @@ impl App {
         if let Ok(seed) = std::env::var("WG_AUTOSTART") {
             let mut s = self.settings.last_world.clone();
             s.seed = worldgen::settings::seed_from_text(&seed).unwrap_or(0);
+            // WG_HEIGHT=blocks picks the world height without the menu.
+            if let Some(h) = std::env::var("WG_HEIGHT").ok().and_then(|h| h.trim().parse().ok()) {
+                s.height = worldgen::settings::WorldHeight::from_blocks(h);
+            }
             self.start_world(s);
             // Optional camera placement for screenshots: WG_CAMERA=x,z[,yaw_deg,pitch_deg,height]
             if let (Ok(spec), Some(sess)) = (std::env::var("WG_CAMERA"), self.session.as_mut()) {

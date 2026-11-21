@@ -15,9 +15,8 @@
 
 use bytemuck::{Pod, Zeroable};
 use worldgen::block::Opacity;
-use worldgen::chunk::SECTIONS_PER_CHUNK;
 use worldgen::palette::{SECTION_SIZE, SECTION_VOLUME};
-use worldgen::{blocks, Biome, BlockId, Chunk, MIN_Y};
+use worldgen::{blocks, Biome, BlockId, Chunk};
 
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Pod, Zeroable, PartialEq)]
@@ -83,12 +82,18 @@ pub fn mesh_chunk(chunk: &Chunk, nb: &Neighbours) -> MeshData {
     let mut padded = vec![blocks::AIR; P * P * P];
     let mut dense = [blocks::AIR; SECTION_VOLUME];
 
-    for s in 0..SECTIONS_PER_CHUNK {
-        let section = &chunk.sections[s];
+    let sections = chunk.section_count();
+    // Only the floor and the stored window can have visible faces: implied
+    // stone below the window is buried, implied air above it is empty. In
+    // a 17,696-block world this skips ~1,000 sections per chunk.
+    let window = chunk.window();
+    let to_mesh = std::iter::once(0).chain(window.start.saturating_sub(1).max(1)..(window.end + 1).min(sections));
+    for s in to_mesh {
+        let section = chunk.section(s);
         if section.uniform() == Some(blocks::AIR) {
             continue;
         }
-        let y0 = MIN_Y + (s * SECTION_SIZE) as i32;
+        let y0 = chunk.min_y() + (s * SECTION_SIZE) as i32;
 
         // Fast reject: a solid opaque section fully enclosed by opaque
         // sections has no visible faces at all (most of the underground).
@@ -109,18 +114,18 @@ pub fn mesh_chunk(chunk: &Chunk, nb: &Neighbours) -> MeshData {
             if s == 0 {
                 blocks::BEDROCK // never draw the underside of the world
             } else {
-                chunk.sections[s - 1].get(x, SECTION_SIZE - 1, z)
+                chunk.section(s - 1).get(x, SECTION_SIZE - 1, z)
             }
         };
         for z in 0..16 {
             for x in 0..16 {
                 padded[pidx(x + 1, 0, z + 1)] = below(x, z);
                 padded[pidx(x + 1, P - 1, z + 1)] =
-                    if s + 1 < SECTIONS_PER_CHUNK { chunk.sections[s + 1].get(x, 0, z) } else { blocks::AIR };
+                    if s + 1 < sections { chunk.section(s + 1).get(x, 0, z) } else { blocks::AIR };
             }
         }
         let side = |c: Option<&Chunk>, x: usize, y: usize, z: usize| -> BlockId {
-            c.map_or(blocks::AIR, |c| c.sections[s].get(x, y, z))
+            c.map_or(blocks::AIR, |c| c.section(s).get(x, y, z))
         };
         for y in 0..16 {
             for i in 0..16 {
@@ -143,7 +148,9 @@ pub fn mesh_chunk(chunk: &Chunk, nb: &Neighbours) -> MeshData {
 
 fn is_buried(chunk: &Chunk, nb: &Neighbours, s: usize) -> bool {
     let opaque = |c: Option<&Chunk>, s: usize| -> bool {
-        c.and_then(|c| c.sections.get(s)).and_then(|sec| sec.uniform()).is_some_and(|b| b.opacity() == Opacity::Opaque)
+        c.filter(|c| s < c.section_count())
+            .and_then(|c| c.section(s).uniform())
+            .is_some_and(|b| b.opacity() == Opacity::Opaque)
     };
     opaque(Some(chunk), s)
         && (s == 0 || opaque(Some(chunk), s - 1))
@@ -302,13 +309,14 @@ fn emit_quad(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use worldgen::ChunkPos;
+    use worldgen::settings::WorldHeight;
+    use worldgen::{ChunkPos, MIN_Y};
 
     const NONE: Neighbours<'static> = Neighbours { neg_x: None, pos_x: None, neg_z: None, pos_z: None };
 
     #[test]
     fn single_block_has_six_faces() {
-        let mut c = Chunk::empty(ChunkPos::new(0, 0));
+        let mut c = Chunk::empty(ChunkPos::new(0, 0), WorldHeight::default());
         c.set(5, 70, 5, blocks::STONE);
         let m = mesh_chunk(&c, &NONE);
         assert_eq!(m.quad_count(), 6);
@@ -318,7 +326,7 @@ mod tests {
 
     #[test]
     fn flat_layer_merges_into_six_quads() {
-        let mut c = Chunk::empty(ChunkPos::new(0, 0));
+        let mut c = Chunk::empty(ChunkPos::new(0, 0), WorldHeight::default());
         for z in 0..16 {
             for x in 0..16 {
                 c.set(x, 64, z, blocks::GRASS);
@@ -331,7 +339,7 @@ mod tests {
 
     #[test]
     fn hidden_faces_between_blocks_are_culled() {
-        let mut c = Chunk::empty(ChunkPos::new(0, 0));
+        let mut c = Chunk::empty(ChunkPos::new(0, 0), WorldHeight::default());
         c.set(1, 70, 1, blocks::STONE);
         c.set(2, 70, 1, blocks::DIRT); // different type: can't merge
         let m = mesh_chunk(&c, &NONE);
@@ -342,8 +350,8 @@ mod tests {
 
     #[test]
     fn neighbour_chunk_hides_border_faces() {
-        let mut a = Chunk::empty(ChunkPos::new(0, 0));
-        let mut b = Chunk::empty(ChunkPos::new(1, 0));
+        let mut a = Chunk::empty(ChunkPos::new(0, 0), WorldHeight::default());
+        let mut b = Chunk::empty(ChunkPos::new(1, 0), WorldHeight::default());
         a.set(15, 70, 0, blocks::STONE);
         b.set(0, 70, 0, blocks::STONE);
         let m = mesh_chunk(&a, &Neighbours { pos_x: Some(&b), ..NONE });
@@ -352,7 +360,7 @@ mod tests {
 
     #[test]
     fn water_has_no_internal_faces_and_does_not_hide_ground() {
-        let mut c = Chunk::empty(ChunkPos::new(0, 0));
+        let mut c = Chunk::empty(ChunkPos::new(0, 0), WorldHeight::default());
         c.set(3, 60, 3, blocks::SAND);
         c.set(3, 61, 3, blocks::WATER);
         c.set(3, 62, 3, blocks::WATER);
@@ -365,7 +373,7 @@ mod tests {
 
     #[test]
     fn world_bottom_is_never_drawn() {
-        let mut c = Chunk::empty(ChunkPos::new(0, 0));
+        let mut c = Chunk::empty(ChunkPos::new(0, 0), WorldHeight::default());
         c.set(0, MIN_Y, 0, blocks::BEDROCK);
         assert_eq!(mesh_chunk(&c, &NONE).quad_count(), 5);
     }
@@ -388,7 +396,7 @@ mod tests {
 
     #[test]
     fn grass_merges_only_within_one_biome() {
-        let mut c = Chunk::empty(ChunkPos::new(0, 0));
+        let mut c = Chunk::empty(ChunkPos::new(0, 0), WorldHeight::default());
         for z in 0..16 {
             for x in 0..16 {
                 c.set(x, 64, z, blocks::GRASS);
