@@ -202,7 +202,8 @@ pub fn simulate(elevation: &Grid<f32>, km: f64, seed: u64, wobble: f64) -> Clima
         })
         .collect();
     let temperature = Grid { w, h, data: rows.iter().flat_map(|r| r.0.iter().copied()).collect() };
-    let precipitation = Grid { w, h, data: rows.iter().flat_map(|r| r.1.iter().copied()).collect() };
+    let mut precipitation = Grid { w, h, data: rows.iter().flat_map(|r| r.1.iter().copied()).collect() };
+    add_monsoon(&mut precipitation, elevation, km);
     // Weather systems also mix north–south and over a few hundred km.
     let r = ((250.0 / km).round() as usize).max(1);
     let precipitation = precipitation.blur(r, 2);
@@ -218,6 +219,54 @@ pub fn simulate(elevation: &Grid<f32>, km: f64, seed: u64, wobble: f64) -> Clima
             .collect(),
     };
     Climate { temperature, precipitation, aridity }
+}
+
+/// Summer monsoons. In summer the tropical rain belt follows the sun
+/// poleward, and land heated by it draws moist sea air inland from the
+/// equator side: India, the Sahel, South-East Asia, northern Australia and
+/// Mexico get most of their rain this way, while a range in the way (the
+/// Himalaya) keeps it out of the land behind. Swept along each column
+/// from the equator to 35° in both hemispheres; the moisture refills over
+/// the sea and rains out over land over ~1000 km, and faster uphill.
+fn add_monsoon(precipitation: &mut Grid<f32>, elevation: &Grid<f32>, km: f64) {
+    let (w, h) = (elevation.w, elevation.h);
+    let recharge = 1.0 - libm::exp(-km / 400.0);
+    let inland = libm::exp(-km / 1000.0);
+    let add: Vec<Vec<(usize, f32)>> = (0..w)
+        .into_par_iter()
+        .map(|i| {
+            let mut out = Vec::new();
+            for north in [true, false] {
+                // Rows from the equator towards the pole.
+                let rows: Vec<usize> = if north {
+                    (0..h).rev().filter(|&j| (0.0..35.0).contains(&latitude(j, h))).collect()
+                } else {
+                    (0..h).filter(|&j| (-35.0..0.0).contains(&latitude(j, h))).collect()
+                };
+                let mut q: f64 = 0.0;
+                let mut prev = 0.0f64;
+                for j in rows {
+                    let e = elevation.get(i, j) as f64;
+                    if e < 0.0 {
+                        q += (1.0 - q) * recharge;
+                        prev = 0.0;
+                        continue;
+                    }
+                    let a = latitude(j, h).abs();
+                    let season = smoothstep(4.0, 10.0, a) * (1.0 - smoothstep(20.0, 30.0, a));
+                    let rise = (e - prev).max(0.0) / 1000.0;
+                    prev = e;
+                    let oro = 1.0 + 3.0 * (rise / (km / 50.0)).min(3.0);
+                    out.push((i + j * w, (1100.0 * season * q * oro) as f32));
+                    q *= inland * libm::exp(-0.5 * rise);
+                }
+            }
+            out
+        })
+        .collect();
+    for (k, v) in add.into_iter().flatten() {
+        precipitation.data[k] += v;
+    }
 }
 
 /// Potential evapotranspiration, mm/yr (a Thornthwaite-like fit).

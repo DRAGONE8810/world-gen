@@ -60,6 +60,98 @@ pub fn relief() -> Grid<f32> {
     }
 }
 
+/// The world's large lakes: a point on each (latitude, longitude) and its
+/// surface level (m). At a few tens of km per cell the relief grid also has
+/// hollows that are not lakes (a gorge narrower than a cell looks like a
+/// dam, as on the Congo), so on the real Earth only the hollows holding a
+/// known lake fill, and only up to the lake's real level: filled to the
+/// rim, the Caspian basin would spread far over the steppe, as it did in
+/// the Ice Age. (Not Lake Chad: a few metres deep, it is too shallow for
+/// this grid.)
+const LAKES: [(f64, f64, f64); 26] = [
+    (42.0, 50.5, -28.0),    // Caspian Sea
+    (-1.0, 33.0, 1134.0),   // Victoria
+    (-6.0, 29.5, 773.0),    // Tanganyika
+    (-12.0, 34.5, 500.0),   // Malawi
+    (3.6, 36.0, 360.0),     // Turkana
+    (53.5, 108.0, 456.0),   // Baikal
+    (46.5, 74.5, 341.0),    // Balkhash
+    (42.4, 77.3, 1607.0),   // Issyk-Kul
+    (36.9, 100.2, 3196.0),  // Qinghai
+    (38.6, 42.9, 1640.0),   // Van
+    (37.7, 45.3, 1270.0),   // Urmia
+    (61.0, 31.5, 5.0),      // Ladoga
+    (61.7, 35.5, 33.0),     // Onega
+    (58.9, 13.3, 44.0),     // Vänern
+    (47.7, -87.5, 183.0),   // Superior
+    (44.0, -87.0, 176.0),   // Michigan
+    (44.8, -82.4, 176.0),   // Huron
+    (42.2, -81.2, 174.0),   // Erie
+    (43.7, -77.9, 75.0),    // Ontario
+    (66.0, -121.0, 156.0),  // Great Bear
+    (61.7, -114.0, 156.0),  // Great Slave
+    (59.2, -109.5, 213.0),  // Athabasca
+    (57.3, -102.3, 337.0),  // Reindeer
+    (52.5, -97.5, 217.0),   // Winnipeg
+    (11.6, -85.4, 32.0),    // Nicaragua
+    (-15.8, -69.4, 3812.0), // Titicaca
+];
+
+/// Lake level (m) per cell for the real Earth: the cells of each hollow
+/// of the flooded relief (`filled` above `elevation`) holding one of
+/// `LAKES` that lie below its real level; `NO_LAKE` elsewhere.
+pub fn lakes(elevation: &Grid<f32>, filled: &[f32], sea: &[f32]) -> Grid<f32> {
+    let (w, h) = (elevation.w, elevation.h);
+    let mut lake = Grid::new(w, h, super::NO_LAKE);
+    let hollow = |k: usize| sea[k] < 0.5 && filled[k] as f64 - elevation.data[k] as f64 > 2.0;
+    for &(lat, lon, surface) in &LAKES {
+        let ci = (((lon + 180.0) / 360.0 * w as f64) as isize).clamp(0, w as isize - 1);
+        let cj = (((90.0 - lat) / 180.0 * h as f64) as isize).clamp(0, h as isize - 1);
+        // The lake's point may fall just outside its hollow at this
+        // resolution: take the nearest hollow cell within two cells.
+        let mut start = None;
+        for r in 0..=2isize {
+            for dj in -r..=r {
+                for di in -r..=r {
+                    let (i, j) = (ci + di, cj + dj);
+                    if start.is_none() && i >= 0 && j >= 0 && i < w as isize && j < h as isize {
+                        let k = i as usize + j as usize * w;
+                        if hollow(k) {
+                            start = Some(k);
+                        }
+                    }
+                }
+            }
+        }
+        let Some(start) = start else { continue };
+        // Its hollow (connected cells filled to the same rim), as far as
+        // it lies below the lake's surface.
+        let rim = filled[start];
+        let level = (surface as f32).min(rim);
+        let wet = |k: usize| hollow(k) && (filled[k] - rim).abs() < 1.0 && elevation.data[k] < level;
+        if !wet(start) {
+            continue;
+        }
+        let mut stack = vec![start];
+        lake.data[start] = level;
+        while let Some(c) = stack.pop() {
+            let (x, z) = ((c % w) as isize, (c / w) as isize);
+            for &(dx, dz, _) in &super::grid::NEIGHBOURS8 {
+                let (a, b) = (x + dx, z + dz);
+                if a < 0 || b < 0 || a >= w as isize || b >= h as isize {
+                    continue;
+                }
+                let k = a as usize + b as usize * w;
+                if lake.data[k] <= super::NO_LAKE && wet(k) {
+                    lake.data[k] = level;
+                    stack.push(k);
+                }
+            }
+        }
+    }
+    lake
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

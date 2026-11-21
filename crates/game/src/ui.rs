@@ -606,7 +606,10 @@ pub fn hud(ui: &mut egui::Ui, h: &HudInfo) {
                     ui.label(mono(format!(
                         "Seed {}  {}  {} wide  {} tall",
                         h.world.seed as i64,
-                        h.world.world_type.label(),
+                        match h.world.generator {
+                            Generator::Classic => h.world.world_type.label().to_string(),
+                            Generator::Realistic => format!("{} ({})", h.world.planet.label(), h.world.quality.label()),
+                        },
                         format_km(h.world.size.width_km()),
                         group_thousands(h.world.height.blocks())
                     )));

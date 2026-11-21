@@ -51,6 +51,13 @@ fn key(v: f64) -> u64 {
 
 /// Floods from every sea cell (height < 0) and every border cell.
 pub fn priority_flood(height: &[f32], w: usize, h: usize) -> Drainage {
+    priority_flood_from(height, w, h, &|i| height[i] < 0.0)
+}
+
+/// Floods from the cells where `outlet` holds (the sea) and every border
+/// cell. Low ground that is not an outlet, like the Caspian basin, fills
+/// up as a hollow.
+pub fn priority_flood_from(height: &[f32], w: usize, h: usize, outlet: &dyn Fn(usize) -> bool) -> Drainage {
     let n = w * h;
     let mut filled = vec![0f32; n];
     let mut receiver = vec![u32::MAX; n];
@@ -60,7 +67,7 @@ pub fn priority_flood(height: &[f32], w: usize, h: usize) -> Drainage {
     for i in 0..n {
         let (x, z) = (i % w, i / w);
         let border = x == 0 || z == 0 || x == w - 1 || z == h - 1;
-        if height[i] < 0.0 || border {
+        if border || outlet(i) {
             filled[i] = height[i];
             receiver[i] = i as u32;
             done[i] = true;
@@ -70,7 +77,7 @@ pub fn priority_flood(height: &[f32], w: usize, h: usize) -> Drainage {
             let coastal = border
                 || NEIGHBOURS8.iter().any(|&(dx, dz, _)| {
                     let (a, b) = (x as isize + dx, z as isize + dz);
-                    height[a as usize + b as usize * w] >= 0.0
+                    !outlet(a as usize + b as usize * w)
                 });
             if coastal {
                 heap.push(Reverse((key(height[i] as f64), i as u32)));

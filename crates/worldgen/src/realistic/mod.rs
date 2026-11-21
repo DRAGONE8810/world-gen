@@ -178,8 +178,10 @@ impl RealisticWorld {
 
         // --- Climate, drainage, rivers, lakes -----------------------------
         let clim = climate::simulate(&elevation, km, seed, if earth { 0.0 } else { 6.0 });
-        let drainage = erosion::priority_flood(&elevation.data, w, h);
-        let sea = open_sea(&elevation, &drainage);
+        // Only the open sea drains the land: basins below sea level inland
+        // (the Caspian) fill up like any other hollow.
+        let sea = open_sea(&elevation);
+        let drainage = erosion::priority_flood_from(&elevation.data, w, h, &|i| sea.data[i] > 0.5);
         let area_m2 = km * km * 1e6;
         let runoff: Vec<f32> = clim
             .precipitation
@@ -194,15 +196,20 @@ impl RealisticWorld {
             .collect();
         let discharge = drainage.accumulate(&runoff);
 
-        let mut lake = Grid::new(w, h, NO_LAKE);
-        for i in 0..w * h {
-            let depth = drainage.filled[i] as f64 - elevation.data[i] as f64;
-            // Hollows fill only where it rains more than evaporates; in a
-            // dry basin the lake dries out (salt flats, Death Valley).
-            if sea.data[i] < 0.5 && depth > 10.0 && clim.aridity.data[i] > 0.5 {
-                lake.data[i] = drainage.filled[i];
+        let lake = if earth {
+            earth::lakes(&elevation, &drainage.filled, &sea.data)
+        } else {
+            let mut lake = Grid::new(w, h, NO_LAKE);
+            for i in 0..w * h {
+                let depth = drainage.filled[i] as f64 - elevation.data[i] as f64;
+                // Hollows fill only where it rains more than evaporates; in a
+                // dry basin the lake dries out (salt flats, Death Valley).
+                if sea.data[i] < 0.5 && depth > 25.0 && clim.aridity.data[i] > 0.5 {
+                    lake.data[i] = drainage.filled[i];
+                }
             }
-        }
+            lake
+        };
 
         let mut world = Self {
             w,
@@ -216,7 +223,7 @@ impl RealisticWorld {
             ocean_room: 0.0,
             norm_scale: 1.0,
             world_scale: settings.height.terrain_scale(),
-            relief: mountain.map(|m| (90.0 + 1500.0 * m as f64) as f32),
+            relief: mountain.map(|m| (90.0 + 2800.0 * (m as f64).powf(1.3)) as f32),
             elevation,
             mountain,
             strike_c,
@@ -338,9 +345,13 @@ impl RealisticWorld {
     }
 
     /// A land column near the centre with a mild climate.
+    /// The spawn cell: low, temperate, humid land (forest or grassland)
+    /// within sight of a mountain range, nearest the middle of the map.
+    /// Falls back to any temperate lowland, then to the origin.
     fn pick_spawn(&self) -> (i32, i32) {
         let (cw, ch) = (self.w as f64 / 2.0, self.h as f64 / 2.0);
-        let mut best = (f64::INFINITY, 0usize);
+        let near_mountains = self.mountain.blur(((600.0 / self.km).round() as usize).max(1), 1);
+        let mut best = [(f64::INFINITY, 0usize); 2];
         for j in 0..self.h {
             for i in 0..self.w {
                 let k = i + j * self.w;
@@ -350,15 +361,19 @@ impl RealisticWorld {
                     continue;
                 }
                 let d = (i as f64 + 0.5 - cw).powi(2) + (j as f64 + 0.5 - ch).powi(2);
-                if d < best.0 {
-                    best = (d, k);
+                let scenic = (6.0..20.0).contains(&t)
+                    && self.humidity.data[k] >= 0.0
+                    && near_mountains.data[k] > 0.12
+                    && self.lake.data[k] <= NO_LAKE;
+                for (b, ok) in best.iter_mut().zip([scenic, true]) {
+                    if ok && d < b.0 {
+                        *b = (d, k);
+                    }
                 }
             }
         }
-        if best.0.is_infinite() {
-            return (0, 0);
-        }
-        let (i, j) = (best.1 % self.w, best.1 / self.w);
+        let Some(&(_, k)) = best.iter().find(|b| b.0.is_finite()) else { return (0, 0) };
+        let (i, j) = (k % self.w, k / self.w);
         ((self.x0 + (i as f64 + 0.5) * self.cell_blocks) as i32, (self.z0 + (j as f64 + 0.5) * self.cell_blocks) as i32)
     }
 
@@ -448,7 +463,11 @@ impl RealisticWorld {
             let v = lerp(ridged, n, ridge * 1.25 - 0.4);
             sum += a * v;
             lambda *= 0.5;
-            a *= 0.574; // amplitude ∝ λ^0.8, as measured on real terrain
+            // Amplitude ∝ λ^0.8 on plains and hills, ∝ λ^0.55 in high
+            // mountains, whose slopes stay steep down to small scales
+            // (fractal analyses of real DEMs give Hurst exponents of about
+            // 0.5–0.8 between 1 and 50 km).
+            a *= lerp(ridged, 0.574, 0.683);
             k += 1;
         }
         sum
@@ -497,19 +516,38 @@ impl RealisticWorld {
         let wv = v0 + 0.7 * self.warp_v.sample_2d(u0 * 0.5, v0 * 0.5);
 
         let base = self.elevation.bicubic(wu, wv);
-        let m = self.mountain.bilinear(wu, wv).clamp(0.0, 1.0);
-        let relief = self.relief.bilinear(wu, wv);
+        // Bicubic, not bilinear: the detail amplitude follows these, and a
+        // kink in it at cell edges would show as a straight crease.
+        let m = self.mountain.bicubic(wu, wv).clamp(0.0, 1.0);
+        let relief = self.relief.bicubic(wu, wv).max(60.0);
         let sea = self.sea.bilinear(u0, v0);
         let (sc, ss) = (self.strike_c.bilinear(wu, wv), self.strike_s.bilinear(wu, wv));
         let sl = (sc * sc + ss * ss).sqrt().max(1e-9);
         let (c2, s2) = (sc / sl, ss / sl);
+        // Ranges are stretched along their axis, but only where the axis is
+        // well defined: where axes from different ranges cancel out (`sl`
+        // near 0) its direction flips, and stretched noise would jump.
+        let aniso = smoothstep(0.15, 0.7, m) * smoothstep(0.1, 0.4, sl);
 
         // Detail from the cell size down to ~6 blocks.
         let (xk, zk) = (u0 * self.km, v0 * self.km);
         let min_km = (6.0 / (self.h_scale * 1000.0)).max(1e-4);
         let ocean_floor = 1.0 - smoothstep(-400.0, 0.0, base);
         let amp = lerp(ocean_floor, relief, 120.0);
-        let mut e = base + self.detail(xk, zk, amp, m, c2, s2, smoothstep(0.15, 0.7, m), min_km);
+        // Valley floors are smooth: the detail fades out towards a river,
+        // so the river runs on the simulated terrain it was traced on
+        // instead of floating over a dip in the noise.
+        let near_river = self.nearest_river(wu, wv);
+        let fade = near_river.map_or(1.0, |(dist, _, width, _, q)| {
+            let hw = width / 2.0;
+            smoothstep(hw, hw + (self.valley_half_width(q) * 6.0).max(0.03 * self.cell_blocks), dist)
+        });
+        let mut e = base + fade * self.detail(xk, zk, amp, m, c2, s2, aniso, min_km);
+        // Peaks taper off above 7 km and never pass ~9.5 km: Everest is
+        // 8.8 km, and the world height is sized for it.
+        if e > 7000.0 {
+            e = 7000.0 + 2500.0 * libm::tanh((e - 7000.0) / 2500.0);
+        }
 
         // Lakes fill their basin up to the rim. The lake cells are blended
         // bilinearly into a 0..1 mask whose 0.5 contour, roughened by a
@@ -565,11 +603,14 @@ impl RealisticWorld {
             water = f64::NEG_INFINITY;
         }
 
-        if let Some((dist, level, width, depth, _q)) = self.nearest_river(wu, wv) {
+        if let Some((dist, level, width, depth, q)) = near_river {
             let hw = width / 2.0;
-            let valley = self.valley_half_width(_q);
+            let valley = self.valley_half_width(q);
             if dist < valley {
-                let wy = (SEA_LEVEL as f64 + level).floor();
+                // The traced level, or the land here if that is lower (the
+                // simulation grid is coarse: on a steep slope its level can
+                // sit above the actual valley floor).
+                let wy = (SEA_LEVEL as f64 + level.min(self.to_blocks(base) - 1.0)).floor();
                 // Valley sides: the land falls towards the river; banks
                 // stay just above the water so it never spills.
                 let bank = wy + 1.0 + (dist - hw).max(0.0) * (0.15 + 0.6 * m);
@@ -581,7 +622,7 @@ impl RealisticWorld {
                     height = height.min(bed);
                     water = water.max(wy);
                     river = 1.0;
-                    e = e.min(level / self.v_scale.max(1e-9));
+                    e = e.min((wy - SEA_LEVEL as f64) / self.v_scale.max(1e-9));
                 } else {
                     river = river.max(0.4 * (1.0 - (dist - hw) / (valley - hw)).max(0.0));
                 }
@@ -636,7 +677,7 @@ impl RealisticWorld {
 
 /// Sea cells connected to the world ocean (the border), as 0/1. Hollows
 /// below sea level inland (Caspian, Dead Sea) are not sea.
-fn open_sea(elevation: &Grid<f32>, _d: &erosion::Drainage) -> Grid<f32> {
+fn open_sea(elevation: &Grid<f32>) -> Grid<f32> {
     let (w, h) = (elevation.w, elevation.h);
     let mut sea = Grid::new(w, h, 0f32);
     let mut stack: Vec<usize> = Vec::new();
