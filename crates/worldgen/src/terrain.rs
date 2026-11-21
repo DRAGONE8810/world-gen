@@ -63,6 +63,29 @@ pub struct Shape {
     pub river: f64,
     /// Oceanic island strength 0..1 (0 almost everywhere).
     pub island: f64,
+    /// Terrain magnification of the world (`WorldHeight::terrain_scale`):
+    /// 1 for 384-block worlds. Altitude rules (snow line, peaks, lapse
+    /// rate) divide heights above sea level by it. 0 (the `Default`) is
+    /// treated as 1.
+    pub vscale: f64,
+}
+
+impl Shape {
+    /// The terrain scale, with the `Default` 0 read as 1.
+    #[inline]
+    pub fn scale(&self) -> f64 {
+        if self.vscale > 0.0 {
+            self.vscale
+        } else {
+            1.0
+        }
+    }
+    /// Converts an absolute height into the height it would have in a
+    /// default 384-block world, so altitude thresholds work at any scale.
+    #[inline]
+    pub fn normalized_y(&self, y: f64) -> f64 {
+        SEA_LEVEL as f64 + (y - SEA_LEVEL as f64) / self.scale()
+    }
 }
 
 pub struct TerrainShaper {
@@ -76,8 +99,11 @@ pub struct TerrainShaper {
     islands: DoubleNoise,
     warp_x: DoubleNoise,
     warp_z: DoubleNoise,
-    /// Horizontal stretch of all climate noise (4 for Large biomes).
+    /// Horizontal stretch of all climate noise: 4 for Large biomes, times
+    /// the world's terrain scale.
     scale: f64,
+    /// Vertical magnification (the world's terrain scale).
+    vscale: f64,
     world_type: WorldType,
 
     base_height: Curve,
@@ -99,7 +125,9 @@ const GAIN_HUMIDITY: f64 = 2.3;
 const GAIN_ISLAND: f64 = 1.9;
 
 impl TerrainShaper {
-    pub fn new(seed: u64, world_type: WorldType) -> Self {
+    /// `terrain_scale` magnifies the terrain in all three directions (see
+    /// `WorldHeight`); 1.0 for the default 384-block world.
+    pub fn new(seed: u64, world_type: WorldType, terrain_scale: f64) -> Self {
         let n = |salt: &str, first: i32, amps: &[f64]| {
             DoubleNoise::new(derive_seed(seed, salt), &OctaveConfig::new(first, amps))
         };
@@ -123,7 +151,8 @@ impl TerrainShaper {
             islands: n("terrain/islands", -9, &[1.0, 1.0]),
             warp_x: n("terrain/warp_x", -10, &[1.0, 1.0, 1.0]),
             warp_z: n("terrain/warp_z", -10, &[1.0, 1.0, 1.0]),
-            scale: if world_type == WorldType::LargeBiomes { 4.0 } else { 1.0 },
+            scale: if world_type == WorldType::LargeBiomes { 4.0 } else { 1.0 } * terrain_scale,
+            vscale: terrain_scale,
             world_type,
 
             // Height relative to sea level by continentalness: abyss, deep
@@ -248,7 +277,15 @@ impl TerrainShaper {
             roughness = lerp(valley * allowed, roughness, 1.0);
         }
 
-        Shape { climate, height, roughness, river, island }
+        // Tall worlds: the whole shape is computed at default scale (on
+        // coordinates divided by the scale) and then stretched vertically
+        // around sea level by the same factor.
+        if self.vscale != 1.0 {
+            height = SEA_LEVEL as f64 + (height - SEA_LEVEL as f64) * self.vscale;
+            roughness *= self.vscale;
+        }
+
+        Shape { climate, height, roughness, river, island, vscale: self.vscale }
     }
 }
 
@@ -258,7 +295,7 @@ mod tests {
 
     #[test]
     fn climate_parameters_in_range_and_spread() {
-        let t = TerrainShaper::new(1, WorldType::Normal);
+        let t = TerrainShaper::new(1, WorldType::Normal, 1.0);
         let mut c_min: f64 = 1.0;
         let mut c_max: f64 = -1.0;
         for i in 0..4000 {

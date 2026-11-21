@@ -3,7 +3,9 @@
 
 use crate::config::GameSettings;
 use egui::{Align2, Color32, RichText, Vec2};
-use worldgen::settings::{seed_from_text, MAX_WORLD_WIDTH, MIN_WORLD_WIDTH};
+use worldgen::settings::{
+    seed_from_text, WorldHeight, MAX_WORLD_HEIGHT, MAX_WORLD_WIDTH, MIN_WORLD_HEIGHT, MIN_WORLD_WIDTH,
+};
 use worldgen::{WorldGenerator, WorldSettings, WorldSize, WorldType, SEA_LEVEL};
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -30,6 +32,8 @@ pub enum Action {
 pub struct WorldForm {
     pub seed_text: String,
     pub size_km: f64,
+    /// World height in blocks (rounded to whole 16-block sections on use).
+    pub height: u32,
     pub world_type: WorldType,
     pub features: bool,
     preview: Option<(WorldSettings, egui::TextureHandle)>,
@@ -40,6 +44,7 @@ impl WorldForm {
         Self {
             seed_text: String::new(),
             size_km: s.size.width_km(),
+            height: s.height.blocks(),
             world_type: s.world_type,
             features: s.features,
             preview: None,
@@ -50,6 +55,7 @@ impl WorldForm {
         WorldSettings {
             seed,
             size: WorldSize::from_km(self.size_km),
+            height: WorldHeight::from_blocks(self.height),
             world_type: self.world_type,
             features: self.features,
         }
@@ -133,6 +139,39 @@ pub fn create_world(ui: &mut egui::Ui, form: &mut WorldForm, actions: &mut Vec<A
                 });
                 ui.end_row();
 
+                ui.label("World height");
+                ui.vertical(|ui| {
+                    egui::ComboBox::from_id_salt("height_preset")
+                        .selected_text(format!("{} blocks", group_thousands(form.height)))
+                        .show_ui(ui, |ui| {
+                            for (label, blocks) in WorldHeight::PRESETS {
+                                ui.selectable_value(&mut form.height, *blocks, *label);
+                            }
+                        });
+                    ui.add(
+                        egui::Slider::new(&mut form.height, MIN_WORLD_HEIGHT..=MAX_WORLD_HEIGHT)
+                            .logarithmic(true)
+                            .suffix(" blocks"),
+                    );
+                    let h = WorldHeight::from_blocks(form.height);
+                    ui.label(
+                        RichText::new(format!(
+                            "{}y {} to {} · sea at {} · terrain ×{:.2}",
+                            if h.blocks() != form.height {
+                                format!("rounded to {} · ", group_thousands(h.blocks()))
+                            } else {
+                                String::new()
+                            },
+                            h.min_y(),
+                            h.max_y(),
+                            SEA_LEVEL,
+                            h.terrain_scale()
+                        ))
+                        .weak(),
+                    );
+                });
+                ui.end_row();
+
                 ui.label("World type");
                 ui.vertical(|ui| {
                     for t in WorldType::ALL {
@@ -189,8 +228,10 @@ pub fn create_world(ui: &mut egui::Ui, form: &mut WorldForm, actions: &mut Vec<A
     });
 }
 
+/// Area shown by the preview. Tall worlds stretch the terrain sideways by
+/// the same factor as upwards, so the preview zooms out with them.
 fn preview_extent(s: &WorldSettings) -> f64 {
-    (s.size.width_blocks() as f64).min(16_000.0)
+    (s.size.width_blocks() as f64).min(16_000.0 * s.height.terrain_scale())
 }
 
 /// Top-down colour map straight from the generator.
@@ -198,6 +239,7 @@ fn preview_image(s: &WorldSettings, px: usize) -> egui::ColorImage {
     let gen = WorldGenerator::new(s.clone());
     let extent = preview_extent(s);
     let step = extent / px as f64;
+    let vscale = s.height.terrain_scale();
     use rayon::prelude::*;
     let samples: Vec<_> = (0..px * px)
         .into_par_iter()
@@ -216,7 +258,7 @@ fn preview_image(s: &WorldSettings, px: usize) -> egui::ColorImage {
             } else if c.ice {
                 worldgen::blocks::ICE.info().color
             } else if c.underwater {
-                let d = ((SEA_LEVEL - c.surface_y) as f32 / 50.0).clamp(0.0, 1.0);
+                let d = ((SEA_LEVEL - c.surface_y) as f64 / (50.0 * vscale)).clamp(0.0, 1.0) as f32;
                 [(40.0 - d * 20.0) as u8, (90.0 - d * 40.0) as u8, (200.0 - d * 60.0) as u8]
             } else {
                 c.top_color()
@@ -243,6 +285,19 @@ pub fn format_km(km: f64) -> String {
     } else {
         format!("{km:.1} km")
     }
+}
+
+/// `17696` → `"17,696"`.
+pub fn group_thousands(n: u32) -> String {
+    let digits = n.to_string();
+    let mut out = String::new();
+    for (i, c) in digits.chars().enumerate() {
+        if i > 0 && (digits.len() - i).is_multiple_of(3) {
+            out.push(',');
+        }
+        out.push(c);
+    }
+    out
 }
 
 /// Returns true when the user pressed "Done".
@@ -360,10 +415,11 @@ pub fn hud(ui: &mut egui::Ui, h: &HudInfo) {
                         h.column.shape.river
                     )));
                     ui.label(mono(format!(
-                        "Seed {}  {}  {}",
+                        "Seed {}  {}  {} wide  {} tall",
                         h.world.seed as i64,
                         h.world.world_type.label(),
-                        format_km(h.world.size.width_km())
+                        format_km(h.world.size.width_km()),
+                        group_thousands(h.world.height.blocks())
                     )));
                     ui.label(mono(format!(
                         "Chunks: {} loaded, {} meshed, {} drawn, {} jobs",
@@ -412,15 +468,7 @@ fn format_speed(v: f32) -> String {
     if v < 10.0 {
         return format!("{}", (v * 100.0).round() / 100.0);
     }
-    let digits = format!("{}", v.round() as u64);
-    let mut out = String::new();
-    for (i, ch) in digits.chars().enumerate() {
-        if i > 0 && (digits.len() - i).is_multiple_of(3) {
-            out.push(',');
-        }
-        out.push(ch);
-    }
-    out
+    group_thousands(v.round() as u32)
 }
 
 #[cfg(test)]
@@ -440,5 +488,8 @@ mod tests {
         assert_eq!(format_km(16.0), "16 km");
         assert_eq!(format_km(1000.0), "1,000 km");
         assert_eq!(format_km(59_999.968), "60,000 km (full)");
+        assert_eq!(group_thousands(256), "256");
+        assert_eq!(group_thousands(17_696), "17,696");
+        assert_eq!(group_thousands(1_048_576), "1,048,576");
     }
 }

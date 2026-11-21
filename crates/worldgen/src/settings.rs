@@ -3,14 +3,86 @@
 
 use serde::{Deserialize, Serialize};
 
-/// Lowest block layer (inclusive). Same vertical range as modern Minecraft.
+/// Lowest block layer (inclusive) of the default 384-block world. Same
+/// vertical range as modern Minecraft. Taller or shorter worlds use
+/// [`WorldHeight::min_y`] instead.
 pub const MIN_Y: i32 = -64;
-/// Total number of block layers.
+/// Number of block layers in the default world.
 pub const WORLD_HEIGHT: i32 = 384;
-/// Highest block layer (inclusive).
+/// Highest block layer (inclusive) of the default world.
 pub const MAX_Y: i32 = MIN_Y + WORLD_HEIGHT - 1;
-/// Water fills every air block at or below this height in oceans.
+/// Water fills every air block at or below this height in oceans. The same
+/// in every world height.
 pub const SEA_LEVEL: i32 = 63;
+
+/// Smallest selectable world height.
+pub const MIN_WORLD_HEIGHT: u32 = 256;
+/// Tallest selectable world height: twice Mount Everest (2 × 8,849 m),
+/// rounded down to whole 16-block sections.
+pub const MAX_WORLD_HEIGHT: u32 = 17_696;
+
+/// Total height of the world in blocks (1 block = 1 m).
+///
+/// The whole terrain is scaled with it, vertically *and* horizontally, by
+/// [`WorldHeight::terrain_scale`] = height / 384. A 17,696-block world is
+/// the default world magnified 46×: mountains ~9.5 km above the sea (like
+/// the Himalaya), ocean trenches ~2.3 km deep, continents ~180 km across.
+/// Scaling both directions keeps slopes realistic; scaling only the height
+/// would turn every hill into a needle. Trees, rivers' banks, beaches and
+/// surface layers keep their real size in blocks.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WorldHeight {
+    height: u32,
+}
+
+impl WorldHeight {
+    /// Rounds to whole 16-block sections and clamps to the allowed range.
+    pub fn from_blocks(height: u32) -> Self {
+        let h = height.clamp(MIN_WORLD_HEIGHT, MAX_WORLD_HEIGHT);
+        Self { height: (h + 8) / 16 * 16 }
+    }
+    pub const fn default_height() -> Self {
+        Self { height: WORLD_HEIGHT as u32 }
+    }
+    pub fn blocks(self) -> u32 {
+        self.height
+    }
+    /// Vertical and horizontal magnification of the terrain (1.0 for 384).
+    pub fn terrain_scale(self) -> f64 {
+        self.height as f64 / WORLD_HEIGHT as f64
+    }
+    /// Lowest layer. The part below sea level grows with the terrain scale
+    /// (deeper oceans need more room), rounded to whole sections.
+    pub fn min_y(self) -> i32 {
+        let below = (64.0 * self.terrain_scale() / 16.0).round().max(1.0) as i32 * 16;
+        -below
+    }
+    /// Highest layer (inclusive).
+    pub fn max_y(self) -> i32 {
+        self.min_y() + self.height as i32 - 1
+    }
+    /// Number of 16-block sections in a column.
+    pub fn sections(self) -> usize {
+        self.height as usize / 16
+    }
+
+    /// Presets shown in the menu.
+    pub const PRESETS: &'static [(&'static str, u32)] = &[
+        ("256", 256),
+        ("384 (Minecraft)", 384),
+        ("1,000", 1_000),
+        ("2,000", 2_000),
+        ("5,000", 5_000),
+        ("10,000", 10_000),
+        ("17,696 (2× Everest)", MAX_WORLD_HEIGHT),
+    ];
+}
+
+impl Default for WorldHeight {
+    fn default() -> Self {
+        Self::default_height()
+    }
+}
 
 /// The largest world we support: the vanilla Minecraft world border sits at
 /// ±29,999,984 blocks, i.e. just under 60,000 km across.
@@ -116,11 +188,21 @@ pub struct WorldSettings {
     pub world_type: WorldType,
     /// Generate trees and other surface features.
     pub features: bool,
+    /// Total world height. `serde(default)` keeps settings files from
+    /// before this option loading as 384-block worlds.
+    #[serde(default)]
+    pub height: WorldHeight,
 }
 
 impl Default for WorldSettings {
     fn default() -> Self {
-        Self { seed: 0, size: WorldSize::default(), world_type: WorldType::Normal, features: true }
+        Self {
+            seed: 0,
+            size: WorldSize::default(),
+            world_type: WorldType::Normal,
+            features: true,
+            height: WorldHeight::default(),
+        }
     }
 }
 
@@ -173,8 +255,35 @@ mod tests {
 
     #[test]
     fn settings_roundtrip_through_ron() {
-        let s = WorldSettings { seed: 99, size: WorldSize::full(), world_type: WorldType::Islands, features: false };
+        let s = WorldSettings {
+            seed: 99,
+            size: WorldSize::full(),
+            world_type: WorldType::Islands,
+            features: false,
+            height: WorldHeight::from_blocks(5000),
+        };
         let text = ron::to_string(&s).unwrap();
         assert_eq!(ron::from_str::<WorldSettings>(&text).unwrap(), s);
+        // Settings saved before the height option existed still load.
+        let old = "(seed: 1, size: (width: 4000), world_type: Normal, features: true)";
+        assert_eq!(ron::from_str::<WorldSettings>(old).unwrap().height, WorldHeight::default());
+    }
+
+    #[test]
+    fn world_heights() {
+        let d = WorldHeight::default();
+        assert_eq!((d.min_y(), d.max_y(), d.sections()), (MIN_Y, MAX_Y, 24));
+        assert_eq!(d.terrain_scale(), 1.0);
+        let max = WorldHeight::from_blocks(u32::MAX);
+        assert_eq!(max.blocks(), MAX_WORLD_HEIGHT);
+        assert!(max.blocks() as f64 <= 2.0 * 8_849.0);
+        assert_eq!(WorldHeight::from_blocks(10).blocks(), MIN_WORLD_HEIGHT);
+        for h in [256, 300, 1000, 5000, 10_000, 17_696] {
+            let w = WorldHeight::from_blocks(h);
+            assert_eq!(w.blocks() % 16, 0);
+            assert_eq!(w.min_y() % 16, 0);
+            assert!(w.min_y() < SEA_LEVEL - 40 && w.max_y() > SEA_LEVEL + 100, "{h}");
+            assert_eq!((w.max_y() - w.min_y() + 1) as u32, w.blocks());
+        }
     }
 }

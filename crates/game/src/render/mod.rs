@@ -598,7 +598,16 @@ impl Renderer {
             self.device.cmd_set_scissor(cmd, 0, &[vk::Rect2D { offset: vk::Offset2D::default(), extent }]);
 
             if let Some((camera, view_distance)) = camera {
-                let far = view_distance * 1.5 + 64.0;
+                // Chunks load by horizontal distance, but in tall worlds the
+                // ground can be thousands of blocks below the camera, so the
+                // far plane must also reach the lowest/highest loaded mesh.
+                let cam_y = camera.pos.y;
+                let vertical = self
+                    .meshes
+                    .values()
+                    .map(|m| ((cam_y - m.min_y as f64).abs().max((m.max_y as f64 - cam_y).abs())) as f32)
+                    .fold(0.0f32, f32::max);
+                let far = (view_distance * 1.5 + 64.0).hypot(vertical) + 16.0;
                 let view_proj = camera.view_proj(self.aspect(), far);
                 let frustum = Frustum::from_matrix(view_proj);
                 self.device.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::GRAPHICS, self.pipeline);

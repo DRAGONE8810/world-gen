@@ -10,12 +10,14 @@
 //! ```
 
 use rayon::prelude::*;
+use worldgen::settings::WorldHeight;
 use worldgen::{blocks, Biome, ColumnSample, WorldGenerator, WorldSettings, WorldSize, WorldType, SEA_LEVEL};
 
 struct Args {
     seed: u64,
     world_type: WorldType,
     size_km: f64,
+    height: u32,
     center: (i32, i32),
     extent: u32,
     px: u32,
@@ -40,7 +42,7 @@ enum Layer {
 
 fn usage() -> ! {
     eprintln!(
-        "usage: wg-map [--seed N|TEXT] [--type normal|amplified|large|islands|flat] [--size-km KM]\n\
+        "usage: wg-map [--seed N|TEXT] [--type normal|amplified|large|islands|flat] [--size-km KM] [--height BLOCKS]\n\
          \x20             [--center X,Z] [--extent BLOCKS] [--px PIXELS] [--out FILE.png]\n\
          \x20             [--layer surface|height|biome|continentalness|erosion|pv|roughness|temperature|humidity]\n\
          \x20             [--no-trees] [--legend]\n\
@@ -54,6 +56,7 @@ fn parse_args() -> Args {
         seed: 0,
         world_type: WorldType::Normal,
         size_km: 16.0,
+        height: 384,
         center: (0, 0),
         extent: 4096,
         px: 1024,
@@ -78,6 +81,7 @@ fn parse_args() -> Args {
                 }
             }
             "--size-km" => a.size_km = val().parse().unwrap_or_else(|_| usage()),
+            "--height" => a.height = val().parse().unwrap_or_else(|_| usage()),
             "--center" => {
                 let v = val();
                 let (x, z) = v.split_once(',').unwrap_or_else(|| usage());
@@ -116,6 +120,7 @@ fn main() {
         size: WorldSize::from_km(args.size_km),
         world_type: args.world_type,
         features: args.features,
+        height: WorldHeight::from_blocks(args.height),
     });
     if let Some(n) = args.bench {
         bench(&gen, n as i32);
@@ -224,7 +229,7 @@ fn pixel_color(layer: Layer, s: &ColumnSample, se: &ColumnSample, blocks_per_px:
         return [12, 12, 16];
     }
     // Hill shading: brighter on slopes facing the north-west light.
-    let slope = (s.surface_y - se.surface_y) as f64 / blocks_per_px.max(1.0);
+    let slope = (s.surface_y - se.surface_y) as f64 / blocks_per_px.max(1.0) / s.shape.scale();
     let shade = (1.0 + slope * 0.35).clamp(0.55, 1.4);
     let shaded = |c: [u8; 3]| c.map(|v| (v as f64 * shade).clamp(0.0, 255.0) as u8);
     let water = |depth: i32| {
@@ -248,7 +253,7 @@ fn pixel_color(layer: Layer, s: &ColumnSample, se: &ColumnSample, blocks_per_px:
             if s.ice {
                 shaded(blocks::ICE.info().color)
             } else if s.underwater {
-                water(SEA_LEVEL - s.surface_y)
+                water(((SEA_LEVEL - s.surface_y) as f64 / s.shape.scale()) as i32)
             } else {
                 shaded(s.top_color())
             }
@@ -263,11 +268,12 @@ fn pixel_color(layer: Layer, s: &ColumnSample, se: &ColumnSample, blocks_per_px:
         Layer::Humidity => ramp(s.shape.climate.humidity),
         Layer::Height => {
             if s.underwater {
-                water(SEA_LEVEL - s.surface_y)
+                water(((SEA_LEVEL - s.surface_y) as f64 / s.shape.scale()) as i32)
             } else {
                 // Hypsometric tint: green lowlands, yellow/brown hills, grey
                 // mountains, white peaks.
-                let h = (s.surface_y - SEA_LEVEL) as f64;
+                // In default-world blocks, so tall worlds use the same tints.
+                let h = s.shape.normalized_y(s.surface_y as f64) - SEA_LEVEL as f64;
                 let stops: [(f64, [f64; 3]); 6] = [
                     (0.0, [70.0, 140.0, 60.0]),
                     (25.0, [140.0, 170.0, 80.0]),

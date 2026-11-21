@@ -28,12 +28,14 @@
 use crate::biome::Biome;
 use crate::block::{blocks, BlockId};
 use crate::rng::{hash_position, Xoroshiro128PlusPlus};
-use crate::settings::{MAX_Y, SEA_LEVEL};
+use crate::settings::SEA_LEVEL;
 
 /// Edge length of a jittered-grid cell, in blocks.
 pub const TREE_CELL: i32 = 5;
 /// The farthest any tree block reaches horizontally from its trunk origin.
 pub const TREE_REACH: i32 = 4;
+/// The highest any tree block reaches above the ground it stands on.
+pub const TREE_HEADROOM: i32 = 30;
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Hash)]
 pub enum TreeKind {
@@ -111,7 +113,7 @@ pub fn cell_candidate(seed: u64, cx: i32, cz: i32) -> (i32, i32, u64) {
 
 /// Decides whether the candidate grows, given the column it stands on.
 /// `top` is the block at `surface_y`.
-pub fn resolve(x: i32, z: i32, hash: u64, biome: Biome, surface_y: i32, top: BlockId) -> Option<Tree> {
+pub fn resolve(x: i32, z: i32, hash: u64, biome: Biome, surface_y: i32, top: BlockId, max_y: i32) -> Option<Tree> {
     let (density, kinds) = biome_trees(biome);
     if density <= 0.0 {
         return None;
@@ -151,7 +153,7 @@ pub fn resolve(x: i32, z: i32, hash: u64, biome: Biome, surface_y: i32, top: Blo
         return None;
     }
     let y = surface_y + 1;
-    if y + 30 > MAX_Y {
+    if y + TREE_HEADROOM > max_y {
         return None;
     }
     Some(Tree { kind, x, y, z, hash })
@@ -371,7 +373,7 @@ mod tests {
                 assert!(!a.is_empty());
                 for &(x, y, z, _, _) in &a {
                     assert!(x.abs() <= TREE_REACH && z.abs() <= TREE_REACH, "{kind:?} reaches {x},{z}");
-                    assert!(y >= t.y - 1 && y < t.y + 30, "{kind:?} y {y}");
+                    assert!(y >= t.y - 1 && y < t.y + TREE_HEADROOM - 1, "{kind:?} y {y}");
                 }
                 // The trunk base is always a log-type block.
                 assert!(a.iter().any(|&(x, y, z, _, l)| l && (x, y, z) == (0, t.y, 0)));
