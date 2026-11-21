@@ -15,7 +15,7 @@ seed when it is needed, so a 60,000 km world costs the same as a 1 km one.
 | 3 | Biomes and trees | **Done**, see [devlog 03](devlog/03-biomes.md) |
 | 4 | Scale and speed: tall worlds (cubic chunks), LODs to 256 chunks, faster meshing, GPU-driven drawing, world map | **Done** (4a, 4b, 4c), see [devlog 04](devlog/04-scale.md); RTX 2080 frame-rate check pending on real hardware |
 | 5 | Realistic generator: whole-planet simulation (plate tectonics, climate, rivers, erosion, lakes), planets Continents / Pangea / Earth / Islands, simulation quality, graphics presets | **Done**, see [devlog 05](devlog/05-realistic.md) |
-| 6 | Chunk and LOD speed: see as much of the world as possible at once | Next |
+| 6 | Whole-world far view: LOD to the world border and orbit, detail by height above ground, GPU mesh cache, faster tiles and bookkeeping | **Done**, see [devlog 06](devlog/06-far-view.md); RTX 2080 frame-rate check pending |
 
 ## Step 1: Foundation ✔
 
@@ -134,9 +134,19 @@ Result: 0.6 ms per chunk (6× faster than Classic in tall worlds), 107
 tests. Known limits: hyper-arid deserts too rare, Earth's rain is
 modelled, not measured.
 
-## Step 6: Chunk and LOD speed (next)
+## Step 6: The whole world at once ✔
 
-Make the far view reach as much of the world as possible: faster chunk
-and LOD tile generation and meshing, caching tiles that come back into
-view, coarser LOD levels out to the whole planet, and measuring the
-RTX 2080 budget.
+- ✔ LOD levels up to 22 (4,194,304-block cells): a **Whole world** option
+  (on in the Quality preset) draws everything out to the world border.
+- ✔ Detail by `max(horizontal distance, height above ground)`: flying up
+  removes chunks and fine tiles; the camera can climb to "orbit" (as high
+  as the world is wide). The whole Earth from orbit is 200 tiles.
+- ✔ 256 MiB GPU cache of out-of-view meshes, reused instantly.
+- ✔ Quadtree bookkeeping 4–6× faster (fast hashing, allocation-free draw
+  set, packed sort keys); more jobs in flight; uploads capped by bytes.
+- ✔ Far tiles 1.5–2.5× faster in Classic worlds (bit-identical sampling
+  shortcuts).
+
+Result: the whole 60,000 km world from the ground is ~13,600 tiles and
+~200 MB of vertices, built in 6–13 s on 3 threads, nearest first.
+Pending: frame rate on an RTX 2080; a screen-space error metric.
