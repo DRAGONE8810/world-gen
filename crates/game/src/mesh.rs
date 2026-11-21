@@ -275,7 +275,7 @@ fn greedy_section(padded: &[BlockId], biomes: &[Biome; 256], y0: i32, out: &mut 
 }
 
 #[allow(clippy::too_many_arguments)]
-fn emit_quad(
+pub fn emit_quad(
     out: &mut MeshData,
     base: [f32; 3],
     u: usize,

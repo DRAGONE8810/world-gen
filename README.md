@@ -15,7 +15,8 @@ deliberately plain.
 
 Steps 1–3 of 4 are done: foundation, terrain (continents, oceans,
 mountains, rivers), and 48 biomes with trees. Step 4 (scale and speed) is
-in progress: configurable world height is in, LOD rings and faster drawing
+in progress: configurable world height and a far view (LOD rings out to
+256 chunks, like Distant Horizons) are in; faster drawing and a world map
 are next. See [docs/PLAN.md](docs/PLAN.md) for the
 roadmap and [docs/devlog/](docs/devlog/) for a detailed log of each step,
 each with a short plain-language summary.
@@ -55,7 +56,7 @@ way to check what a seed looks like:
 ```sh
 cargo run --release -p wg-map -- --seed 42 --extent 16000 --px 1024 --out map.png
 cargo run --release -p wg-map -- --seed 42 --layer biome  # also: height, temperature, humidity, …
-cargo run --release -p wg-map -- --seed 42 --bench 32     # generation speed
+cargo run --release -p wg-map -- --seed 42 --bench 32     # generation speed (chunks and LOD tiles)
 cargo run --release -p wg-map -- --seed 42 --size-km 60000 --height 17696 --extent 737000  # a tall world
 ```
 

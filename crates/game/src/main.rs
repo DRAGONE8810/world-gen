@@ -8,6 +8,7 @@
 
 mod camera;
 mod config;
+mod lod;
 mod mesh;
 mod render;
 mod ui;
@@ -172,7 +173,7 @@ impl App {
         }
 
         let center = ChunkPos::from_block(s.camera.pos.x.floor() as i32, s.camera.pos.z.floor() as i32);
-        let events = s.chunks.update(center, self.settings.render_distance as i32);
+        let events = s.chunks.update(center, self.settings.layout(s.settings.height.terrain_scale()));
         if let Some(r) = &mut self.renderer {
             for e in events {
                 match e {
@@ -206,10 +207,6 @@ impl App {
             Screen::Settings { .. } => settings_done = ui::settings(ui, &mut self.settings),
             Screen::Playing | Screen::Paused => {
                 if let Some(s) = &self.session {
-                    let pending = s.chunks.pending_near(
-                        ChunkPos::from_block(s.camera.pos.x.floor() as i32, s.camera.pos.z.floor() as i32),
-                        self.settings.render_distance as i32,
-                    );
                     ui::hud(
                         ui,
                         &ui::HudInfo {
@@ -225,7 +222,7 @@ impl App {
                             drawn_chunks: self.last_draw.0,
                             drawn_triangles: self.last_draw.1,
                             gpu: &gpu,
-                            pending,
+                            pending: s.chunks.stats.pending_chunks,
                             show_debug: self.settings.show_debug,
                             fly_speed: self.settings.fly_speed,
                         },
@@ -253,11 +250,9 @@ impl App {
         if let Some(r) = &mut self.renderer {
             let in_world = matches!(self.screen, Screen::Playing | Screen::Paused)
                 || self.screen == (Screen::Settings { from_pause: true });
-            let cam = self
-                .session
-                .as_ref()
-                .filter(|_| in_world)
-                .map(|s| (&s.camera, (self.settings.render_distance * 16) as f32));
+            let cam = self.session.as_ref().filter(|_| in_world).map(|s| {
+                (&s.camera, self.settings.view_distance_blocks(s.settings.height.terrain_scale()), s.chunks.draw_list())
+            });
             let stats = r.draw(
                 (size.width, size.height),
                 cam,

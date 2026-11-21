@@ -44,10 +44,14 @@ impl Camera {
     }
 
     /// View-projection for camera-relative coordinates (camera at origin).
-    /// Vulkan clip space: depth 0..1 and Y pointing down, hence the flip.
-    pub fn view_proj(&self, aspect: f32, far: f32) -> Mat4 {
+    /// Vulkan clip space: Y pointing down, hence the flip. Depth is
+    /// *reversed* (1 at the near plane, 0 at infinity) with no far plane:
+    /// float depth then keeps ~7 significant digits at any distance, which a
+    /// 4,000-block LOD view needs (standard depth would be ~15 blocks coarse
+    /// out there).
+    pub fn view_proj(&self, aspect: f32) -> Mat4 {
         let view = Mat4::look_to_rh(Vec3::ZERO, self.forward(), Vec3::Y);
-        let mut proj = Mat4::perspective_rh(self.fov_y_deg.to_radians(), aspect, 0.1, far);
+        let mut proj = Mat4::perspective_infinite_reverse_rh(self.fov_y_deg.to_radians(), aspect, 0.1);
         proj.y_axis.y *= -1.0;
         proj * view
     }
@@ -65,7 +69,9 @@ impl Frustum {
         let r = [m.row(0), m.row(1), m.row(2), m.row(3)];
         let mut planes = [r[3] + r[0], r[3] - r[0], r[3] + r[1], r[3] - r[1], r[2], r[3] - r[2]];
         for p in &mut planes {
-            *p /= p.truncate().length();
+            let len = p.truncate().length();
+            // An infinite far plane has no normal: make it accept everything.
+            *p = if len > 1e-6 { *p / len } else { Vec4::new(0.0, 0.0, 0.0, 1.0) };
         }
         Self { planes }
     }
@@ -93,10 +99,26 @@ mod tests {
     #[test]
     fn frustum_keeps_boxes_in_front_and_drops_boxes_behind() {
         let cam = Camera { pos: DVec3::ZERO, yaw: 0.0, pitch: 0.0, fov_y_deg: 70.0 };
-        let f = Frustum::from_matrix(cam.view_proj(16.0 / 9.0, 500.0));
+        let f = Frustum::from_matrix(cam.view_proj(16.0 / 9.0));
         assert!(f.intersects_aabb(Vec3::new(-1.0, -1.0, -20.0), Vec3::new(1.0, 1.0, -18.0)));
         assert!(!f.intersects_aabb(Vec3::new(-1.0, -1.0, 18.0), Vec3::new(1.0, 1.0, 20.0)));
-        assert!(!f.intersects_aabb(Vec3::new(-1.0, -1.0, -900.0), Vec3::new(1.0, 1.0, -800.0)));
+        assert!(!f.intersects_aabb(Vec3::new(-100.0, -1.0, -20.0), Vec3::new(-90.0, 1.0, -18.0)), "off to the left");
+        // No far plane: 100 km ahead is still inside.
+        assert!(f.intersects_aabb(Vec3::new(-1.0, -1.0, -100_000.0), Vec3::new(1.0, 1.0, -99_990.0)));
+    }
+
+    #[test]
+    fn depth_is_reversed() {
+        let cam = Camera { pos: DVec3::ZERO, yaw: 0.0, pitch: 0.0, fov_y_deg: 70.0 };
+        let m = cam.view_proj(1.0);
+        let depth = |d: f32| {
+            let p = m * Vec4::new(0.0, 0.0, -d, 1.0);
+            p.z / p.w
+        };
+        assert!((depth(0.1) - 1.0).abs() < 1e-5, "near plane at depth 1");
+        assert!(depth(1.0) > depth(10.0) && depth(10.0) > depth(4000.0) && depth(4000.0) > 0.0);
+        // Two surfaces 0.5 blocks apart 4,000 blocks away get different depths.
+        assert!(depth(4000.0) != depth(4000.5));
     }
 
     #[test]
@@ -116,7 +138,7 @@ mod orientation_tests {
     #[test]
     fn point_below_camera_is_in_lower_half_of_vulkan_screen() {
         let cam = Camera { pos: DVec3::ZERO, yaw: 0.0, pitch: 0.0, fov_y_deg: 70.0 };
-        let p = cam.view_proj(1.0, 100.0) * glam::Vec4::new(0.0, -5.0, -20.0, 1.0);
+        let p = cam.view_proj(1.0) * glam::Vec4::new(0.0, -5.0, -20.0, 1.0);
         let ndc_y = p.y / p.w;
         eprintln!("ndc_y = {ndc_y}");
         // Vulkan: +y in NDC is the bottom of the screen.

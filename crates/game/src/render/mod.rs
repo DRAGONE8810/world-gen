@@ -14,6 +14,7 @@
 mod swapchain;
 
 use crate::camera::{Camera, Frustum};
+use crate::lod::NodeKey;
 use crate::mesh::{MeshData, Vertex};
 use ash::vk;
 use glam::{Vec3, Vec4};
@@ -25,11 +26,12 @@ use std::ffi::{c_char, CStr};
 use std::mem::ManuallyDrop;
 use std::sync::{Arc, Mutex};
 use swapchain::Swapchain;
-use worldgen::{ChunkPos, CHUNK_SIZE};
 
 const FRAMES_IN_FLIGHT: usize = 2;
 /// Upper bound on chunk uploads per frame, to keep frame times steady.
-const MAX_UPLOADS_PER_FRAME: usize = 48;
+/// Mesh uploads recorded per frame. The streamer never hands over more,
+/// so everything it calls ready is on the GPU by the next draw.
+pub const MAX_UPLOADS_PER_FRAME: usize = 48;
 
 static VERT_SPV: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/terrain.vert.spv"));
 static FRAG_SPV: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/terrain.frag.spv"));
@@ -96,8 +98,8 @@ pub struct Renderer {
     upload_pool: vk::CommandPool,
     frames: Vec<Frame>,
     frame_index: usize,
-    meshes: HashMap<ChunkPos, GpuMesh>,
-    pending_uploads: Vec<(ChunkPos, MeshData)>,
+    meshes: HashMap<NodeKey, GpuMesh>,
+    pending_uploads: Vec<(NodeKey, MeshData)>,
     pending_garbage: Vec<GpuBuffer>,
     egui: ManuallyDrop<egui_ash_renderer::Renderer<egui_ash_renderer::allocator::GpuAllocator>>,
     vsync: bool,
@@ -339,12 +341,12 @@ impl Renderer {
         e.width.max(1) as f32 / e.height.max(1) as f32
     }
 
-    /// Queue a chunk mesh for upload (replaces any previous mesh).
-    pub fn upload_mesh(&mut self, pos: ChunkPos, mesh: MeshData) {
+    /// Queue a chunk or LOD tile mesh for upload (replaces any previous mesh).
+    pub fn upload_mesh(&mut self, pos: NodeKey, mesh: MeshData) {
         self.pending_uploads.push((pos, mesh));
     }
 
-    pub fn remove_mesh(&mut self, pos: ChunkPos) {
+    pub fn remove_mesh(&mut self, pos: NodeKey) {
         self.pending_uploads.retain(|(p, _)| *p != pos);
         if let Some(m) = self.meshes.remove(&pos) {
             self.pending_garbage.push(m.vertices);
@@ -505,7 +507,7 @@ impl Renderer {
     pub fn draw(
         &mut self,
         window_size: (u32, u32),
-        camera: Option<(&Camera, f32 /* view distance */)>,
+        camera: Option<(&Camera, f32 /* fog distance */, &[NodeKey] /* what to draw */)>,
         sky: [f32; 3],
         ui: UiFrame,
     ) -> FrameStats {
@@ -575,7 +577,7 @@ impl Renderer {
             let lin = sky.map(|c| c.powf(2.2));
             let clear = [
                 vk::ClearValue { color: vk::ClearColorValue { float32: [lin[0], lin[1], lin[2], 1.0] } },
-                vk::ClearValue { depth_stencil: vk::ClearDepthStencilValue { depth: 1.0, stencil: 0 } },
+                vk::ClearValue { depth_stencil: vk::ClearDepthStencilValue { depth: 0.0, stencil: 0 } }, // reverse-Z
             ];
             self.device.cmd_begin_render_pass(
                 cmd,
@@ -597,27 +599,24 @@ impl Renderer {
             self.device.cmd_set_viewport(cmd, 0, &[viewport]);
             self.device.cmd_set_scissor(cmd, 0, &[vk::Rect2D { offset: vk::Offset2D::default(), extent }]);
 
-            if let Some((camera, view_distance)) = camera {
-                // Chunks load by horizontal distance, but in tall worlds the
-                // ground can be thousands of blocks below the camera, so the
-                // far plane must also reach the lowest/highest loaded mesh.
-                let cam_y = camera.pos.y;
-                let vertical = self
-                    .meshes
-                    .values()
-                    .map(|m| ((cam_y - m.min_y as f64).abs().max((m.max_y as f64 - cam_y).abs())) as f32)
-                    .fold(0.0f32, f32::max);
-                let far = (view_distance * 1.5 + 64.0).hypot(vertical) + 16.0;
-                let view_proj = camera.view_proj(self.aspect(), far);
+            if let Some((camera, view_distance, draw_list)) = camera {
+                // Reverse-Z with an infinite far plane: depth precision
+                // is spread evenly over distance, so tiles 4,000 blocks
+                // away don't flicker, and nothing is ever clipped far away
+                // (fog hides the edge instead).
+                let view_proj = camera.view_proj(self.aspect());
                 let frustum = Frustum::from_matrix(view_proj);
                 self.device.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::GRAPHICS, self.pipeline);
-                for (pos, mesh) in &self.meshes {
-                    // Chunk origin relative to the camera, in f64 then f32.
-                    let ox = (pos.min_block_x() as f64 - camera.pos.x) as f32;
+                for key in draw_list {
+                    let Some(mesh) = self.meshes.get(key) else { continue };
+                    // Mesh origin relative to the camera, in f64 then f32.
+                    let (bx, bz) = key.origin_block();
+                    let ox = (bx as f64 - camera.pos.x) as f32;
                     let oy = (-camera.pos.y) as f32;
-                    let oz = (pos.min_block_z() as f64 - camera.pos.z) as f32;
+                    let oz = (bz as f64 - camera.pos.z) as f32;
+                    let size = key.size_blocks() as f32;
                     let min = Vec3::new(ox, oy + mesh.min_y, oz);
-                    let max = min + Vec3::new(CHUNK_SIZE as f32, mesh.max_y - mesh.min_y, CHUNK_SIZE as f32);
+                    let max = min + Vec3::new(size, mesh.max_y - mesh.min_y, size);
                     if !frustum.intersects_aabb(min, max) {
                         continue;
                     }
@@ -839,7 +838,7 @@ unsafe fn create_pipeline(
     let depth = vk::PipelineDepthStencilStateCreateInfo::default()
         .depth_test_enable(true)
         .depth_write_enable(true)
-        .depth_compare_op(vk::CompareOp::LESS);
+        .depth_compare_op(vk::CompareOp::GREATER_OR_EQUAL); // reverse-Z
     let blend_attachment =
         [vk::PipelineColorBlendAttachmentState::default().color_write_mask(vk::ColorComponentFlags::RGBA)];
     let blend = vk::PipelineColorBlendStateCreateInfo::default().attachments(&blend_attachment);

@@ -46,7 +46,7 @@ fn usage() -> ! {
          \x20             [--center X,Z] [--extent BLOCKS] [--px PIXELS] [--out FILE.png]\n\
          \x20             [--layer surface|height|biome|continentalness|erosion|pv|roughness|temperature|humidity]\n\
          \x20             [--no-trees] [--legend]\n\
-         \x20      wg-map --bench N   (time generating an N×N square of chunks on one thread)"
+         \x20      wg-map --bench N   (time generating an N×N square of chunks, and N LOD tiles per level, on one thread)"
     );
     std::process::exit(2)
 }
@@ -124,6 +124,7 @@ fn main() {
     });
     if let Some(n) = args.bench {
         bench(&gen, n as i32);
+        bench_lod(&gen, n as i32);
         return;
     }
     let px = args.px.max(16);
@@ -221,6 +222,27 @@ fn bench(gen: &WorldGenerator, n: i32) {
         t.as_secs_f64() * 1000.0 / total,
         bytes as f64 / total / 1024.0
     );
+}
+
+/// Single-threaded LOD sampling benchmark: one tile = an 18 × 18 grid of
+/// cells (16 × 16 plus a border), as the game samples it.
+fn bench_lod(gen: &WorldGenerator, n: i32) {
+    for level in [1u32, 2, 3, 4, 6, 8] {
+        let cell = 1i32 << level;
+        let tile = 16 * cell;
+        let start = std::time::Instant::now();
+        let mut canopy = 0;
+        for i in 0..n {
+            // Tiles along a line through the world, like a ring of the view.
+            let grid = gen.lod_grid(i * tile - cell, -cell, cell, 18);
+            canopy += grid.iter().filter(|c| c.block.is_tree_part()).count();
+        }
+        let t = start.elapsed();
+        eprintln!(
+            "LOD level {level} ({cell}-block cells): {:.2} ms/tile on one thread ({canopy} canopy cells)",
+            t.as_secs_f64() * 1000.0 / n as f64
+        );
+    }
 }
 
 /// Colour of one map pixel for the chosen layer.
